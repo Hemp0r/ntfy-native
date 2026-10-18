@@ -3,18 +3,22 @@
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
+use std::ptr::NonNull;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, bail};
 use block2::{DynBlock, RcBlock};
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{Bool, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, define_class, msg_send};
-use objc2_foundation::{NSArray, NSBundle, NSDictionary, NSError, NSSet, NSString, NSURL};
+use objc2_foundation::{
+    NSArray, NSBundle, NSDictionary, NSError, NSInteger, NSSet, NSString, NSURL,
+};
 use objc2_user_notifications::{
-    UNAuthorizationOptions, UNMutableNotificationContent, UNNotification, UNNotificationAction,
-    UNNotificationActionOptions, UNNotificationAttachment, UNNotificationCategory,
-    UNNotificationCategoryOptions, UNNotificationDefaultActionIdentifier,
+    UNAuthorizationOptions, UNErrorCode, UNErrorDomain, UNMutableNotificationContent,
+    UNNotification, UNNotificationAction, UNNotificationActionOptions, UNNotificationAttachment,
+    UNNotificationCategory, UNNotificationCategoryOptions, UNNotificationDefaultActionIdentifier,
     UNNotificationInterruptionLevel, UNNotificationPresentationOptions, UNNotificationRequest,
     UNNotificationResponse, UNNotificationSound, UNUserNotificationCenter,
     UNUserNotificationCenterDelegate,
@@ -30,6 +34,9 @@ const MAX_CATEGORIES: usize = 32;
 
 const DEFAULT_KEY: &str = "default";
 
+/// Set once "not authorized" has been logged; cleared by a successful add.
+static NOT_ALLOWED_LOGGED: AtomicBool = AtomicBool::new(false);
+
 pub struct MacNotifier {
     // The center references its delegate weakly.
     _delegate: Retained<Delegate>,
@@ -41,6 +48,11 @@ impl MacNotifier {
     /// called before the event loop starts so that a launch caused by a click
     /// on a notification is delivered.
     pub fn new(on_activate: ActivationSink) -> Result<Self> {
+        // Callers may run on threads without an autorelease pool.
+        autoreleasepool(|_| Self::new_in_pool(on_activate))
+    }
+
+    fn new_in_pool(on_activate: ActivationSink) -> Result<Self> {
         if NSBundle::mainBundle().bundleIdentifier().is_none() {
             bail!(
                 "the app must run from an app bundle (see scripts/macos-dev-bundle.sh) \
@@ -53,12 +65,16 @@ impl MacNotifier {
 
         let on_auth = RcBlock::new(|granted: Bool, err: *mut NSError| {
             // SAFETY: the framework passes a valid NSError or null.
-            match unsafe { err.as_ref() } {
-                Some(err) => tracing::warn!(
-                    error = %err.localizedDescription(),
+            let err = unsafe { err.as_ref() };
+            if granted.as_bool() {
+                tracing::info!("notifications authorized");
+                return;
+            }
+            match err.filter(|e| classify(e) != AddError::NotAllowed) {
+                Some(e) => tracing::warn!(
+                    error = %e.localizedDescription(),
                     "notification authorization failed"
                 ),
-                None if granted.as_bool() => tracing::info!("notifications authorized"),
                 None => tracing::warn!("notifications not authorized by the user"),
             }
         });
@@ -73,18 +89,24 @@ impl MacNotifier {
         })
     }
 
-    fn register_category(&self, center: &UNUserNotificationCenter, id: &str, labels: &[&str]) {
+    /// Registers the category if needed. Returns whether the registered set
+    /// changed.
+    fn register_category(
+        &self,
+        center: &UNUserNotificationCenter,
+        id: &str,
+        labels: &[&str],
+    ) -> bool {
         let mut lru = self.categories.lock().unwrap_or_else(|e| e.into_inner());
         if !lru.touch(id, labels) {
-            return;
+            return false;
         }
         let categories: Vec<_> = lru.entries.iter().map(|(id, l)| category(id, l)).collect();
         center.setNotificationCategories(&NSSet::from_retained_slice(&categories));
+        true
     }
-}
 
-impl Notifier for MacNotifier {
-    fn show(&self, n: &Notification) -> Result<()> {
+    fn show_in_pool(&self, n: &Notification) {
         let center = UNUserNotificationCenter::currentNotificationCenter();
         let content = UNMutableNotificationContent::new();
         content.setTitle(&NSString::from_str(&n.title));
@@ -104,10 +126,11 @@ impl Notifier for MacNotifier {
         }
         set_user_info(&content, &info);
 
+        let mut categories_changed = false;
         if !n.buttons.is_empty() {
             let labels: Vec<&str> = n.buttons.iter().map(|b| b.label.as_str()).collect();
             let id = category_id(&labels);
-            self.register_category(&center, &id, &labels);
+            categories_changed = self.register_category(&center, &id, &labels);
             content.setCategoryIdentifier(&NSString::from_str(&id));
         }
 
@@ -121,13 +144,33 @@ impl Notifier for MacNotifier {
             _ => None,
         };
         let plain = request(&identifier, &content);
-        match image {
+        let (request, fallback) = match image {
             Some(image) => {
                 content.setAttachments(&NSArray::from_retained_slice(&[image]));
-                add(&center, &n.id, &request(&identifier, &content), Some(plain));
+                (request(&identifier, &content), Some(plain))
             }
-            None => add(&center, &n.id, &plain, None),
+            None => (plain, None),
+        };
+
+        if categories_changed {
+            // Category registration is asynchronous; reading the categories
+            // back completes after it, so the request then finds its buttons.
+            let id = n.id.clone();
+            let then_add = RcBlock::new(move |_: NonNull<NSSet<UNNotificationCategory>>| {
+                let center = UNUserNotificationCenter::currentNotificationCenter();
+                add(&center, &id, &request, fallback.clone());
+            });
+            center.getNotificationCategoriesWithCompletionHandler(&then_add);
+        } else {
+            add(&center, &n.id, &request, fallback);
         }
+    }
+}
+
+impl Notifier for MacNotifier {
+    fn show(&self, n: &Notification) -> Result<()> {
+        // Called from the engine's thread, which has no autorelease pool.
+        autoreleasepool(|_| self.show_in_pool(n));
         Ok(())
     }
 }
@@ -140,8 +183,31 @@ fn request(
     UNNotificationRequest::requestWithIdentifier_content_trigger(id, content, None)
 }
 
-/// Adds the request without waiting. If it fails and `fallback` (the same
-/// notification without attachment) is given, that is added instead.
+#[derive(Debug, PartialEq, Eq)]
+enum AddError {
+    NotAllowed,
+    Attachment,
+    Other,
+}
+
+fn classify(err: &NSError) -> AddError {
+    // SAFETY: an immutable string constant of the framework.
+    let un_domain = unsafe { UNErrorDomain }.is_some_and(|d| *d == *err.domain());
+    classify_code(un_domain, err.code())
+}
+
+fn classify_code(un_domain: bool, code: NSInteger) -> AddError {
+    match UNErrorCode(code) {
+        _ if !un_domain => AddError::Other,
+        UNErrorCode::NotificationsNotAllowed => AddError::NotAllowed,
+        UNErrorCode(100..=199) => AddError::Attachment,
+        _ => AddError::Other,
+    }
+}
+
+/// Adds the request without waiting. If it fails because of the attachment
+/// and `fallback` (the same notification without attachment) is given, that
+/// is added instead.
 fn add(
     center: &UNUserNotificationCenter,
     id: &str,
@@ -152,20 +218,22 @@ fn add(
     let done = RcBlock::new(move |err: *mut NSError| {
         // SAFETY: the framework passes a valid NSError or null.
         let Some(err) = (unsafe { err.as_ref() }) else {
+            NOT_ALLOWED_LOGGED.store(false, Ordering::Relaxed);
             return;
         };
         let error = err.localizedDescription();
-        match &fallback {
-            Some(plain) => {
-                tracing::warn!(%id, %error, "notification with image failed, retrying without");
-                add(
-                    &UNUserNotificationCenter::currentNotificationCenter(),
-                    &id,
-                    plain,
-                    None,
-                );
+        match (classify(err), &fallback) {
+            (AddError::NotAllowed, _) => {
+                if !NOT_ALLOWED_LOGGED.swap(true, Ordering::Relaxed) {
+                    tracing::warn!("notifications not authorized");
+                }
             }
-            None => tracing::warn!(%id, %error, "adding notification failed"),
+            (AddError::Attachment, Some(plain)) => {
+                tracing::warn!(%id, %error, "notification image rejected, retrying without");
+                let center = UNUserNotificationCenter::currentNotificationCenter();
+                add(&center, &id, plain, None);
+            }
+            _ => tracing::warn!(%id, %error, "adding notification failed"),
         }
     });
     center.addNotificationRequest_withCompletionHandler(request, Some(&done));
@@ -353,6 +421,16 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn classify_code_retries_only_attachment_errors() {
+        assert_eq!(classify_code(true, 1), AddError::NotAllowed);
+        assert_eq!(classify_code(true, 100), AddError::Attachment);
+        assert_eq!(classify_code(true, 105), AddError::Attachment);
+        assert_eq!(classify_code(true, 1401), AddError::Other);
+        assert_eq!(classify_code(false, 1), AddError::Other);
+        assert_eq!(classify_code(false, 100), AddError::Other);
     }
 
     #[test]
