@@ -53,3 +53,23 @@ Der Hinweis erscheint in drei Fällen:
 Das Ausbleiben des Hinweises ist kein Beweis für Vollständigkeit. Nicht erkennbar ist ein verlorener Cache insbesondere, wenn die letzte bekannte Nachricht regulär abgelaufen ist oder keine Ablaufzeit (`expires`) hat (`Cache: no` oder Zustand einer älteren App-Version). Verglichen werden ausschließlich Serverzeiten (Event-Zeiten und Date-Header des Servers), nie die lokale Uhr. Liefert der Server (oder ein Proxy davor) keinen `Date`-Header, kann kein Lückenhinweis berechnet werden.
 
 ## Entwicklung
+
+### macOS: App-Bundle für Benachrichtigungen
+
+Native Benachrichtigungen (`UNUserNotificationCenter`) funktionieren nur, wenn die App aus einem signierten App-Bundle mit Bundle-ID läuft: macOS ordnet Berechtigung, Einstellungen und Klicks auf Benachrichtigungen dem Bundle `dev.hemp0r.ntfy-native` zu. Ein nacktes `cargo run` schreibt Benachrichtigungen deshalb nur ins Log.
+
+```sh
+scripts/macos-dev-bundle.sh                         # baut target/ntfy-native.app (Release)
+scripts/macos-dev-bundle.sh --example notify_demo   # Bundle mit der Demo statt der App
+target/ntfy-native.app/Contents/MacOS/ntfy-native   # starten, Ausgabe im Terminal
+```
+
+Beim ersten Start fragt macOS nach der Erlaubnis für Mitteilungen. Die Demo zeigt je eine Benachrichtigung pro Stufe (passiv, aktiv mit Buttons und Bild, dringend), gibt Klicks auf Banner und Buttons auf stdout aus und beendet sich nach 30 Sekunden.
+
+Signatur: Ohne `MACOS_SIGN_IDENTITY` wird ad hoc signiert (`codesign --sign -`). macOS startet ad hoc signierte Programme mit dem eingeschränkten Entitlement `com.apple.developer.usernotifications.time-sensitive` nicht, daher wird es nur mit einer echten Identität eingebettet:
+
+```sh
+MACOS_SIGN_IDENTITY="Apple Development: …" scripts/macos-dev-bundle.sh
+```
+
+Ohne das Entitlement (oder ohne erlaubte zeitkritische Mitteilungen in den Systemeinstellungen) stuft macOS dringende Benachrichtigungen auf „aktiv“ herab; sie durchbrechen dann keinen Fokus („Nicht stören“). Für eine echte Identität ist voraussichtlich ein passendes Provisioning-Profil nötig; die endgültige Signatur und Notarisierung folgen mit dem Packaging (Teil 3).

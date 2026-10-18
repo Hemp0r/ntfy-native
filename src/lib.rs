@@ -9,6 +9,7 @@ pub mod i18n;
 pub mod import;
 pub mod media;
 pub mod notification;
+pub mod notify;
 pub mod ntfy;
 pub mod paths;
 pub mod render;
