@@ -1046,3 +1046,114 @@ async fn url_change_starts_with_fresh_state() {
     assert!(!reqs[0].is_poll(), "no catch-up against the new server");
     assert_eq!(reqs[0].query_param("since"), None);
 }
+
+fn token_instance_settings(url: &str) -> Settings {
+    let mut settings = settings_for(url);
+    settings.instances[0].auth = AuthKind::Token;
+    settings
+}
+
+#[tokio::test]
+async fn secret_survives_failed_removal_and_failed_auth_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    std::fs::create_dir_all(paths.settings_file()).unwrap();
+    let server = FakeServer::scripted(&ntfy_script()).await;
+    let secrets = Arc::new(MemoryStore::new());
+    secrets.set(&account_for(INSTANCE), "tok").unwrap();
+    let engine = TestEngine::start_with(
+        &paths,
+        token_instance_settings(&server.url()),
+        State::default(),
+        secrets.clone(),
+    );
+    engine
+        .wait_for("connected", |e| {
+            e.last_snapshot()
+                .is_some_and(|s| s.instances[0].status == InstanceStatus::Connected)
+        })
+        .await;
+
+    let mut no_auth = draft(Some(INSTANCE), &server.url(), &["alerts", "backup"]);
+    no_auth.auth = AuthDraft::None;
+    assert_eq!(
+        engine.save(1, no_auth).await,
+        Err("settings could not be saved".into())
+    );
+    assert_eq!(
+        secrets.get(&account_for(INSTANCE)).unwrap().as_deref(),
+        Some("tok")
+    );
+
+    engine.send(ui(UiRequest::RemoveInstance {
+        instance_id: INSTANCE.into(),
+    }));
+    // Commands are handled in order: the snapshot request follows the removal.
+    engine.send(Command::ResendSnapshot);
+    let count = engine.snapshots().len();
+    engine
+        .wait_for("snapshot after removal", |e| e.snapshots().len() > count)
+        .await;
+    let snap = engine.last_snapshot().unwrap();
+    assert_eq!(snap.instances.len(), 1, "instance kept");
+    assert_eq!(
+        secrets.get(&account_for(INSTANCE)).unwrap().as_deref(),
+        Some("tok")
+    );
+}
+
+#[tokio::test]
+async fn switching_to_no_auth_deletes_secret_after_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let server = FakeServer::scripted(&ntfy_script()).await;
+    let secrets = Arc::new(MemoryStore::new());
+    secrets.set(&account_for(INSTANCE), "tok").unwrap();
+    let engine = TestEngine::start_with(
+        &paths,
+        token_instance_settings(&server.url()),
+        State::default(),
+        secrets.clone(),
+    );
+    let mut no_auth = draft(Some(INSTANCE), &server.url(), &["alerts", "backup"]);
+    no_auth.auth = AuthDraft::None;
+    assert_eq!(engine.save(1, no_auth).await, Ok(INSTANCE.to_owned()));
+    assert_eq!(secrets.get(&account_for(INSTANCE)).unwrap(), None);
+    let saved = engine.saved_settings().unwrap();
+    assert_eq!(saved.instances[0].auth, AuthKind::None);
+}
+
+#[tokio::test]
+async fn url_change_clears_gap_flags_of_the_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let old = FakeServer::scripted(&ntfy_script()).await;
+    let new = FakeServer::scripted(&ntfy_script()).await;
+    let gap = |topic: &str| ntfy_native::state::GapFlag {
+        instance_id: INSTANCE.into(),
+        topic: topic.into(),
+        detected_at: 1,
+    };
+    let state = State {
+        gaps: vec![gap("alerts")],
+        ..State::default()
+    };
+    let engine = TestEngine::start(&paths, settings_for(&old.url()), state);
+    engine
+        .wait_for("gap shown", |e| {
+            e.last_snapshot().is_some_and(|s| !s.gaps.is_empty())
+        })
+        .await;
+
+    let same = draft(Some(INSTANCE), &old.url(), &["alerts", "backup"]);
+    assert_eq!(engine.save(1, same).await, Ok(INSTANCE.to_owned()));
+    assert!(!engine.last_snapshot().unwrap().gaps.is_empty(), "kept");
+
+    let moved = draft(Some(INSTANCE), &new.url(), &["alerts", "backup"]);
+    assert_eq!(engine.save(2, moved).await, Ok(INSTANCE.to_owned()));
+    engine
+        .wait_for("gap cleared", |e| {
+            e.last_snapshot().is_some_and(|s| s.gaps.is_empty())
+        })
+        .await;
+}

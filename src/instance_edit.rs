@@ -90,6 +90,22 @@ enum SecretPlan {
     Delete,
 }
 
+/// A secret deletion planned by `apply_draft`/`remove_instance`. The caller
+/// commits it only after `settings.json` was written, so a failed write never
+/// leaves a still-configured instance without its credentials.
+#[derive(Debug, PartialEq)]
+#[must_use = "commit after settings.json was written"]
+pub struct SecretChange(Option<String>);
+
+impl SecretChange {
+    pub fn commit(self, secrets: &dyn SecretStore) -> Result<()> {
+        match self.0 {
+            Some(account) => secrets.delete(&account),
+            None => Ok(()),
+        }
+    }
+}
+
 /// Errors name fields and positions, never the entered values.
 fn validate_fields(draft: &InstanceDraft) -> Result<String> {
     let url = normalize_url(&draft.url)?;
@@ -153,13 +169,14 @@ fn plan_auth(
     })
 }
 
-/// Validates everything first, then writes the secret. Returns the new
-/// settings (not persisted) and the instance id.
+/// Validates everything first, then writes a newly entered secret. Returns the
+/// new settings (not persisted), the instance id and the planned secret
+/// deletion (when auth becomes none).
 pub fn apply_draft(
     settings: &Settings,
     draft: &InstanceDraft,
     secrets: &dyn SecretStore,
-) -> Result<(Settings, String)> {
+) -> Result<(Settings, String, SecretChange)> {
     let url = validate_fields(draft)?;
     let pos = match &draft.id {
         Some(id) => Some(
@@ -204,11 +221,14 @@ pub fn apply_draft(
     let existing = pos.map(|_| inst.auth.clone());
     let (kind, plan) = plan_auth(&draft.auth, existing.as_ref(), stored)?;
 
-    match plan {
-        SecretPlan::Set(secret) => secrets.set(&account, &secret)?,
-        SecretPlan::Keep => {}
-        SecretPlan::Delete => secrets.delete(&account)?,
-    }
+    let change = match plan {
+        SecretPlan::Set(secret) => {
+            secrets.set(&account, &secret)?;
+            SecretChange(None)
+        }
+        SecretPlan::Keep => SecretChange(None),
+        SecretPlan::Delete => SecretChange(Some(account)),
+    };
     inst.url = url;
     inst.auth = kind;
     inst.cache_duration_secs = draft.cache_duration_secs;
@@ -218,21 +238,18 @@ pub fn apply_draft(
         Some(p) => settings.instances[p] = inst,
         None => settings.instances.push(inst),
     }
-    Ok((settings, id))
+    Ok((settings, id, change))
 }
 
-pub fn remove_instance(
-    settings: &Settings,
-    id: &str,
-    secrets: &dyn SecretStore,
-) -> Result<Settings> {
+/// Returns the settings without the instance (not persisted) and the planned
+/// secret deletion.
+pub fn remove_instance(settings: &Settings, id: &str) -> Result<(Settings, SecretChange)> {
     if settings.instance(id).is_none() {
         bail!("instance not found");
     }
-    secrets.delete(&account_for(id))?;
     let mut settings = settings.clone();
     settings.instances.retain(|i| i.id != id);
-    Ok(settings)
+    Ok((settings, SecretChange(Some(account_for(id)))))
 }
 
 #[cfg(test)]
@@ -258,7 +275,9 @@ mod tests {
     }
 
     fn add(s: &Settings, d: &InstanceDraft, store: &MemoryStore) -> (Settings, String) {
-        apply_draft(s, d, store).unwrap()
+        let (s, id, change) = apply_draft(s, d, store).unwrap();
+        change.commit(store).unwrap();
+        (s, id)
     }
 
     #[test]
@@ -399,6 +418,30 @@ mod tests {
     }
 
     #[test]
+    fn deletions_wait_for_commit() {
+        let store = MemoryStore::new();
+        let mut d = draft("https://h");
+        d.auth = AuthDraft::Token {
+            token: Some("tk".into()),
+        };
+        let (s, id) = add(&Settings::default(), &d, &store);
+        let account = account_for(&id);
+
+        d.id = Some(id.clone());
+        d.auth = AuthDraft::None;
+        let (_, _, change) = apply_draft(&s, &d, &store).unwrap();
+        assert_eq!(store.get(&account).unwrap().as_deref(), Some("tk"));
+        change.commit(&store).unwrap();
+        assert_eq!(store.get(&account).unwrap(), None);
+
+        store.set(&account, "tk").unwrap();
+        let (_, change) = remove_instance(&s, &id).unwrap();
+        assert_eq!(store.get(&account).unwrap().as_deref(), Some("tk"));
+        change.commit(&store).unwrap();
+        assert_eq!(store.get(&account).unwrap(), None);
+    }
+
+    #[test]
     fn invalid_draft_writes_no_secret() {
         let store = MemoryStore::new();
         let mut d = draft("https://h");
@@ -498,9 +541,10 @@ mod tests {
             token: Some("tk".into()),
         };
         let (s, id) = add(&Settings::default(), &d, &store);
-        let s = remove_instance(&s, &id, &store).unwrap();
+        let (s, change) = remove_instance(&s, &id).unwrap();
+        change.commit(&store).unwrap();
         assert!(s.instances.is_empty());
         assert_eq!(store.get(&account_for(&id)).unwrap(), None);
-        assert!(remove_instance(&s, &id, &store).is_err());
+        assert!(remove_instance(&s, &id).is_err());
     }
 }

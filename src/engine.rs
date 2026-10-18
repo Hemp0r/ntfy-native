@@ -113,6 +113,11 @@ pub async fn run_engine(
     tx: mpsc::UnboundedSender<Command>,
     mut rx: mpsc::UnboundedReceiver<Command>,
 ) -> anyhow::Result<()> {
+    // `stop_connection` relies on a single-threaded runtime.
+    debug_assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread
+    );
     let EngineDeps {
         paths,
         settings,
@@ -402,7 +407,7 @@ impl Engine {
     }
 
     fn save_instance(&mut self, draft: &InstanceDraft) -> Result<String, String> {
-        let (settings, id) =
+        let (settings, id, secret_change) =
             match apply_draft(&self.dispatcher.settings, draft, self.secrets.as_ref()) {
                 Ok(v) => v,
                 Err(e) => {
@@ -419,6 +424,9 @@ impl Engine {
             tracing::error!(instance = %id, "instance not saved: settings.json could not be written");
             self.dispatcher.settings = previous;
             return Err("settings could not be saved".into());
+        }
+        if let Err(e) = secret_change.commit(self.secrets.as_ref()) {
+            tracing::warn!(instance = %id, error = %format!("{e:#}"), "stale secret not deleted");
         }
         let new = self
             .dispatcher
@@ -465,14 +473,15 @@ impl Engine {
         self.stop_connection(&new.id);
         if !same_server {
             self.instances.remove(&new.id);
+            self.dispatcher.gaps.retain(|g| g.instance_id != new.id);
         }
         self.state_dirty = true;
         self.start_connection(new);
     }
 
     fn remove_instance(&mut self, id: &str) {
-        let settings = match remove_instance(&self.dispatcher.settings, id, self.secrets.as_ref()) {
-            Ok(s) => s,
+        let (settings, secret_change) = match remove_instance(&self.dispatcher.settings, id) {
+            Ok(v) => v,
             Err(e) => {
                 tracing::warn!(instance = %id, error = %format!("{e:#}"), "instance not removed");
                 return;
@@ -480,11 +489,12 @@ impl Engine {
         };
         let previous = std::mem::replace(&mut self.dispatcher.settings, settings);
         if self.write_settings().is_err() {
-            // Its secret is already deleted: the instance keeps running with
-            // the credentials in memory, the next start reports them missing.
             tracing::error!(instance = %id, "instance not removed: settings.json could not be written");
             self.dispatcher.settings = previous;
             return;
+        }
+        if let Err(e) = secret_change.commit(self.secrets.as_ref()) {
+            tracing::warn!(instance = %id, error = %format!("{e:#}"), "stale secret not deleted");
         }
         self.stop_connection(id);
         self.instances.remove(id);
@@ -1052,6 +1062,112 @@ mod tests {
         st.insert("crashed".into(), (ConnStatus::Connected, 20));
         reap_crashed_connections(&mut conns, &mut st, 30);
         assert_eq!(st["crashed"], (ConnStatus::Connected, 20), "reported once");
+    }
+
+    #[tokio::test]
+    async fn reconcile_applies_queued_events_before_restart() {
+        use crate::ntfy::model::parse_event;
+        use crate::state::SeenMessage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let topic = |n: &str| Topic {
+            name: n.into(),
+            ..Topic::default()
+        };
+        let inst = Instance {
+            id: "a".into(),
+            url: "https://ntfy.example.org".into(),
+            topics: vec![topic("t")],
+            ..Instance::default()
+        };
+        let settings = Settings {
+            instances: vec![inst.clone()],
+            ..Settings::default()
+        };
+        let notifier = Arc::new(crate::notification::RecordingNotifier::default());
+        let media = Arc::new(MediaFetcher::new(http_client(), dir.path().into()));
+        let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(delivery_worker(
+            delivery_rx,
+            media.clone(),
+            notifier.clone(),
+            CancellationToken::new(),
+        ));
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let mut engine = Engine {
+            paths: AppPaths::under(dir.path()),
+            http: http_client(),
+            deliveries: Some(delivery_tx),
+            notifier: notifier.clone(),
+            opener: Arc::new(crate::actions::RecordingOpener::default()),
+            strings: &EN,
+            on_tray: Box::new(|_| {}),
+            on_ui: Box::new(|_| {}),
+            snapshot: None,
+            dispatcher: Dispatcher::new(settings.clone(), Default::default(), Vec::new(), &EN),
+            saved_settings: settings,
+            instances: BTreeMap::new(),
+            connections: HashMap::from([(
+                "a".to_owned(),
+                Running {
+                    ctl: ConnControl::default(),
+                    base_url: inst.url.clone(),
+                    auth: None,
+                    task: Some(tokio::spawn(std::future::pending::<()>())),
+                },
+            )]),
+            statuses: BTreeMap::new(),
+            state_dirty: false,
+            tray: None,
+            settings_save: SaveHealth::default(),
+            state_save: SaveHealth::default(),
+            media,
+            media_cleanup: Periodic::starting_now(MEDIA_CLEANUP_INTERVAL),
+            secrets: Arc::new(crate::secrets::MemoryStore::new()),
+            tune: |_| {},
+            events_tx,
+            events,
+        };
+
+        let message = match parse_event(
+            r#"{"id":"m1","time":100,"event":"message","topic":"t","message":"hi"}"#,
+        )
+        .unwrap()
+        {
+            crate::ntfy::model::Event::Message(m) => m,
+            other => panic!("{other:?}"),
+        };
+        let new_state = InstanceState {
+            watermark: Some(100),
+            last_message: Some(SeenMessage {
+                id: "m1".into(),
+                time: 100,
+                expires: None,
+            }),
+            seen_ids: ["m1".to_owned()].into(),
+        };
+        let send = |ev| engine.events_tx.send(("a".to_owned(), ev)).unwrap();
+        send(ConnEvent::Messages {
+            messages: vec![message],
+            catch_up: false,
+        });
+        send(ConnEvent::State(new_state.clone()));
+
+        // A topic change restarts the connection (no topics: nothing starts).
+        let edited = Instance {
+            topics: Vec::new(),
+            ..inst.clone()
+        };
+        engine.reconcile(Some(&inst), &edited, false);
+
+        assert_eq!(engine.instances["a"], new_state);
+        assert!(engine.events.try_recv().is_err(), "queue drained");
+        assert!(engine.connections.is_empty());
+        engine.deliveries = None;
+        worker.await.unwrap();
+        let shown = notifier.shown.lock().unwrap();
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert_eq!(shown[0].id, "a:m1");
     }
 
     #[test]
