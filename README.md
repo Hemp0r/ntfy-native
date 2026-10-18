@@ -91,3 +91,20 @@ MACOS_SIGN_IDENTITY="Apple Development: …" scripts/macos-dev-bundle.sh
 ```
 
 Ohne das Entitlement (oder ohne erlaubte zeitkritische Mitteilungen in den Systemeinstellungen) stuft macOS dringende Benachrichtigungen auf „aktiv“ herab; sie durchbrechen dann keinen Fokus („Nicht stören“). Für eine echte Identität ist voraussichtlich ein passendes Provisioning-Profil nötig; die endgültige Signatur und Notarisierung folgen mit dem Packaging (Teil 3).
+
+### Windows: Toast-Benachrichtigungen
+
+Benachrichtigungen laufen über WinRT-Toasts mit der AppUserModelID `dev.hemp0r.ntfy-native`. Beim Start registriert sich die App (bzw. das gestartete Beispiel) selbst, nur unter `HKEY_CURRENT_USER` und bei jedem Start neu (der Pfad der `.exe` kann sich ändern):
+
+- `HKCU\Software\Classes\AppUserModelId\dev.hemp0r.ntfy-native`: `DisplayName` = `ntfy-native`, `CustomActivator` = `{AE88E831-148B-400C-8273-6ABC4FDEA102}`
+- `HKCU\Software\Classes\CLSID\{AE88E831-148B-400C-8273-6ABC4FDEA102}\LocalServer32`: Standardwert `"<Pfad der exe>" -ToastActivated`
+
+Klicks auf einen Toast oder dessen Buttons erreichen die laufende App über einen COM-Server mit dieser CLSID (fest, nie ändern). Läuft die App nicht mehr (Toast im Info-Center), startet Windows die eingetragene `.exe` mit `-ToastActivated` neu und liefert den Klick nach. Dringende Nachrichten nutzen `scenario="urgent"`; ältere Windows-10-Builds lehnen das ab, dann wird der Toast ohne dieses Szenario erneut angezeigt.
+
+Manuelle Prüfung mit der Demo:
+
+```powershell
+cargo run --example notify_demo
+```
+
+Die Demo zeigt je einen Toast pro Stufe (passiv ohne Ton, aktiv mit Buttons, Bild und App-Logo, dringend), gibt Klicks auf stdout aus und beendet sich nach 30 Sekunden. Sie trägt sich dabei selbst als `LocalServer32` ein; ein Klick im Info-Center nach dem Beenden startet sie mit `-ToastActivated` neu, sie zeigt dann keine neuen Toasts, sondern gibt nur die Aktivierung aus. Der nächste Start der App trägt wieder deren eigene `.exe` ein.

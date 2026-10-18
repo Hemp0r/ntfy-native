@@ -72,7 +72,8 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
     }
     let proxy = event_loop.create_proxy();
 
-    // Registers the macOS notification delegate; must precede the event loop.
+    // Registers the notification delegate (macOS) or toast activator
+    // (Windows); must precede the event loop.
     let on_activate: ActivationSink = {
         let proxy = proxy.clone();
         Arc::new(move |p| {

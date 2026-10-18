@@ -1,5 +1,5 @@
 // Release builds are GUI apps on Windows: no console window.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use ntfy_native::cli::{CliAction, parse_args};
 
