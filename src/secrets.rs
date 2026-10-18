@@ -121,26 +121,39 @@ impl SecretStore for MemoryStore {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum Auth {
     Token(String),
     Basic { username: String, password: String },
 }
 
-pub fn resolve_auth(store: &dyn SecretStore, inst: &Instance) -> Result<Option<Auth>> {
-    if inst.auth == AuthKind::None {
-        return Ok(None);
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Auth::Token(_) => f.write_str("Token(***)"),
+            Auth::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &format_args!("***"))
+                .finish(),
+        }
     }
-    let secret = store
-        .get(&account_for(&inst.id))?
-        .ok_or_else(|| anyhow!("no stored credential for {}", inst.url))?;
-    Ok(Some(match &inst.auth {
-        AuthKind::Basic { username } => Auth::Basic {
+}
+
+pub fn resolve_auth(store: &dyn SecretStore, inst: &Instance) -> Result<Option<Auth>> {
+    let secret = || {
+        store
+            .get(&account_for(&inst.id))?
+            .ok_or_else(|| anyhow!("no stored credential for {}", inst.url))
+    };
+    match &inst.auth {
+        AuthKind::None => Ok(None),
+        AuthKind::Token => Ok(Some(Auth::Token(secret()?))),
+        AuthKind::Basic { username } => Ok(Some(Auth::Basic {
             username: username.clone(),
-            password: secret,
-        },
-        _ => Auth::Token(secret),
-    }))
+            password: secret()?,
+        })),
+    }
 }
 
 #[cfg(test)]
@@ -241,5 +254,20 @@ mod tests {
         assert_eq!(s.get(&acct).unwrap(), Some("secret".to_string()));
         s.delete(&acct).unwrap();
         assert_eq!(s.get(&acct).unwrap(), None);
+    }
+
+    #[test]
+    fn auth_debug_redacts() {
+        let t = format!("{:?}", Auth::Token("tk_secret".into()));
+        assert!(!t.contains("tk_secret"), "{t}");
+        let b = format!(
+            "{:?}",
+            Auth::Basic {
+                username: "alice".into(),
+                password: "hunter2".into()
+            }
+        );
+        assert!(!b.contains("hunter2"), "{b}");
+        assert!(b.contains("alice"), "{b}");
     }
 }
