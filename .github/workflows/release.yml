@@ -1,0 +1,185 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re-)release, e.g. v0.1.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Tag matches Cargo.toml version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          if [[ "${TAG#v}" != "$version" ]]; then
+            echo "::error::Tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  macos:
+    needs: verify
+    runs-on: macos-latest
+    env:
+      MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+      MACOS_PROVISION_PROFILE_BASE64: ${{ secrets.MACOS_PROVISION_PROFILE_BASE64 }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+      - name: Create universal binary
+        run: |
+          mkdir -p target/universal
+          lipo -create -output target/universal/ntfy-native \
+            target/aarch64-apple-darwin/release/ntfy-native \
+            target/x86_64-apple-darwin/release/ntfy-native
+          lipo -info target/universal/ntfy-native
+      - name: Import signing certificate
+        run: |
+          if [[ -z "$MACOS_CERT_P12_BASE64" || -z "$MACOS_CERT_PASSWORD" || -z "$MACOS_SIGN_IDENTITY" ]]; then
+            # Without all three secrets the build falls back to an ad-hoc signature.
+            echo "MACOS_SIGN_IDENTITY=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          keychain="$RUNNER_TEMP/release-signing.keychain-db"
+          keychain_password=$(uuidgen)
+          echo "::add-mask::$keychain_password"
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          printf '%s' "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$MACOS_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/security
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" login.keychain-db
+      - name: Decode provisioning profile
+        run: |
+          if [[ -n "$MACOS_PROVISION_PROFILE_BASE64" ]]; then
+            printf '%s' "$MACOS_PROVISION_PROFILE_BASE64" | base64 --decode > "$RUNNER_TEMP/ntfy-native.provisionprofile"
+            echo "MACOS_PROVISION_PROFILE_FILE=$RUNNER_TEMP/ntfy-native.provisionprofile" >> "$GITHUB_ENV"
+          fi
+      - name: Bundle, sign and notarize
+        run: scripts/macos-release-bundle.sh target/universal/ntfy-native dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: dist/*.dmg
+          if-no-files-found: error
+      - name: Remove temporary keychain
+        if: always()
+        run: |
+          if [[ -n "${SIGNING_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$SIGNING_KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/cert.p12" "$RUNNER_TEMP/ntfy-native.provisionprofile"
+
+  windows:
+    needs: verify
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            arch: x64
+          - target: aarch64-pc-windows-msvc
+            arch: arm64
+    # TODO(Plan Part 3): replace the zip with a per-user MSI (Start-menu
+    # shortcut with AUMID/ToastActivatorCLSID, autostart).
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Package zip
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+          name="ntfy-native-$version-windows-$ARCH"
+          mkdir -p "dist/$name"
+          cp "target/$TARGET/release/ntfy-native.exe" README.md LICENSE-MIT LICENSE-APACHE "dist/$name/"
+          powershell -NoProfile -Command "Compress-Archive -Path 'dist/$name/*' -DestinationPath 'dist/$name.zip'"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}-zip
+          path: dist/*.zip
+          if-no-files-found: error
+
+  release:
+    needs: [macos, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Checksums
+        working-directory: artifacts
+        run: |
+          sha256sum ./*.dmg ./*.zip | sed 's# \./# #' > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          draft: false
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
+          generate_release_notes: true
+          files: |
+            artifacts/*.dmg
+            artifacts/*.zip
+            artifacts/SHA256SUMS.txt

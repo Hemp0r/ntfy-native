@@ -118,3 +118,21 @@ cargo run --example notify_demo
 ```
 
 Die Demo legt ihr Bild dann in diesem Ordner ab. Fehlen Bild und App-Logo im aktiven Toast, muss der Pfad prozentkodiert werden.
+
+## Release
+
+Ein Release entsteht automatisch über `.github/workflows/release.yml`:
+
+1. Version in `Cargo.toml` anheben und committen.
+2. `git tag vX.Y.Z && git push --tags` (das Tag muss exakt der Version entsprechen, sonst bricht der Lauf ab). Vorabversionen wie `v0.2.0-rc1` werden als Pre-Release veröffentlicht.
+3. Der Workflow prüft (fmt, clippy, Tests auf macOS und Windows), baut eine universelle macOS-DMG (Apple Silicon + Intel) sowie Windows-ZIPs (x64, ARM64) und legt alles samt `SHA256SUMS.txt` im GitHub-Release ab. Ein bestehendes Tag lässt sich über „Run workflow“ (Eingabe `tag`) erneut veröffentlichen.
+
+Optionale Repository-Secrets (ohne sie wird die DMG ad-hoc signiert und der Lauf gibt Warnungen aus):
+
+| Secret | Wirkung |
+| --- | --- |
+| `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `MACOS_SIGN_IDENTITY` | alle drei: Signatur mit Developer-ID-Zertifikat (Hardened Runtime, Zeitstempel) statt ad-hoc |
+| `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | zusätzlich zur Signatur: Notarisierung und Stapling der DMG |
+| `MACOS_PROVISION_PROFILE_BASE64` | bettet das Provisioning-Profil ein und aktiviert das zeitkritische Entitlement (ohne Profil startet macOS die App mit diesem Entitlement nicht, daher wird es sonst weggelassen) |
+
+Die Windows-Builds sind nicht signiert (SmartScreen warnt beim ersten Start). Ein MSI-Installer folgt in Teil 3 des Plans.

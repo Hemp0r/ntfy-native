@@ -4,6 +4,8 @@
 # Usage: scripts/macos-dev-bundle.sh [--example NAME]
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck source=scripts/macos-bundle-lib.sh
+source scripts/macos-bundle-lib.sh
 
 build_args=(--release)
 bin=target/release/ntfy-native
@@ -19,21 +21,14 @@ esac
 
 cargo build "${build_args[@]}"
 
-version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
 app=target/ntfy-native.app
-rm -rf "$app"
-mkdir -p "$app/Contents/MacOS"
-cp "$bin" "$app/Contents/MacOS/ntfy-native"
-sed "s/@VERSION@/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+assemble_app "$bin" "$app"
 
-# macOS refuses to launch ad-hoc signed code that claims the restricted
-# time-sensitive entitlement, so it is only added for a real identity.
-sign_args=(--force --options runtime --sign "${MACOS_SIGN_IDENTITY:--}")
 if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
-  sign_args+=(--entitlements packaging/macos/ntfy-native.entitlements)
+  sign_app "$app" "$MACOS_SIGN_IDENTITY" 1
 else
   echo "note: ad-hoc signature without time-sensitive entitlement" >&2
+  sign_app "$app" - 0
 fi
-codesign "${sign_args[@]}" "$app"
 
 echo "$app"
