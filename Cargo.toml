@@ -15,6 +15,7 @@ lexopt = "0.3.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 serde_yaml_ng = "0.10.0"
+sys-locale = "0.3.2"
 url = "2.5.8"
 
 [profile.release]
