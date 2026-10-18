@@ -337,13 +337,24 @@ mod tests {
         let mut s = st(Some(10_000), Some(("a", 10_000)));
         s.last_message.as_mut().unwrap().expires = Some(20_000);
         s.seen_ids.push_back("a".into());
-        let polled = vec![msg_exp("a", 10_000, 20_000), msg("b", 10_010)];
-        let r = s.apply_catch_up(polled, Some(7_000), 43_200);
+        let a = msg_exp("a", 10_000, 20_000);
+        let b = msg_exp("b", 10_010, 20_010);
+        let r = s.apply_catch_up(vec![a.clone(), b.clone()], Some(7_000), 43_200);
         assert!(r.gap);
-        assert_eq!(r.accepted, vec![msg("b", 10_010)]);
+        assert_eq!(r.accepted, vec![b.clone()]);
         assert!(catch_up_since(&s) <= Some(7_000 - DEDUP_MARGIN_SECS));
-        let r = s.apply_catch_up(vec![], Some(7_010), 43_200);
+        let r = s.apply_catch_up(vec![a, b], Some(7_010), 43_200);
         assert!(!r.gap);
+        assert!(r.accepted.is_empty());
+    }
+
+    #[test]
+    fn cache_loss_hint_fires_once() {
+        let now = 1_000_000;
+        let mut s = st(Some(now - 60), Some(("a", now - 100)));
+        assert!(s.last_message.as_ref().unwrap().expires > Some(now + 5));
+        assert!(s.apply_catch_up(vec![], Some(now), 43_200).gap);
+        assert!(!s.apply_catch_up(vec![], Some(now + 5), 43_200).gap);
     }
 
     #[test]
