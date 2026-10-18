@@ -29,4 +29,5 @@ pub mod store;
 pub mod sync;
 pub mod tray;
 pub mod triggers;
+pub mod ui;
 pub mod validate;

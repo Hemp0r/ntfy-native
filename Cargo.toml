@@ -8,6 +8,7 @@ description = "Lightweight tray app bridging ntfy servers to native OS notificat
 
 [dependencies]
 anyhow = "1.0.104"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 directories = "6.0.0"
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 httpdate = "1.0.3"
