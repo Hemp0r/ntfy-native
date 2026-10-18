@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::connection::ConnStatus;
 use crate::settings::Settings;
+use crate::snapshot::InstanceStatus;
 
 pub const PROBLEM_GRACE_SECS: i64 = 15;
 
@@ -48,6 +49,17 @@ pub fn aggregate(
         TrayState::Paused
     } else {
         TrayState::Ok
+    }
+}
+
+/// Same grace period as `aggregate`; raw error text never leaves this function.
+pub fn instance_status(status: Option<&(ConnStatus, i64)>, now: i64) -> InstanceStatus {
+    match status {
+        None => InstanceStatus::Connecting,
+        Some((ConnStatus::AuthFailed, _)) => InstanceStatus::AuthFailed,
+        Some((ConnStatus::Connected, _)) => InstanceStatus::Connected,
+        Some((_, since)) if now - since >= PROBLEM_GRACE_SECS => InstanceStatus::Problem,
+        Some(_) => InstanceStatus::Connecting,
     }
 }
 
@@ -162,5 +174,24 @@ mod tests {
             aggregate(&s, &st(ConnStatus::Connecting, NOW - 60), true, NOW),
             TrayState::Problem { .. }
         ));
+    }
+
+    #[test]
+    fn instance_status_mapping() {
+        let c = |s: ConnStatus, since: i64| instance_status(Some(&(s, since)), NOW);
+        assert_eq!(
+            c(ConnStatus::Connecting, NOW - 10),
+            InstanceStatus::Connecting
+        );
+        assert_eq!(c(ConnStatus::Connecting, NOW - 20), InstanceStatus::Problem);
+        let d = || ConnStatus::Disconnected { error: "x".into() };
+        assert_eq!(c(d(), NOW - 5), InstanceStatus::Connecting);
+        assert_eq!(c(d(), NOW - 30), InstanceStatus::Problem);
+        assert_eq!(c(ConnStatus::AuthFailed, NOW), InstanceStatus::AuthFailed);
+        assert_eq!(
+            c(ConnStatus::Connected, NOW - 100),
+            InstanceStatus::Connected
+        );
+        assert_eq!(instance_status(None, NOW), InstanceStatus::Connecting);
     }
 }

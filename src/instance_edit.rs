@@ -56,11 +56,27 @@ impl std::fmt::Debug for AuthDraft {
     }
 }
 
+/// The user may type `user:password@host`; keep credentials out of logs.
+fn redacted_url(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(mut u) => {
+            if !u.username().is_empty() {
+                let _ = u.set_username("***");
+            }
+            if u.password().is_some() {
+                let _ = u.set_password(Some("***"));
+            }
+            u.to_string()
+        }
+        Err(_) => "<invalid url>".into(),
+    }
+}
+
 impl std::fmt::Debug for InstanceDraft {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InstanceDraft")
             .field("id", &self.id)
-            .field("url", &self.url)
+            .field("url", &format_args!("{}", redacted_url(&self.url)))
             .field("auth", &self.auth)
             .field("cache_duration_secs", &self.cache_duration_secs)
             .field("topics", &self.topics)
@@ -449,6 +465,17 @@ mod tests {
         };
         let b = format!("{d:?} {:?}", d.auth);
         assert!(!b.contains("s3cret") && b.contains("alice"), "{b}");
+    }
+
+    #[test]
+    fn draft_debug_redacts_url_userinfo() {
+        let t = format!("{:?}", draft("https://alice:s3cret@host.example/path"));
+        assert!(!t.contains("s3cret") && !t.contains("alice"), "{t}");
+        assert!(t.contains("host.example"), "{t}");
+        let t = format!("{:?}", draft("s3cret"));
+        assert!(!t.contains("s3cret") && t.contains("<invalid url>"), "{t}");
+        let t = format!("{:?}", draft("https://tok3n@host.example"));
+        assert!(!t.contains("tok3n"), "{t}");
     }
 
     #[test]
