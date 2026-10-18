@@ -1,0 +1,533 @@
+//! The engine: runs all connections, dispatches their messages to the
+//! notifier, executes actions and persists settings and state.
+
+use std::collections::{BTreeMap, HashMap};
+use std::ops::ControlFlow;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tokio::sync::mpsc;
+use tokio::time::MissedTickBehavior;
+
+use crate::actions::{self, UrlOpener};
+use crate::connection::{ConnControl, ConnEvent, ConnStatus, ConnectionConfig, spawn_connection};
+use crate::dispatcher::Dispatcher;
+use crate::i18n::{Strings, fill};
+use crate::media::MediaFetcher;
+use crate::notification::{ActivationPayload, Level, Notification, Notifier};
+use crate::ntfy::client::http_client;
+use crate::paths::AppPaths;
+use crate::secrets::{Auth, SecretStore, resolve_auth};
+use crate::settings::Settings;
+use crate::state::{InstanceState, State};
+use crate::status::{TrayState, aggregate};
+use crate::store::save_json;
+use crate::triggers::{spawn_network_watcher, spawn_wake_detector};
+
+const TICK: Duration = Duration::from_secs(5);
+const MEDIA_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const STATE_VERSION: u32 = 1;
+
+#[derive(Debug)]
+pub enum Command {
+    Activated(ActivationPayload),
+    ReconnectAll,
+    PauseAll(Option<i64>),
+    SetTopicMuted {
+        instance_id: String,
+        topic: String,
+        muted: bool,
+    },
+    Quit,
+}
+
+pub struct EngineDeps {
+    pub paths: AppPaths,
+    pub settings: Settings,
+    pub state: State,
+    pub secrets: Arc<dyn SecretStore>,
+    pub notifier: Arc<dyn Notifier>,
+    pub opener: Arc<dyn UrlOpener>,
+    pub strings: &'static Strings,
+    pub on_tray: Box<dyn Fn(TrayState) + Send>,
+    pub on_exit: Box<dyn FnOnce() + Send>,
+    /// Adjusts each connection's config; production: `|_| {}`.
+    pub tune: fn(&mut ConnectionConfig),
+    /// Wake/network reconnect triggers and Ctrl-C/SIGTERM handling.
+    pub enable_triggers: bool,
+}
+
+#[derive(Clone)]
+pub struct EngineHandle {
+    pub tx: mpsc::UnboundedSender<Command>,
+}
+
+/// Runs the engine on a new thread with a tokio current-thread runtime.
+pub fn spawn_engine_thread(deps: EngineDeps) -> (EngineHandle, std::thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let handle = EngineHandle { tx: tx.clone() };
+    let thread = std::thread::Builder::new()
+        .name("engine".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!(error = %e, "cannot start engine runtime");
+                    (deps.on_exit)();
+                    return;
+                }
+            };
+            if let Err(e) = rt.block_on(run_engine(deps, tx, rx)) {
+                tracing::error!(error = %format!("{e:#}"), "engine stopped with error");
+            }
+        })
+        .expect("spawn engine thread");
+    (handle, thread)
+}
+
+/// Runs until `Quit`, a shutdown signal (with `enable_triggers`) or until all
+/// command senders are gone. Calls `on_exit` after the final save.
+pub async fn run_engine(
+    deps: EngineDeps,
+    tx: mpsc::UnboundedSender<Command>,
+    mut rx: mpsc::UnboundedReceiver<Command>,
+) -> anyhow::Result<()> {
+    let EngineDeps {
+        paths,
+        settings,
+        state,
+        secrets,
+        notifier,
+        opener,
+        strings,
+        on_tray,
+        on_exit,
+        tune,
+        enable_triggers,
+    } = deps;
+
+    let http = http_client();
+    let media = MediaFetcher::new(http.clone(), paths.media_dir());
+    match media.cleanup(MEDIA_MAX_AGE) {
+        Ok(n) if n > 0 => tracing::debug!(removed = n, "media cache cleaned"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "media cache cleanup failed"),
+    }
+
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+    let mut engine = Engine {
+        saved_settings: settings.clone(),
+        dispatcher: Dispatcher::new(settings, state.recent, state.gaps, strings),
+        instances: state.instances,
+        connections: HashMap::new(),
+        statuses: BTreeMap::new(),
+        state_dirty: false,
+        tray: None,
+        paths,
+        http,
+        media,
+        notifier,
+        opener,
+        strings,
+        on_tray,
+    };
+    engine.start_connections(secrets.as_ref(), tune, &ev_tx);
+
+    let mut triggers = Vec::new();
+    if enable_triggers {
+        triggers.push(spawn_wake_detector(tx.clone()));
+        triggers.push(spawn_network_watcher(tx.clone()));
+    }
+    // Without other senders, `rx` ends once every `EngineHandle` is dropped.
+    drop(tx);
+
+    let shutdown = async {
+        if enable_triggers {
+            shutdown_signal().await
+        } else {
+            std::future::pending().await
+        }
+    };
+    tokio::pin!(shutdown);
+    let mut ticker = tokio::time::interval(TICK);
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    engine.settle(unix_now());
+    loop {
+        // Connection events first: a connection sends `Messages` and its
+        // `State` back to back, so a `Quit` is never handled between them.
+        tokio::select! {
+            biased;
+            Some((id, ev)) = ev_rx.recv() => engine.on_conn_event(&id, ev).await,
+            cmd = rx.recv() => {
+                if engine.on_command(cmd).is_break() {
+                    break;
+                }
+            }
+            _ = ticker.tick() => engine.on_tick(),
+            _ = &mut shutdown => break,
+        }
+        engine.settle(unix_now());
+    }
+
+    for t in triggers {
+        t.abort();
+    }
+    let result = engine.shutdown();
+    on_exit();
+    result
+}
+
+struct Running {
+    ctl: ConnControl,
+    base_url: String,
+    auth: Option<Auth>,
+}
+
+struct Engine {
+    paths: AppPaths,
+    http: reqwest::Client,
+    media: MediaFetcher,
+    notifier: Arc<dyn Notifier>,
+    opener: Arc<dyn UrlOpener>,
+    strings: &'static Strings,
+    on_tray: Box<dyn Fn(TrayState) + Send>,
+    dispatcher: Dispatcher,
+    /// Last successfully written `settings.json` content.
+    saved_settings: Settings,
+    instances: BTreeMap<String, InstanceState>,
+    connections: HashMap<String, Running>,
+    statuses: BTreeMap<String, (ConnStatus, i64)>,
+    state_dirty: bool,
+    tray: Option<TrayState>,
+}
+
+impl Engine {
+    fn start_connections(
+        &mut self,
+        secrets: &dyn SecretStore,
+        tune: fn(&mut ConnectionConfig),
+        tx: &mpsc::UnboundedSender<(String, ConnEvent)>,
+    ) {
+        let now = unix_now();
+        for inst in &self.dispatcher.settings.instances {
+            if inst.topics.is_empty() {
+                continue;
+            }
+            let auth = match resolve_auth(secrets, inst) {
+                Ok(auth) => auth,
+                Err(e) => {
+                    tracing::error!(instance = %inst.id, error = %format!("{e:#}"), "cannot load credentials");
+                    self.statuses
+                        .insert(inst.id.clone(), (ConnStatus::AuthFailed, now));
+                    continue;
+                }
+            };
+            let mut cfg = ConnectionConfig::production(inst, auth.clone());
+            tune(&mut cfg);
+            let ctl = ConnControl::default();
+            let state = self.instances.get(&inst.id).cloned().unwrap_or_default();
+            spawn_connection(cfg, state, self.http.clone(), tx.clone(), ctl.clone());
+            self.connections.insert(
+                inst.id.clone(),
+                Running {
+                    ctl,
+                    base_url: inst.url.clone(),
+                    auth,
+                },
+            );
+        }
+    }
+
+    async fn on_conn_event(&mut self, id: &str, ev: ConnEvent) {
+        let now = unix_now();
+        match ev {
+            ConnEvent::Status(status) => track_status(&mut self.statuses, id, status, now),
+            ConnEvent::Messages { messages, catch_up } => {
+                let notifications = self.dispatcher.on_messages(id, &messages, catch_up, now);
+                self.state_dirty = true;
+                for n in notifications {
+                    let n = match self.connections.get(id) {
+                        Some(r) => self.media.resolve(n, &r.base_url, r.auth.as_ref()).await,
+                        None => n,
+                    };
+                    show(self.notifier.as_ref(), &n);
+                }
+            }
+            ConnEvent::Gap => {
+                self.state_dirty = true;
+                if let Some(n) = self.dispatcher.on_gap(id, now) {
+                    show(self.notifier.as_ref(), &n);
+                }
+            }
+            ConnEvent::State(state) => {
+                self.instances.insert(id.to_owned(), state);
+                self.state_dirty = true;
+            }
+        }
+    }
+
+    fn on_command(&mut self, cmd: Option<Command>) -> ControlFlow<()> {
+        match cmd {
+            None | Some(Command::Quit) => return ControlFlow::Break(()),
+            Some(Command::Activated(payload)) => self.spawn_action(payload),
+            Some(Command::ReconnectAll) => {
+                tracing::info!("reconnecting all instances");
+                for r in self.connections.values() {
+                    r.ctl.reconnect.notify_one();
+                }
+            }
+            Some(Command::PauseAll(until)) => self.dispatcher.pause_all(until),
+            Some(Command::SetTopicMuted {
+                instance_id,
+                topic,
+                muted,
+            }) => {
+                self.dispatcher.set_topic_muted(&instance_id, &topic, muted);
+            }
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Runs the action off the event loop so a slow HTTP action cannot delay
+    /// message delivery.
+    fn spawn_action(&self, payload: ActivationPayload) {
+        let http = self.http.clone();
+        let opener = self.opener.clone();
+        let notifier = self.notifier.clone();
+        let strings = self.strings;
+        tokio::spawn(async move {
+            if let Err(err) = actions::perform(&http, &payload, opener.as_ref()).await {
+                tracing::warn!(error = %format!("{err:#}"), "action failed");
+                show(
+                    notifier.as_ref(),
+                    &action_failed(&payload, &err.to_string(), strings),
+                );
+            }
+        });
+    }
+
+    fn on_tick(&mut self) {
+        if self.state_dirty {
+            match save_json(&self.paths.state_file(), &self.state()) {
+                Ok(()) => self.state_dirty = false,
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "saving state failed"),
+            }
+        }
+    }
+
+    /// Clears an expired pause, persists changed settings and reports a changed
+    /// tray state.
+    fn settle(&mut self, now: i64) {
+        let paused = self.dispatcher.is_paused(now);
+        if self.dispatcher.settings != self.saved_settings {
+            match save_json(&self.paths.settings_file(), &self.dispatcher.settings) {
+                Ok(()) => self.saved_settings = self.dispatcher.settings.clone(),
+                Err(e) => tracing::warn!(error = %format!("{e:#}"), "saving settings failed"),
+            }
+        }
+        let tray = aggregate(&self.dispatcher.settings, &self.statuses, paused, now);
+        if self.tray.as_ref() != Some(&tray) {
+            (self.on_tray)(tray.clone());
+            self.tray = Some(tray);
+        }
+    }
+
+    fn state(&self) -> State {
+        State {
+            version: STATE_VERSION,
+            instances: self.instances.clone(),
+            recent: self.dispatcher.recent.clone(),
+            gaps: self.dispatcher.gaps.clone(),
+        }
+    }
+
+    /// Stops all connections and writes settings and state.
+    fn shutdown(&mut self) -> anyhow::Result<()> {
+        for r in self.connections.values() {
+            r.ctl.cancel.cancel();
+        }
+        let settings = save_json(&self.paths.settings_file(), &self.dispatcher.settings);
+        let state = save_json(&self.paths.state_file(), &self.state());
+        for e in [&settings, &state]
+            .into_iter()
+            .filter_map(|r| r.as_ref().err())
+        {
+            tracing::error!(error = %format!("{e:#}"), "saving on exit failed");
+        }
+        settings.and(state)
+    }
+}
+
+/// Records a connection status. `since` marks when the instance entered its
+/// condition (connected, without connection, auth failed): retries after a
+/// failure keep the failure and its time, so the tray's grace period can run
+/// out and `AuthFailed` does not flicker during auth retries.
+fn track_status(
+    statuses: &mut BTreeMap<String, (ConnStatus, i64)>,
+    id: &str,
+    status: ConnStatus,
+    now: i64,
+) {
+    fn condition(s: &ConnStatus) -> u8 {
+        match s {
+            ConnStatus::Connected => 0,
+            ConnStatus::Connecting | ConnStatus::Disconnected { .. } => 1,
+            ConnStatus::AuthFailed => 2,
+        }
+    }
+    match statuses.get_mut(id) {
+        Some((old, _))
+            if status == ConnStatus::Connecting && !matches!(old, ConnStatus::Connected) => {}
+        Some((old, _)) if condition(old) == condition(&status) => *old = status,
+        _ => {
+            statuses.insert(id.to_owned(), (status, now));
+        }
+    }
+}
+
+fn show(notifier: &dyn Notifier, n: &Notification) {
+    tracing::debug!(id = %n.id, title = %n.title, "showing notification");
+    if let Err(e) = notifier.show(n) {
+        tracing::warn!(id = %n.id, error = %format!("{e:#}"), "showing notification failed");
+    }
+}
+
+fn action_failed(payload: &ActivationPayload, error: &str, strings: &Strings) -> Notification {
+    let label = match payload {
+        ActivationPayload::Http { label, .. } => label.clone(),
+        ActivationPayload::Open { url } => url::Url::parse(url)
+            .map(|u| u.scheme().to_owned())
+            .unwrap_or_else(|_| "link".into()),
+    };
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    Notification {
+        id: format!("action-failed:{stamp}"),
+        thread: "action-failed".into(),
+        title: fill(strings.action_failed_title, &[("label", &label)]),
+        body: error.to_owned(),
+        level: Level::Passive,
+        default_action: None,
+        buttons: Vec::new(),
+        image: None,
+        icon: None,
+    }
+}
+
+/// Resolves on Ctrl-C or (Unix) SIGTERM; never if no handler can be installed.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot listen for SIGTERM");
+                std::future::pending::<()>().await
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    let interrupt = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "cannot listen for Ctrl-C");
+            std::future::pending::<()>().await
+        }
+    };
+    tokio::select! {
+        _ = terminate => tracing::info!("SIGTERM received, quitting"),
+        _ = interrupt => tracing::info!("Ctrl-C received, quitting"),
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::i18n::EN;
+    use crate::settings::{Instance, Topic};
+
+    fn disconnected() -> ConnStatus {
+        ConnStatus::Disconnected {
+            error: "refused".into(),
+        }
+    }
+
+    #[test]
+    fn retries_keep_the_time_the_connection_was_lost() {
+        let mut st = BTreeMap::new();
+        track_status(&mut st, "a", ConnStatus::Connecting, 0);
+        track_status(&mut st, "a", disconnected(), 10);
+        track_status(&mut st, "a", ConnStatus::Connecting, 12);
+        track_status(&mut st, "a", disconnected(), 20);
+        assert_eq!(st["a"], (disconnected(), 0));
+
+        let settings = Settings {
+            instances: vec![Instance {
+                id: "a".into(),
+                url: "https://ntfy.example.org".into(),
+                topics: vec![Topic {
+                    name: "t".into(),
+                    ..Topic::default()
+                }],
+                ..Instance::default()
+            }],
+            ..Settings::default()
+        };
+        assert!(matches!(
+            aggregate(&settings, &st, false, 20),
+            TrayState::Problem { .. }
+        ));
+
+        track_status(&mut st, "a", ConnStatus::Connected, 30);
+        track_status(&mut st, "a", ConnStatus::Connected, 40);
+        assert_eq!(st["a"], (ConnStatus::Connected, 30));
+        track_status(&mut st, "a", ConnStatus::Connecting, 100);
+        assert_eq!(st["a"], (ConnStatus::Connecting, 100));
+    }
+
+    #[test]
+    fn auth_retry_keeps_auth_failed() {
+        let mut st = BTreeMap::new();
+        track_status(&mut st, "a", ConnStatus::AuthFailed, 200);
+        track_status(&mut st, "a", ConnStatus::Connecting, 260);
+        assert_eq!(st["a"], (ConnStatus::AuthFailed, 200));
+        track_status(&mut st, "a", disconnected(), 261);
+        assert_eq!(st["a"], (disconnected(), 261));
+    }
+
+    #[test]
+    fn action_failed_label_and_body() {
+        let http = ActivationPayload::Http {
+            label: "Restart".into(),
+            method: "POST".into(),
+            url: "https://h/x?token=s".into(),
+            headers: Default::default(),
+            body: None,
+        };
+        let n = action_failed(&http, "HTTP action returned status 500", &EN);
+        assert_eq!(n.title, "Action failed: Restart");
+        assert_eq!(n.body, "HTTP action returned status 500");
+        assert_eq!(n.level, Level::Passive);
+
+        let bad = ActivationPayload::Open {
+            url: "not a url".into(),
+        };
+        assert_eq!(action_failed(&bad, "e", &EN).title, "Action failed: link");
+    }
+}
