@@ -32,7 +32,7 @@ pub static DE: Strings = Strings {
     menu_open_config: "Konfigurationsordner öffnen",
     menu_open_logs: "Logs öffnen",
     tray_config_invalid: "Konfiguration fehlerhaft – siehe Logs",
-    import_failed_title: "config.yaml konnte nicht gelesen werden",
+    import_failed_title: "Konfiguration konnte nicht gelesen werden",
     import_while_running: "ntfy-native läuft bereits – bitte beenden und --import {path} erneut ausführen",
 };
 
@@ -51,7 +51,7 @@ pub static EN: Strings = Strings {
     menu_open_config: "Open config folder",
     menu_open_logs: "Open logs",
     tray_config_invalid: "Configuration invalid – see logs",
-    import_failed_title: "Could not read config.yaml",
+    import_failed_title: "Could not read the configuration",
     import_while_running: "ntfy-native is already running – quit it and run --import {path} again",
 };
 
@@ -99,9 +99,9 @@ mod tests {
         assert_eq!(EN.tray_config_invalid, "Configuration invalid – see logs");
         assert_eq!(
             DE.import_failed_title,
-            "config.yaml konnte nicht gelesen werden"
+            "Konfiguration konnte nicht gelesen werden"
         );
-        assert_eq!(EN.import_failed_title, "Could not read config.yaml");
+        assert_eq!(EN.import_failed_title, "Could not read the configuration");
     }
 
     #[test]

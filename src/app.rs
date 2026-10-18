@@ -304,7 +304,8 @@ fn config_near_misses(dir: &Path) -> Vec<String> {
 
 struct Startup {
     settings: Settings,
-    /// Outermost message of a failed import that left the settings unchanged.
+    /// File name and outermost message of a failed import that left the
+    /// settings unchanged.
     import_error: Option<String>,
 }
 
@@ -405,9 +406,22 @@ fn after_failed_import(
             );
             Startup {
                 settings: existing.unwrap_or_default(),
-                import_error: Some(err.to_string()),
+                import_error: Some(import_error_text(import, err)),
             }
         }
+    }
+}
+
+/// The outermost error message, prefixed with the file name unless it
+/// already contains the file's path.
+fn import_error_text(import: &Path, err: &anyhow::Error) -> String {
+    let msg = err.to_string();
+    if msg.contains(&import.display().to_string()) {
+        return msg;
+    }
+    match import.file_name() {
+        Some(name) => format!("{}: {msg}", name.to_string_lossy()),
+        None => format!("{}: {msg}", import.display()),
     }
 }
 
@@ -670,8 +684,27 @@ mod tests {
         let s = initial_settings(&paths, &Cli::default(), &MemoryStore::new()).unwrap();
         assert!(s.settings.instances.is_empty());
         let err = s.import_error.expect("import error");
-        assert!(err.contains("instance 1: missing field `url`"), "{err}");
+        assert!(
+            err.starts_with("config.yaml: instance 1: missing field `url`"),
+            "{err}"
+        );
         assert!(!err.contains("s3cret"), "{err}");
+    }
+
+    #[test]
+    fn import_error_names_the_file_once() {
+        let (_dir, paths) = setup();
+        let yml = paths.config_dir.join("config.yml");
+        fs::write(&yml, "instances: [nonsense").unwrap();
+        let s = initial_settings(&paths, &Cli::default(), &MemoryStore::new()).unwrap();
+        let err = s.import_error.expect("import error");
+        assert!(err.starts_with("config.yml: "), "{err}");
+
+        // Messages that already contain the path are not prefixed again.
+        fs::write(&yml, [0xFF, 0xFE, b'x', 0]).unwrap();
+        let s = initial_settings(&paths, &Cli::default(), &MemoryStore::new()).unwrap();
+        let err = s.import_error.expect("import error");
+        assert!(err.starts_with(&yml.display().to_string()), "{err}");
     }
 
     #[test]
@@ -699,7 +732,7 @@ mod tests {
         use crate::i18n::EN;
         use crate::notification::Level;
         let n = import_failed_notification("instance 1: missing field `url`", &EN);
-        assert_eq!(n.title, "Could not read config.yaml");
+        assert_eq!(n.title, "Could not read the configuration");
         assert_eq!(n.body, "instance 1: missing field `url`");
         assert_eq!(n.level, Level::Active);
         assert!(n.default_action.is_none() && n.buttons.is_empty());
