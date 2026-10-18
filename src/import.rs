@@ -245,10 +245,9 @@ fn auth_plan(imp: &ImportInstance, existing: Option<&AuthKind>) -> Result<AuthPl
                 username: username.clone(),
             })
         }
-        (Credentials::Username(_), Some(AuthKind::Basic { .. })) => bail!(
-            "{}: changed username needs a password / geänderter Benutzername braucht ein password",
-            imp.url
-        ),
+        (Credentials::Username(_), Some(AuthKind::Basic { .. })) => {
+            bail!("{}: changed username needs a password", imp.url)
+        }
         (Credentials::Username(_), _) => bail!(
             "{}: username without password needs an already stored password",
             imp.url
@@ -408,11 +407,12 @@ pub fn import_file(
         .and_then(|()| fs::rename(&tmp, &imported))
         .with_context(|| format!("writing {}", imported.display()))?;
     // Re-importing the sanitized file itself rewrote it in place.
-    let is_target = path.parent() == imported.parent()
-        && path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .is_some_and(|n| n.eq_ignore_ascii_case(SANITIZED_NAME));
+    // `imported` shares `path`'s parent, so only the name needs comparing
+    // (case-insensitively, for case-insensitive filesystems).
+    let is_target = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case(SANITIZED_NAME));
     if !is_target {
         fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
     }
@@ -505,19 +505,28 @@ instances:
 
     #[test]
     fn changed_username_requires_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
         let store = MemoryStore::new();
-        let y = "instances:\n  - url: https://x.org\n    username: alice\n    password: pw\n";
-        let s1 = apply_import(None, &parse_import(y).unwrap(), &store).unwrap();
-        let y2 = "instances:\n  - url: https://x.org\n    username: bob\n";
-        let err = apply_import(Some(s1.clone()), &parse_import(y2).unwrap(), &store).unwrap_err();
-        assert!(err.to_string().contains("password"), "{err}");
+        let cfg = dir.path().join("config.yaml");
+        fs::write(
+            &cfg,
+            "instances:\n  - url: https://x.org\n    username: alice\n    password: pw\n",
+        )
+        .unwrap();
+        let s1 = import_file(&cfg, None, &store, &settings_path).unwrap();
+        let before = fs::read(&settings_path).unwrap();
+
+        fs::write(
+            &cfg,
+            "instances:\n  - url: https://x.org\n    username: bob\n",
+        )
+        .unwrap();
+        let err = import_file(&cfg, Some(s1), &store, &settings_path).unwrap_err();
+        assert!(err.to_string().contains("changed username"), "{err}");
+        assert_eq!(fs::read(&settings_path).unwrap(), before);
         assert_eq!(store.get("instance:x.org").unwrap().as_deref(), Some("pw"));
-        assert_eq!(
-            s1.instances[0].auth,
-            AuthKind::Basic {
-                username: "alice".into()
-            }
-        );
+        assert!(cfg.exists());
     }
 
     #[test]

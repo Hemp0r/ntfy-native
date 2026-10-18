@@ -133,6 +133,6 @@ Optionale Repository-Secrets (ohne sie wird die DMG ad-hoc signiert und der Lauf
 | --- | --- |
 | `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `MACOS_SIGN_IDENTITY` | alle drei: Signatur mit Developer-ID-Zertifikat (Hardened Runtime, Zeitstempel) statt ad-hoc |
 | `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD` | zusätzlich zur Signatur: Notarisierung und Stapling der DMG |
-| `MACOS_PROVISION_PROFILE_BASE64` | bettet das Provisioning-Profil ein und aktiviert das zeitkritische Entitlement (ohne Profil startet macOS die App mit diesem Entitlement nicht, daher wird es sonst weggelassen) |
+| `MACOS_PROVISION_PROFILE_BASE64` | setzt die Zertifikats-Secrets voraus (ohne Signatur wird das Profil ignoriert); bettet das Provisioning-Profil ein und aktiviert das zeitkritische Entitlement. Die Entitlements werden aus dem Profil übernommen; dessen App-ID muss auf `.dev.hemp0r.ntfy-native` enden, sonst bricht der Lauf ab. Ohne Profil startet macOS die App mit diesem Entitlement nicht, daher wird es dann weggelassen |
 
 Die Windows-Builds sind nicht signiert (SmartScreen warnt beim ersten Start). Ein MSI-Installer folgt in Teil 3 des Plans.

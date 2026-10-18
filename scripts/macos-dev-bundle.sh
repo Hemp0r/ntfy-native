@@ -25,10 +25,10 @@ app=target/ntfy-native.app
 assemble_app "$bin" "$app"
 
 if [[ -n "${MACOS_SIGN_IDENTITY:-}" ]]; then
-  sign_app "$app" "$MACOS_SIGN_IDENTITY" 1
+  sign_app "$app" "$MACOS_SIGN_IDENTITY" packaging/macos/ntfy-native.entitlements
 else
   echo "note: ad-hoc signature without time-sensitive entitlement" >&2
-  sign_app "$app" - 0
+  sign_app "$app" -
 fi
 
 echo "$app"
