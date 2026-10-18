@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod connection;
+pub mod dispatcher;
 pub mod emoji;
 mod emoji_table;
 pub mod i18n;
@@ -12,5 +13,6 @@ pub mod render;
 pub mod secrets;
 pub mod settings;
 pub mod state;
+pub mod status;
 pub mod store;
 pub mod sync;
