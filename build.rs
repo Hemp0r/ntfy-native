@@ -8,9 +8,10 @@ fn main() {
     // have no resource compiler.
     let host_windows = std::env::var("HOST").is_ok_and(|host| host.contains("windows"));
     if target_windows && host_windows {
+        // Only the app binary gets the resource, not tests or examples.
         winresource::WindowsResource::new()
             .set_icon("assets/icon.ico")
-            .compile()
+            .compile_for("ntfy-native")
             .expect("embedding the icon into the Windows executable");
     }
 }
