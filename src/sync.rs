@@ -62,13 +62,49 @@ impl InstanceState {
     }
 
     /// Call after `detect_gap` returned true and before accepting the polled
-    /// messages, so the "possibly missed" hint fires only once. Sets the
+    /// messages, so the "possibly missed" hint fires only once. Catch-up callers
+    /// should use `apply_catch_up`, which enforces this order. Sets the
     /// watermark to `server_now` (also when the server clock went backwards)
     /// and forgets `last_message`; accepting older polled messages afterwards
     /// does not lower the watermark.
     pub fn rebaseline_after_gap(&mut self, server_now: i64) {
         self.watermark = Some(server_now);
         self.last_message = None;
+    }
+}
+
+/// Result of `InstanceState::apply_catch_up`.
+#[derive(Debug, PartialEq)]
+pub struct CatchUpResult {
+    pub gap: bool,
+    pub accepted: Vec<Message>,
+}
+
+impl InstanceState {
+    /// Processes one catch-up poll in the only correct order: gap detection on
+    /// the pre-poll state, rebaseline on a gap, accept the polled messages, then
+    /// observe the server time (which pulls the watermark back if pre-correction
+    /// messages raised it past a corrected server clock). Without a server time
+    /// (no `Date` header) no gap can be computed and nothing time-related is
+    /// touched; the local clock is never used.
+    pub fn apply_catch_up(
+        &mut self,
+        polled: Vec<Message>,
+        server_now: Option<i64>,
+        cache_duration: i64,
+    ) -> CatchUpResult {
+        let mut gap = false;
+        if let Some(now) = server_now {
+            gap = detect_gap(self, &polled, now, cache_duration);
+            if gap {
+                self.rebaseline_after_gap(now);
+            }
+        }
+        let accepted = polled.into_iter().filter(|m| self.accept(m)).collect();
+        if let Some(now) = server_now {
+            self.observe_time(now);
+        }
+        CatchUpResult { gap, accepted }
     }
 }
 
@@ -81,6 +117,8 @@ impl InstanceState {
 /// server lost its cache (restart without `cache-file`), or
 /// (c) the server clock is behind our watermark by more than the margin (it was
 /// turned back while we were offline), so our timeline is no longer comparable.
+/// Catch-up callers should use `InstanceState::apply_catch_up` instead of calling
+/// this directly.
 /// Messages without `expires` (`Cache: no`, or state from an older app version)
 /// are never sentinels. Only server times are compared. Not detecting a gap is
 /// no proof of completeness: without a recent message in the server cache a
@@ -261,25 +299,60 @@ mod tests {
         assert!(!detect_gap(&s, &[], now, 43_200));
     }
 
+    fn msg_exp(id: &str, time: i64, expires: i64) -> Message {
+        Message {
+            expires: Some(expires),
+            ..msg(id, time)
+        }
+    }
+
     #[test]
     fn gap_fires_once_after_rebaseline() {
         let now = 1_000_000;
         let mut s = st(Some(now - 60), Some(("a", now - 100)));
-        assert!(detect_gap(&s, &[], now, 43_200));
-        s.rebaseline_after_gap(now);
-        assert!(s.accept(&msg("older", now - 500)));
+        let c = msg_exp("c", now - 50, now + 1000);
+        let r = s.apply_catch_up(vec![c.clone()], Some(now), 43_200);
+        assert!(r.gap);
+        assert_eq!(r.accepted, vec![c.clone()]);
         assert_eq!(s.watermark, Some(now));
-        assert!(!detect_gap(&s, &[], now, 43_200));
+        let r = s.apply_catch_up(vec![c], Some(now + 5), 43_200);
+        assert!(!r.gap);
+        assert!(r.accepted.is_empty());
     }
 
     #[test]
     fn gap_on_server_clock_regression_while_offline() {
         let mut s = st(Some(10_000), Some(("a", 10_000)));
         s.last_message.as_mut().unwrap().expires = Some(20_000);
-        assert!(detect_gap(&s, &[msg("a", 10_000)], 7_000, 43_200));
-        s.rebaseline_after_gap(7_000);
+        s.seen_ids.push_back("a".into());
+        let r = s.apply_catch_up(vec![msg_exp("a", 10_000, 20_000)], Some(7_000), 43_200);
+        assert!(r.gap);
+        assert!(r.accepted.is_empty());
         assert_eq!(s.watermark, Some(7_000));
         assert_eq!(catch_up_since(&s), Some(6_970));
+    }
+
+    #[test]
+    fn clock_regression_with_unseen_pre_correction_message() {
+        let mut s = st(Some(10_000), Some(("a", 10_000)));
+        s.last_message.as_mut().unwrap().expires = Some(20_000);
+        s.seen_ids.push_back("a".into());
+        let polled = vec![msg_exp("a", 10_000, 20_000), msg("b", 10_010)];
+        let r = s.apply_catch_up(polled, Some(7_000), 43_200);
+        assert!(r.gap);
+        assert_eq!(r.accepted, vec![msg("b", 10_010)]);
+        assert!(catch_up_since(&s) <= Some(7_000 - DEDUP_MARGIN_SECS));
+        let r = s.apply_catch_up(vec![], Some(7_010), 43_200);
+        assert!(!r.gap);
+    }
+
+    #[test]
+    fn catch_up_without_server_time_skips_gap_detection() {
+        let mut s = st(Some(0), Some(("a", 0)));
+        let r = s.apply_catch_up(vec![msg("b", 5)], None, 43_200);
+        assert!(!r.gap);
+        assert_eq!(r.accepted, vec![msg("b", 5)]);
+        assert_eq!(s.watermark, Some(5));
     }
 
     #[test]
