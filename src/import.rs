@@ -193,8 +193,31 @@ fn convert_instance(raw: RawInstance) -> Result<ImportInstance> {
     })
 }
 
+/// serde_yaml_ng prefixes errors with a 0-based path like `instances[1]: `;
+/// users count instances from 1.
+fn humanize_yaml_error(msg: &str) -> String {
+    let index = msg
+        .strip_prefix("instances[")
+        .and_then(|rest| rest.split_once(']'))
+        .and_then(|(n, rest)| Some((n.parse::<usize>().ok()?, rest)));
+    match index {
+        Some((n, rest)) => {
+            let rest = rest.strip_prefix('.').unwrap_or(rest);
+            format!(
+                "instance {}{}{rest}",
+                n + 1,
+                if rest.starts_with(':') { "" } else { ": " }
+            )
+        }
+        None => msg.to_owned(),
+    }
+}
+
+/// Errors are self-contained in their outermost message (shown in a
+/// notification) and never echo secrets.
 pub fn parse_import(yaml: &str) -> Result<ImportFile> {
-    let raw: RawFile = serde_yaml_ng::from_str(yaml).context("parsing config.yaml")?;
+    let raw: RawFile =
+        serde_yaml_ng::from_str(yaml).map_err(|e| anyhow!(humanize_yaml_error(&e.to_string())))?;
     let instances = raw
         .instances
         .into_iter()
@@ -388,6 +411,17 @@ pub fn sanitized_yaml(file: &ImportFile) -> String {
     format!("{SANITIZED_HEADER}{yaml}")
 }
 
+/// Notepad and PowerShell may save UTF-16; YAML must be UTF-8 here.
+fn decode_utf8(bytes: Vec<u8>) -> std::result::Result<String, &'static str> {
+    // ASCII text in UTF-16 without a byte order mark is valid UTF-8 with NULs.
+    let utf16 =
+        bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) || bytes.contains(&0);
+    if utf16 {
+        return Err("must be saved as UTF-8 (UTF-16 detected?)");
+    }
+    String::from_utf8(bytes).map_err(|_| "must be saved as UTF-8")
+}
+
 const SANITIZED_NAME: &str = "config.imported.yaml";
 
 pub fn import_file(
@@ -396,7 +430,8 @@ pub fn import_file(
     secrets: &dyn SecretStore,
     settings_path: &Path,
 ) -> Result<Settings> {
-    let yaml = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = fs::read(path).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?;
+    let yaml = decode_utf8(bytes).map_err(|e| anyhow!("{} {e}", path.display()))?;
     let file = parse_import(&yaml)?;
     let settings = apply_import(existing, &file, secrets)?;
     save_json(settings_path, &settings)?;
@@ -788,6 +823,106 @@ instances:
     fn rejects_empty_token() {
         let y = "instances:\n  - url: https://x.org\n    token: \"\"\n";
         assert!(parse_import(y).is_err());
+    }
+
+    #[test]
+    fn missing_url_names_field_and_instance() {
+        let y = "instances:\n  - url: https://a.org\n  - topics: [a]\n";
+        // The outermost message is shown in a notification, so it must
+        // name the problem on its own.
+        let err = parse_import(y).unwrap_err().to_string();
+        assert!(err.contains("instance 2"), "{err}");
+        assert!(err.contains("missing field `url`"), "{err}");
+    }
+
+    #[test]
+    fn yaml_error_paths_count_from_one() {
+        assert_eq!(
+            humanize_yaml_error("instances[0].password: invalid type: sequence"),
+            "instance 1: password: invalid type: sequence"
+        );
+        assert_eq!(
+            humanize_yaml_error("instances[9]: missing field `url` at line 4"),
+            "instance 10: missing field `url` at line 4"
+        );
+        assert_eq!(
+            humanize_yaml_error("urgent_breaks_dnd: invalid type"),
+            "urgent_breaks_dnd: invalid type"
+        );
+    }
+
+    #[test]
+    fn parse_errors_never_echo_secrets() {
+        let cases = [
+            // Errors elsewhere in a file holding a token or password.
+            "instances:\n  - url: https://a.org\n    token: tk_s3cret\n    topcs: [a]\n",
+            "instances:\n  - url: https://a.org\n    token: tk_s3cret\n  - topics: [a]\n",
+            "urgent_breaks_dnd: maybe\ninstances:\n  - url: https://a.org\n    token: tk_s3cret\n",
+            "instances:\n  - url: https://a.org\n    token: tk_s3cret\n    topics: [\"bad topic\"]\n",
+            "instances:\n  - url: https://a.org\n    username: u\n    password: tk_s3cret\n    cache_duration: soon\n",
+            "instances:\n  - url: https://a.org\n    token: tk_s3cret\n    topics: [a\n",
+            // A secret of the wrong type.
+            "instances:\n  - url: https://a.org\n    username: u\n    password: [tk_s3cret]\n",
+        ];
+        for y in cases {
+            let err = format!("{:#}", parse_import(y).unwrap_err());
+            assert!(!err.contains("s3cret"), "{y}\n=> {err}");
+        }
+    }
+
+    #[test]
+    fn utf16_file_asks_for_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        let settings_path = dir.path().join("settings.json");
+        for bom in [[0xFF, 0xFE], [0xFE, 0xFF]] {
+            let mut bytes = bom.to_vec();
+            for u in one("https://x.org", &["a"]).encode_utf16() {
+                bytes.extend(if bom[0] == 0xFF {
+                    u.to_le_bytes()
+                } else {
+                    u.to_be_bytes()
+                });
+            }
+            fs::write(&cfg, bytes).unwrap();
+            let err = import_file(&cfg, None, &MemoryStore::new(), &settings_path)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("must be saved as UTF-8"), "{err}");
+            assert!(err.contains("UTF-16"), "{err}");
+            assert!(cfg.exists());
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_asks_for_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        fs::write(&cfg, b"instances: [\xE4]\n").unwrap();
+        let err = import_file(&cfg, None, &MemoryStore::new(), &dir.path().join("s.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be saved as UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn utf8_bom_is_accepted() {
+        let y = format!("\u{feff}{}", one("https://x.org", &["a"]));
+        assert_eq!(parse_import(&y).unwrap().instances.len(), 1);
+    }
+
+    #[test]
+    fn unreadable_file_error_names_path_and_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        let err = import_file(&cfg, None, &MemoryStore::new(), &dir.path().join("s.json"))
+            .unwrap_err()
+            .to_string();
+        let prefix = format!("cannot read {}: ", cfg.display());
+        assert!(
+            err.len() > prefix.len() && err.starts_with(&prefix),
+            "{err}"
+        );
     }
 
     #[test]
