@@ -1,5 +1,6 @@
 //! Reconnect triggers: wake from sleep and network changes.
 
+use std::io;
 use std::time::{Duration, SystemTime};
 
 use futures_util::{Stream, StreamExt};
@@ -14,6 +15,8 @@ const WAKE_THRESHOLD: Duration = Duration::from_secs(30);
 /// The watcher reports every existing address at startup.
 const NET_STARTUP_IGNORE: Duration = Duration::from_secs(5);
 const NET_DEBOUNCE: Duration = Duration::from_secs(2);
+/// Delay before a failed network watcher is created again.
+const NET_RETRY: Duration = Duration::from_secs(60);
 
 /// True if the wall clock advanced by more than `tick + threshold`.
 pub fn is_wake_jump(
@@ -49,21 +52,42 @@ pub fn spawn_wake_detector(tx: mpsc::UnboundedSender<Command>) -> tokio::task::J
 
 /// Sends `ReconnectAll` once the network configuration has settled after a change.
 pub fn spawn_network_watcher(tx: mpsc::UnboundedSender<Command>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        match if_watch::tokio::IfWatcher::new() {
-            Ok(watcher) => watch_network(watcher, tx, NET_STARTUP_IGNORE, NET_DEBOUNCE).await,
+    tokio::spawn(supervise_network(
+        if_watch::tokio::IfWatcher::new,
+        tx,
+        NET_RETRY,
+    ))
+}
+
+/// Runs a watcher from `create`; after it fails (or cannot be created) it is
+/// created again after `retry`, until the engine is gone.
+async fn supervise_network<F, S>(mut create: F, tx: mpsc::UnboundedSender<Command>, retry: Duration)
+where
+    F: FnMut() -> io::Result<S>,
+    S: Stream<Item = io::Result<IfEvent>> + Unpin,
+{
+    loop {
+        match create() {
+            Ok(events) => watch_network(events, &tx, NET_STARTUP_IGNORE, NET_DEBOUNCE).await,
             Err(e) => tracing::warn!(error = %e, "network watcher unavailable"),
         }
-    })
+        if tx.is_closed() {
+            return;
+        }
+        tracing::info!(
+            retry_secs = retry.as_secs(),
+            "restarting network watcher later"
+        );
+        tokio::time::sleep(retry).await;
+    }
 }
 
 /// Ignores events during `ignore_for`, then sends `ReconnectAll` once no
-/// further event arrived for `quiet`. Stops on the first error, since the
-/// watcher may keep failing immediately; the keepalive watchdog still covers
-/// lost connections.
+/// further event arrived for `quiet`. Returns on the first error, since the
+/// watcher may keep failing immediately (the caller retries later).
 async fn watch_network<S, E>(
     mut events: S,
-    tx: mpsc::UnboundedSender<Command>,
+    tx: &mpsc::UnboundedSender<Command>,
     ignore_for: Duration,
     quiet: Duration,
 ) where
@@ -88,7 +112,7 @@ async fn watch_network<S, E>(
                     }
                 }
                 Some(Err(e)) => {
-                    tracing::warn!(error = %e, "network watcher failed, stopping it");
+                    tracing::warn!(error = %e, "network watcher failed");
                     return;
                 }
                 None => return,
@@ -106,8 +130,8 @@ async fn watch_network<S, E>(
 
 #[cfg(test)]
 mod tests {
-    use std::io;
     use std::pin::Pin;
+    use std::sync::{Arc, Mutex};
 
     use if_watch::IpNet;
 
@@ -170,7 +194,9 @@ mod tests {
     async fn network_changes_ignored_at_startup_then_debounced() {
         let (ev_tx, events) = events();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        tokio::spawn(watch_network(events, tx, NET_STARTUP_IGNORE, NET_DEBOUNCE));
+        tokio::spawn(
+            async move { watch_network(events, &tx, NET_STARTUP_IGNORE, NET_DEBOUNCE).await },
+        );
         let sleep = |ms| tokio::time::sleep(Duration::from_millis(ms));
 
         sleep(1000).await;
@@ -190,15 +216,61 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn network_watcher_stops_on_error() {
+    async fn network_watch_ends_on_error() {
         let (ev_tx, events) = events();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let task = tokio::spawn(watch_network(events, tx, Duration::ZERO, NET_DEBOUNCE));
+        let task =
+            tokio::spawn(
+                async move { watch_network(events, &tx, Duration::ZERO, NET_DEBOUNCE).await },
+            );
         ev_tx.send(Err(io::Error::other("gone"))).unwrap();
         tokio::time::timeout(Duration::from_secs(1), task)
             .await
             .expect("watcher ends")
             .unwrap();
         assert_eq!(reconnects(&mut rx), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn network_watcher_recreated_after_failure() {
+        let start = Instant::now();
+        let created = Arc::new(Mutex::new(Vec::new()));
+        let (ev_tx, working) = events();
+        let mut working = Some(working);
+        let log = created.clone();
+        let create = move || -> io::Result<Events> {
+            let mut log = log.lock().unwrap();
+            log.push((Instant::now() - start).as_secs());
+            match log.len() {
+                1 => Err(io::Error::other("init failed")),
+                2 => Ok(Box::pin(futures_util::stream::iter([Err(
+                    io::Error::other("gone"),
+                )]))),
+                _ => Ok(working.take().expect("created at most three times")),
+            }
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        tokio::spawn(supervise_network(create, tx, NET_RETRY));
+
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(*created.lock().unwrap(), [0, 60, 120]);
+        ev_tx.send(Ok(up())).unwrap();
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert_eq!(reconnects(&mut rx), 1, "recreated watcher works");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn network_watcher_retry_ends_with_engine() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+        let task = tokio::spawn(supervise_network(
+            || -> io::Result<Events> { Err(io::Error::other("init failed")) },
+            tx,
+            NET_RETRY,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("no retry once the engine is gone")
+            .unwrap();
     }
 }

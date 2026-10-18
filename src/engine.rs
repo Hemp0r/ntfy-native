@@ -8,13 +8,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
+use tokio_util::sync::CancellationToken;
 
 use crate::actions::{self, UrlOpener};
 use crate::connection::{ConnControl, ConnEvent, ConnStatus, ConnectionConfig, spawn_connection};
 use crate::dispatcher::Dispatcher;
 use crate::i18n::{Strings, fill};
 use crate::media::MediaFetcher;
-use crate::notification::{ActivationPayload, Level, Notification, Notifier};
+use crate::notification::{ActivationPayload, Level, MediaRef, Notification, Notifier};
 use crate::ntfy::client::http_client;
 use crate::paths::AppPaths;
 use crate::secrets::{Auth, SecretStore, resolve_auth};
@@ -27,6 +28,8 @@ use crate::triggers::{spawn_network_watcher, spawn_wake_detector};
 const TICK: Duration = Duration::from_secs(5);
 const MEDIA_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const STATE_VERSION: u32 = 1;
+/// On quit, pending notifications are shown without media within this time.
+const FLUSH_DEADLINE: Duration = Duration::from_secs(2);
 
 #[derive(Debug)]
 pub enum Command {
@@ -118,6 +121,14 @@ pub async fn run_engine(
     }
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+    let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
+    let stop_media = CancellationToken::new();
+    let mut worker = tokio::spawn(delivery_worker(
+        delivery_rx,
+        media,
+        notifier.clone(),
+        stop_media.clone(),
+    ));
     let mut engine = Engine {
         saved_settings: settings.clone(),
         dispatcher: Dispatcher::new(settings, state.recent, state.gaps, strings),
@@ -126,9 +137,11 @@ pub async fn run_engine(
         statuses: BTreeMap::new(),
         state_dirty: false,
         tray: None,
+        settings_save: SaveHealth::default(),
+        state_save: SaveHealth::default(),
         paths,
         http,
-        media,
+        deliveries: Some(delivery_tx),
         notifier,
         opener,
         strings,
@@ -159,9 +172,11 @@ pub async fn run_engine(
     loop {
         // Connection events first: a connection sends `Messages` and its
         // `State` back to back, so a `Quit` is never handled between them.
+        // Event handling never awaits (media and display run in the delivery
+        // worker), so a command waits at most for the events already queued.
         tokio::select! {
             biased;
-            Some((id, ev)) = ev_rx.recv() => engine.on_conn_event(&id, ev).await,
+            Some((id, ev)) = ev_rx.recv() => engine.on_conn_event(&id, ev),
             cmd = rx.recv() => {
                 if engine.on_command(cmd).is_break() {
                     break;
@@ -176,9 +191,53 @@ pub async fn run_engine(
     for t in triggers {
         t.abort();
     }
-    let result = engine.shutdown();
+    engine.stop_connections();
+    // Closing the queue lets the worker finish; pending items skip media.
+    engine.deliveries = None;
+    stop_media.cancel();
+    if tokio::time::timeout(FLUSH_DEADLINE, &mut worker)
+        .await
+        .is_err()
+    {
+        worker.abort();
+        tracing::warn!("notifications still pending at exit were dropped");
+    }
+    let result = engine.save_all();
     on_exit();
     result
+}
+
+/// A notification queued for media download and display.
+struct Delivery {
+    n: Notification,
+    base_url: String,
+    auth: Option<Auth>,
+}
+
+/// Shows queued notifications in order, after fetching their media. Once
+/// `stop_media` fires, remaining and in-flight items are shown without
+/// remote media.
+async fn delivery_worker(
+    mut rx: mpsc::UnboundedReceiver<Delivery>,
+    media: MediaFetcher,
+    notifier: Arc<dyn Notifier>,
+    stop_media: CancellationToken,
+) {
+    while let Some(d) = rx.recv().await {
+        let n = tokio::select! {
+            biased;
+            _ = stop_media.cancelled() => without_remote_media(d.n),
+            n = media.resolve(d.n.clone(), &d.base_url, d.auth.as_ref()) => n,
+        };
+        show(notifier.as_ref(), &n);
+    }
+}
+
+fn without_remote_media(mut n: Notification) -> Notification {
+    let local = |m: Option<MediaRef>| m.filter(|m| matches!(m, MediaRef::Local(_)));
+    n.image = local(n.image.take());
+    n.icon = local(n.icon.take());
+    n
 }
 
 struct Running {
@@ -190,7 +249,8 @@ struct Running {
 struct Engine {
     paths: AppPaths,
     http: reqwest::Client,
-    media: MediaFetcher,
+    /// `None` once closed for shutdown.
+    deliveries: Option<mpsc::UnboundedSender<Delivery>>,
     notifier: Arc<dyn Notifier>,
     opener: Arc<dyn UrlOpener>,
     strings: &'static Strings,
@@ -203,6 +263,8 @@ struct Engine {
     statuses: BTreeMap<String, (ConnStatus, i64)>,
     state_dirty: bool,
     tray: Option<TrayState>,
+    settings_save: SaveHealth,
+    state_save: SaveHealth,
 }
 
 impl Engine {
@@ -242,7 +304,9 @@ impl Engine {
         }
     }
 
-    async fn on_conn_event(&mut self, id: &str, ev: ConnEvent) {
+    /// Notifications are queued before the connection's following `State`
+    /// event is applied.
+    fn on_conn_event(&mut self, id: &str, ev: ConnEvent) {
         let now = unix_now();
         match ev {
             ConnEvent::Status(status) => track_status(&mut self.statuses, id, status, now),
@@ -250,23 +314,34 @@ impl Engine {
                 let notifications = self.dispatcher.on_messages(id, &messages, catch_up, now);
                 self.state_dirty = true;
                 for n in notifications {
-                    let n = match self.connections.get(id) {
-                        Some(r) => self.media.resolve(n, &r.base_url, r.auth.as_ref()).await,
-                        None => n,
-                    };
-                    show(self.notifier.as_ref(), &n);
+                    self.enqueue(id, n);
                 }
             }
             ConnEvent::Gap => {
                 self.state_dirty = true;
                 if let Some(n) = self.dispatcher.on_gap(id, now) {
-                    show(self.notifier.as_ref(), &n);
+                    self.enqueue(id, n);
                 }
             }
             ConnEvent::State(state) => {
                 self.instances.insert(id.to_owned(), state);
                 self.state_dirty = true;
             }
+        }
+    }
+
+    fn enqueue(&self, id: &str, n: Notification) {
+        let (base_url, auth) = self
+            .connections
+            .get(id)
+            .map(|r| (r.base_url.clone(), r.auth.clone()))
+            .unwrap_or_default();
+        let sent = self
+            .deliveries
+            .as_ref()
+            .is_some_and(|tx| tx.send(Delivery { n, base_url, auth }).is_ok());
+        if !sent {
+            tracing::error!("notification worker stopped");
         }
     }
 
@@ -312,10 +387,9 @@ impl Engine {
 
     fn on_tick(&mut self) {
         if self.state_dirty {
-            match save_json(&self.paths.state_file(), &self.state()) {
-                Ok(()) => self.state_dirty = false,
-                Err(e) => tracing::warn!(error = %format!("{e:#}"), "saving state failed"),
-            }
+            let result = save_json(&self.paths.state_file(), &self.state());
+            self.state_dirty = result.is_err();
+            self.state_save.record("state", &result);
         }
     }
 
@@ -324,10 +398,11 @@ impl Engine {
     fn settle(&mut self, now: i64) {
         let paused = self.dispatcher.is_paused(now);
         if self.dispatcher.settings != self.saved_settings {
-            match save_json(&self.paths.settings_file(), &self.dispatcher.settings) {
-                Ok(()) => self.saved_settings = self.dispatcher.settings.clone(),
-                Err(e) => tracing::warn!(error = %format!("{e:#}"), "saving settings failed"),
+            let result = save_json(&self.paths.settings_file(), &self.dispatcher.settings);
+            if result.is_ok() {
+                self.saved_settings = self.dispatcher.settings.clone();
             }
+            self.settings_save.record("settings", &result);
         }
         let tray = aggregate(&self.dispatcher.settings, &self.statuses, paused, now);
         if self.tray.as_ref() != Some(&tray) {
@@ -345,11 +420,14 @@ impl Engine {
         }
     }
 
-    /// Stops all connections and writes settings and state.
-    fn shutdown(&mut self) -> anyhow::Result<()> {
+    fn stop_connections(&self) {
         for r in self.connections.values() {
             r.ctl.cancel.cancel();
         }
+    }
+
+    /// Final write of settings and state.
+    fn save_all(&self) -> anyhow::Result<()> {
         let settings = save_json(&self.paths.settings_file(), &self.dispatcher.settings);
         let state = save_json(&self.paths.state_file(), &self.state());
         for e in [&settings, &state]
@@ -359,6 +437,27 @@ impl Engine {
             tracing::error!(error = %format!("{e:#}"), "saving on exit failed");
         }
         settings.and(state)
+    }
+}
+
+/// Logs a failing save once per failure streak instead of on every attempt.
+#[derive(Default)]
+struct SaveHealth {
+    failing: bool,
+}
+
+impl SaveHealth {
+    /// Returns true if the result started or ended a failure streak.
+    fn record(&mut self, what: &str, result: &anyhow::Result<()>) -> bool {
+        match result {
+            Err(e) if !self.failing => {
+                tracing::warn!(error = %format!("{e:#}"), "saving {what} failed");
+            }
+            Ok(()) if self.failing => tracing::info!("saving {what} works again"),
+            _ => return false,
+        }
+        self.failing = result.is_err();
+        true
     }
 }
 
@@ -509,6 +608,36 @@ mod tests {
         assert_eq!(st["a"], (ConnStatus::AuthFailed, 200));
         track_status(&mut st, "a", disconnected(), 261);
         assert_eq!(st["a"], (disconnected(), 261));
+    }
+
+    #[test]
+    fn save_failures_logged_once_per_streak() {
+        let mut h = SaveHealth::default();
+        let failed = || Err(anyhow::anyhow!("disk full"));
+        assert!(!h.record("x", &Ok(())));
+        assert!(h.record("x", &failed()), "first failure logged");
+        assert!(!h.record("x", &failed()), "repeat is quiet");
+        assert!(h.record("x", &Ok(())), "recovery logged");
+        assert!(!h.record("x", &Ok(())));
+        assert!(h.record("x", &failed()), "new streak logged");
+    }
+
+    #[test]
+    fn remote_media_stripped_local_kept() {
+        let n = Notification {
+            id: "i".into(),
+            thread: "t".into(),
+            title: String::new(),
+            body: String::new(),
+            level: Level::Active,
+            default_action: None,
+            buttons: Vec::new(),
+            image: Some(MediaRef::Remote("https://x/a.png".into())),
+            icon: Some(MediaRef::Local("/tmp/i.png".into())),
+        };
+        let n = without_remote_media(n);
+        assert_eq!(n.image, None);
+        assert_eq!(n.icon, Some(MediaRef::Local("/tmp/i.png".into())));
     }
 
     #[test]

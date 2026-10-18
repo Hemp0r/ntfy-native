@@ -437,3 +437,90 @@ async fn pause_is_persisted_and_expired_pause_cleared() {
         .wait_for("Ok tray", |e| e.trays().last() == Some(&TrayState::Ok))
         .await;
 }
+
+/// ntfy plus a tarpit under `/file/`: image headers, then a body that never arrives.
+fn tarpit_script() -> Script {
+    Script::with_fallback(|req: &Recorded| {
+        if req.path.starts_with("/file/") {
+            Reply::stall().header("Content-Type", "image/png")
+        } else if req.is_poll() {
+            Reply::lines::<&str>(&[])
+        } else {
+            Reply::lines(&[open(now())]).keep_open()
+        }
+    })
+}
+
+fn msg_with_image(id: &str, time: i64, image_url: &str) -> String {
+    format!(
+        r#"{{"id":"{id}","time":{time},"event":"message","topic":"alerts","message":"body {id}","expires":{},"attachment":{{"name":"x.png","type":"image/png","url":"{image_url}"}}}}"#,
+        time + 43200
+    )
+}
+
+/// Starts an engine whose first message has an image stuck in the tarpit and
+/// waits until that download is in flight.
+async fn engine_with_stalled_image(paths: &AppPaths) -> (FakeServer, TestEngine) {
+    let script = tarpit_script();
+    let server = FakeServer::scripted(&script).await;
+    let t = now();
+    let image = format!("{}/file/x.png", server.url());
+    script.push(Reply::lines(&[open(t), msg_with_image("m1", t, &image)]).keep_open());
+    let engine = TestEngine::start(paths, settings_for(&server.url()), State::default());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !server.requests().iter().any(|r| r.path == "/file/x.png") {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "image never requested"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    (server, engine)
+}
+
+#[tokio::test]
+async fn quit_not_blocked_by_tarpit_media() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let (_server, engine) = engine_with_stalled_image(&paths).await;
+    assert!(engine.shown().is_empty(), "image still downloading");
+
+    let started = std::time::Instant::now();
+    let engine = engine.quit().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(engine.exited.load(Ordering::SeqCst));
+    let shown = engine.shown();
+    assert_eq!(shown.len(), 1, "pending notification shown on quit");
+    assert_eq!(shown[0].id, "inst:m1");
+    assert_eq!(shown[0].image, None);
+    let state: State = load(&paths.state_file()).expect("state.json written");
+    assert!(
+        state.instances[INSTANCE]
+            .seen_ids
+            .contains(&"m1".to_string())
+    );
+}
+
+#[tokio::test]
+async fn commands_processed_while_media_stalls() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let (_server, engine) = engine_with_stalled_image(&paths).await;
+
+    let started = std::time::Instant::now();
+    engine.send(Command::Activated(ActivationPayload::Open {
+        url: "https://x".into(),
+    }));
+    while engine.opener.opened.lock().unwrap().is_empty() {
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "activation blocked by media download"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(engine.shown().is_empty(), "image still downloading");
+}
