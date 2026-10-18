@@ -36,4 +36,19 @@ Secrets wandern in den Schlüsselbund (macOS) bzw. die Anmeldeinformationsverwal
 
 ## Server-Empfehlungen
 
+ntfy-native holt verpasste Nachrichten beim Start und nach Verbindungsabbrüchen vom Server-Cache nach. Damit das zuverlässig funktioniert, sollte der ntfy-Server entsprechend konfiguriert sein:
+
+- `cache-file` setzen (z. B. `/var/cache/ntfy/cache.db`). Ohne Cache-Datei liegt der Cache nur im Speicher, und bei einem Server-Neustart gehen alle noch nicht zugestellten Nachrichten verloren.
+- `cache-duration` ausreichend lang wählen, z. B. `72h`, damit auch ein Wochenende ohne laufende App überbrückt wird. Der Standardwert beträgt 12 Stunden.
+- In der App den Wert `cache_duration` passend zur Server-Einstellung setzen. Die App nutzt ihn, um zu erkennen, ob Nachrichten verloren gegangen sein können.
+
+### Hinweis „Nachrichten möglicherweise verpasst“
+
+Dieser Hinweis erscheint, wenn die App nicht ausschließen kann, dass Nachrichten fehlen. Das ist der Fall, wenn
+
+- die App länger offline war als `cache_duration` (ältere Nachrichten sind auf dem Server bereits gelöscht), oder
+- die zuletzt empfangene Nachricht eigentlich noch im Cache sein müsste, der Server sie aber nicht mehr liefert (typisch nach einem Server-Neustart ohne `cache-file`).
+
+Alle Zeitvergleiche verwenden ausschließlich Serverzeiten, die Uhr des Rechners spielt keine Rolle.
+
 ## Entwicklung
