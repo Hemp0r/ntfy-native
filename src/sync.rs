@@ -21,6 +21,8 @@ pub fn stream_since(server_now: i64) -> i64 {
 impl InstanceState {
     /// Returns true if the message id has not been seen and should be delivered.
     /// Deduplication is by id only, so a server clock jump cannot drop messages.
+    /// Only ever raises the watermark (clock regression is handled solely in
+    /// `observe_time`); `last_message` is replaced only by an equal or newer message.
     pub fn accept(&mut self, msg: &Message) -> bool {
         if self.seen_ids.contains(&msg.id) {
             return false;
@@ -29,7 +31,7 @@ impl InstanceState {
         while self.seen_ids.len() > SEEN_RING {
             self.seen_ids.pop_front();
         }
-        self.observe_time(msg.time);
+        self.watermark = Some(self.watermark.map_or(msg.time, |w| w.max(msg.time)));
         if self
             .last_message
             .as_ref()
@@ -60,32 +62,39 @@ impl InstanceState {
     }
 
     /// Call after `detect_gap` returned true and before accepting the polled
-    /// messages, so the "possibly missed" hint fires only once.
+    /// messages, so the "possibly missed" hint fires only once. Sets the
+    /// watermark to `server_now` (also when the server clock went backwards)
+    /// and forgets `last_message`; accepting older polled messages afterwards
+    /// does not lower the watermark.
     pub fn rebaseline_after_gap(&mut self, server_now: i64) {
-        self.watermark = Some(self.watermark.map_or(server_now, |w| w.max(server_now)));
+        self.watermark = Some(server_now);
         self.last_message = None;
     }
 }
 
 /// Detects possibly missed messages. Call with the state from before `accept`
-/// was applied to the poll results. A gap exists if either
+/// was applied to the poll results. A gap exists if any of
 /// (a) we were offline longer than the server caches
-/// (`server_now - watermark > cache_duration`), or
+/// (`server_now - watermark > cache_duration`),
 /// (b) the last known message carries an `expires` still in the future (so the
 /// server cache must still hold it) but the poll does not return it, i.e. the
-/// server lost its cache (restart without `cache-file`). Messages without
-/// `expires` (`Cache: no`) are never sentinels. Only server times are compared.
-/// Without a recent message in the server cache a lost cache is undetectable.
+/// server lost its cache (restart without `cache-file`), or
+/// (c) the server clock is behind our watermark by more than the margin (it was
+/// turned back while we were offline), so our timeline is no longer comparable.
+/// Messages without `expires` (`Cache: no`, or state from an older app version)
+/// are never sentinels. Only server times are compared. Not detecting a gap is
+/// no proof of completeness: without a recent message in the server cache a
+/// lost cache is undetectable.
 pub fn detect_gap(
     st: &InstanceState,
     polled: &[Message],
     server_now: i64,
     cache_duration: i64,
 ) -> bool {
-    if st
-        .watermark
-        .is_some_and(|w| server_now.saturating_sub(w) > cache_duration)
-    {
+    if st.watermark.is_some_and(|w| {
+        server_now.saturating_sub(w) > cache_duration
+            || server_now < w.saturating_sub(DEDUP_MARGIN_SECS)
+    }) {
         return true;
     }
     st.last_message.as_ref().is_some_and(|l| {
@@ -156,6 +165,7 @@ mod tests {
         let mut s = st(Some(1000), None);
         assert!(s.accept(&msg("old", 900)));
         assert!(s.seen_ids.contains(&"old".to_string()));
+        assert_eq!(s.watermark, Some(1000));
     }
 
     #[test]
@@ -257,9 +267,19 @@ mod tests {
         let mut s = st(Some(now - 60), Some(("a", now - 100)));
         assert!(detect_gap(&s, &[], now, 43_200));
         s.rebaseline_after_gap(now);
+        assert!(s.accept(&msg("older", now - 500)));
         assert_eq!(s.watermark, Some(now));
-        assert!(s.last_message.is_none());
         assert!(!detect_gap(&s, &[], now, 43_200));
+    }
+
+    #[test]
+    fn gap_on_server_clock_regression_while_offline() {
+        let mut s = st(Some(10_000), Some(("a", 10_000)));
+        s.last_message.as_mut().unwrap().expires = Some(20_000);
+        assert!(detect_gap(&s, &[msg("a", 10_000)], 7_000, 43_200));
+        s.rebaseline_after_gap(7_000);
+        assert_eq!(s.watermark, Some(7_000));
+        assert_eq!(catch_up_since(&s), Some(6_970));
     }
 
     #[test]

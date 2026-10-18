@@ -40,15 +40,16 @@ ntfy-native holt verpasste Nachrichten beim Start und nach Verbindungsabbrüchen
 
 - `cache-file` setzen (z. B. `/var/cache/ntfy/cache.db`). Das ist Voraussetzung für die Garantie, keine Nachrichten zu verpassen: Ohne Cache-Datei liegt der Cache nur im Speicher, und ein Server-Neustart kann Nachrichten verlieren, ohne dass die App das bemerken kann, sobald keine aktuelle Nachricht der Instanz mehr im Server-Cache liegt.
 - `cache-duration` ausreichend lang wählen, z. B. `72h`, damit auch ein Wochenende ohne laufende App überbrückt wird. Der Standardwert beträgt 12 Stunden.
-- In der App den Wert `cache_duration` passend zur Server-Einstellung setzen.
+- In der App den Wert `cache_duration` passend zur Server-Einstellung setzen. Die App nutzt ihn, um lange Offline-Zeiten zu erkennen (war sie länger offline als `cache_duration`, sind ältere Nachrichten auf dem Server bereits gelöscht).
 
 ### Hinweis „Nachrichten möglicherweise verpasst“
 
-Der Hinweis erscheint in zwei Fällen:
+Der Hinweis erscheint in drei Fällen:
 
-- Die App war länger offline als `cache_duration`; ältere Nachrichten sind auf dem Server bereits gelöscht.
+- Die App war länger offline als `cache_duration`.
 - Die zuletzt empfangene Nachricht müsste laut Server noch im Cache liegen, wird aber nicht mehr geliefert (Server-Neustart ohne `cache-file`, solange noch eine aktuelle Nachricht im Cache gewesen wäre).
+- Die Serveruhr wurde zurückgestellt, während die App offline war.
 
-Der Hinweis ist kein vollständiger Beweis für Vollständigkeit: Ist die letzte bekannte Nachricht regulär abgelaufen, lässt sich ein verlorener Cache nicht erkennen. Alle Zeitvergleiche verwenden ausschließlich Serverzeiten.
+Das Ausbleiben des Hinweises ist kein Beweis für Vollständigkeit. Nicht erkennbar ist ein verlorener Cache insbesondere, wenn die letzte bekannte Nachricht regulär abgelaufen ist oder keine Ablaufzeit (`expires`) hat (`Cache: no` oder Zustand einer älteren App-Version). Verglichen werden ausschließlich Serverzeiten (Event-Zeiten und Date-Header des Servers), nie die lokale Uhr.
 
 ## Entwicklung
