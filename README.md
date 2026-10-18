@@ -108,3 +108,12 @@ cargo run --example notify_demo
 ```
 
 Die Demo zeigt je einen Toast pro Stufe (passiv ohne Ton, aktiv mit Buttons, Bild und App-Logo, dringend), gibt Klicks auf stdout aus und beendet sich nach 30 Sekunden. Sie trägt sich dabei selbst als `LocalServer32` ein; ein Klick im Info-Center nach dem Beenden startet sie mit `-ToastActivated` neu, sie zeigt dann keine neuen Toasts, sondern gibt nur die Aktivierung aus. Der nächste Start der App trägt wieder deren eigene `.exe` ein.
+
+Zusätzlich prüfen, ob Bilder aus Pfaden mit Sonderzeichen angezeigt werden (die App bettet Pfade unkodiert als `file:///<pfad>` ein):
+
+```powershell
+$env:NTFY_NATIVE_DEMO_DIR = 'C:\Temp\Jörg Ä #1'
+cargo run --example notify_demo
+```
+
+Die Demo legt ihr Bild dann in diesem Ordner ab. Fehlen Bild und App-Logo im aktiven Toast, muss der Pfad prozentkodiert werden.

@@ -26,8 +26,8 @@ use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::core::{BOOL, Error, GUID, HSTRING, IUnknown, Interface, PCWSTR, Ref, implement};
 
 use super::fnv1a;
-use super::toast_xml::build;
-use crate::notification::{ActivationPayload, ActivationSink, Level, Notification, Notifier};
+use super::toast_xml::attempts;
+use crate::notification::{ActivationPayload, ActivationSink, Notification, Notifier};
 use crate::paths::{APP_ID, APP_NAME};
 
 /// COM class of the toast activator. Fixed: installers and the system
@@ -78,15 +78,20 @@ impl Notifier for WinNotifier {
         ensure_winrt();
         let tag = HSTRING::from(short_hash(&n.id));
         let group = HSTRING::from(short_hash(&n.thread));
-        match show_toast(&build(n, true), &tag, &group) {
-            // Older Windows 10 builds reject the urgent scenario.
-            Err(e) if n.level == Level::Urgent => {
-                tracing::debug!(id = %n.id, error = %format!("{e:#}"), "urgent toast rejected, retrying without scenario");
-                show_toast(&build(n, false), &tag, &group)
+        let mut last = None;
+        for (i, xml) in attempts(n).enumerate() {
+            match show_toast(&xml, &tag, &group) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::debug!(id = %n.id, attempt = i + 1, error = %format!("{e:#}"), "toast rejected");
+                    last = Some(e);
+                }
             }
-            r => r,
         }
-        .with_context(|| format!("showing toast {}", n.id))
+        // The engine logs the final failure at warn level.
+        Err(last
+            .unwrap_or_else(|| anyhow::anyhow!("no toast to show"))
+            .context(format!("showing toast {}", n.id)))
     }
 }
 

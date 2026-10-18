@@ -3,9 +3,18 @@
 
 use crate::notification::{Level, MediaRef, Notification};
 
+/// Longer bodies are cut to this many characters plus "…".
+pub const MAX_BODY_CHARS: usize = 1000;
+
 /// The toast XML for `n`. `urgent_scenario` allows `scenario="urgent"` for
 /// urgent notifications (unsupported on older Windows 10 builds).
 pub fn build(n: &Notification, urgent_scenario: bool) -> String {
+    build_with(n, urgent_scenario, true)
+}
+
+/// Like [`build`]; `with_actions = false` omits the buttons (the `launch`
+/// action stays), for systems that reject oversized button payloads.
+pub fn build_with(n: &Notification, urgent_scenario: bool, with_actions: bool) -> String {
     let launch = n
         .default_action
         .as_ref()
@@ -19,7 +28,7 @@ pub fn build(n: &Notification, urgent_scenario: bool) -> String {
     xml.push_str(&format!(
         "<text>{}</text><text>{}</text>",
         escape(&n.title),
-        escape(&n.body)
+        escape(&capped(&n.body))
     ));
     if let Some(src) = local_src(n.icon.as_ref()) {
         xml.push_str(&format!(
@@ -33,7 +42,7 @@ pub fn build(n: &Notification, urgent_scenario: bool) -> String {
     if n.level == Level::Passive {
         xml.push_str(r#"<audio silent="true"/>"#);
     }
-    if !n.buttons.is_empty() {
+    if with_actions && !n.buttons.is_empty() {
         xml.push_str("<actions>");
         for b in &n.buttons {
             xml.push_str(&format!(
@@ -48,6 +57,22 @@ pub fn build(n: &Notification, urgent_scenario: bool) -> String {
     xml
 }
 
+/// The toasts to try in order until one is accepted: the full toast, then
+/// (urgent only) without the scenario, then (with buttons only) also without
+/// the buttons, whose payloads may exceed the size limit.
+pub fn attempts(n: &Notification) -> impl Iterator<Item = String> + '_ {
+    let urgent = n.level == Level::Urgent;
+    let buttons = !n.buttons.is_empty();
+    [
+        (true, true, true),
+        (false, true, urgent),
+        (false, false, buttons),
+    ]
+    .into_iter()
+    .filter(|&(_, _, applies)| applies)
+    .map(move |(scenario, actions, _)| build_with(n, scenario, actions))
+}
+
 /// Escaped `file:///` URI of a local media file; remote media is not embedded.
 fn local_src(media: Option<&MediaRef>) -> Option<String> {
     match media? {
@@ -56,11 +81,22 @@ fn local_src(media: Option<&MediaRef>) -> Option<String> {
     }
 }
 
-/// Escapes the five XML special characters.
+fn capped(body: &str) -> std::borrow::Cow<'_, str> {
+    match body.char_indices().nth(MAX_BODY_CHARS) {
+        Some((cut, _)) => format!("{}…", &body[..cut]).into(),
+        None => body.into(),
+    }
+}
+
+/// Escapes the five XML special characters and drops characters XML 1.0
+/// does not allow (control characters other than tab, LF and CR, U+FFFE and
+/// U+FFFF), which would make the whole toast unloadable.
 pub fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
+            '\t' | '\n' | '\r' => out.push(c),
+            '\u{0}'..='\u{1f}' | '\u{fffe}' | '\u{ffff}' => {}
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '&' => out.push_str("&amp;"),
@@ -224,5 +260,113 @@ mod tests {
         }
         // toast, visual, binding, 2 text, image, audio, actions, action
         assert_eq!(elements, 9, "{xml}");
+    }
+
+    fn assert_well_formed(xml: &str) {
+        let mut reader = quick_xml::Reader::from_str(xml);
+        loop {
+            match reader.read_event() {
+                Ok(quick_xml::events::Event::Eof) => break,
+                Ok(_) => {}
+                Err(e) => panic!("malformed XML at {}: {e}\n{xml}", reader.buffer_position()),
+            }
+        }
+    }
+
+    #[test]
+    fn strips_xml_illegal_chars() {
+        let mut n = notification(Level::Active);
+        n.title = "t\u{7}\u{fffe}\u{ffff}i\tt\r\nle".into();
+        n.body = "a\u{1b}[31mb\u{0}".into();
+        let xml = build(&n, true);
+        assert!(xml.contains("<text>a[31mb</text>"), "{xml}");
+        assert!(xml.contains("<text>ti\tt\r\nle</text>"), "{xml}");
+        assert_eq!(
+            escape("\u{1f}\u{20}\u{d7ff}\u{e000}\u{fffd}\u{10000}"),
+            "\u{20}\u{d7ff}\u{e000}\u{fffd}\u{10000}"
+        );
+        assert_well_formed(&xml);
+        // quick-xml does not validate character ranges, so check them directly.
+        assert!(
+            !xml.chars()
+                .any(|c| (c < ' ' && !matches!(c, '\t' | '\n' | '\r'))
+                    || matches!(c, '\u{fffe}' | '\u{ffff}')),
+            "{xml:?}"
+        );
+    }
+
+    #[test]
+    fn long_body_is_capped() {
+        let mut n = notification(Level::Active);
+        n.body = "ä".repeat(MAX_BODY_CHARS);
+        let xml = build(&n, true);
+        assert!(
+            xml.contains(&format!("<text>{}</text>", n.body)),
+            "exactly at the limit is kept"
+        );
+
+        n.body = format!("{}ü<&>tail", "ä".repeat(MAX_BODY_CHARS - 1));
+        let xml = build(&n, true);
+        let expected = format!("<text>{}ü…</text>", "ä".repeat(MAX_BODY_CHARS - 1));
+        assert!(xml.contains(&expected), "{xml}");
+        assert!(!xml.contains("tail"), "{xml}");
+        assert_well_formed(&xml);
+    }
+
+    #[test]
+    fn without_actions_keeps_launch() {
+        let mut n = notification(Level::Urgent);
+        n.default_action = Some(open("https://x/default"));
+        n.buttons = vec![Button {
+            label: "Open".into(),
+            payload: open("https://x/open"),
+        }];
+        let full = build(&n, true);
+        assert_eq!(full, build_with(&n, true, true));
+        assert!(full.contains("<actions>"), "{full}");
+
+        let xml = build_with(&n, false, false);
+        let launch = format!(
+            r#"<toast launch="{}">"#,
+            escape(&open("https://x/default").encode())
+        );
+        assert!(xml.starts_with(&launch), "{xml}");
+        assert!(
+            !xml.contains("<action") && !xml.contains("scenario"),
+            "{xml}"
+        );
+        assert!(xml.contains("<text>Title</text>"), "{xml}");
+        assert_well_formed(&xml);
+    }
+
+    #[test]
+    fn attempts_degrade_in_order() {
+        let mut n = notification(Level::Active);
+        assert_eq!(attempts(&n).collect::<Vec<_>>(), vec![build(&n, true)]);
+
+        n.level = Level::Urgent;
+        assert_eq!(
+            attempts(&n).collect::<Vec<_>>(),
+            vec![build(&n, true), build(&n, false)]
+        );
+
+        n.buttons = vec![Button {
+            label: "Open".into(),
+            payload: open("https://x/open"),
+        }];
+        assert_eq!(
+            attempts(&n).collect::<Vec<_>>(),
+            vec![
+                build(&n, true),
+                build(&n, false),
+                build_with(&n, false, false)
+            ]
+        );
+
+        n.level = Level::Active;
+        assert_eq!(
+            attempts(&n).collect::<Vec<_>>(),
+            vec![build(&n, true), build_with(&n, false, false)]
+        );
     }
 }

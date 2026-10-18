@@ -43,7 +43,13 @@ fn main() -> anyhow::Result<()> {
     }
 
     // The system may move attachments, so hand it a copy of the fixture.
-    let image = std::env::temp_dir().join(format!("ntfy-native-demo-{}.png", std::process::id()));
+    // NTFY_NATIVE_DEMO_DIR picks the image directory, e.g. to test paths
+    // with spaces or special characters.
+    let dir = std::env::var_os("NTFY_NATIVE_DEMO_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    std::fs::create_dir_all(&dir)?;
+    let image = dir.join(format!("ntfy-native-demo-{}.png", std::process::id()));
     std::fs::write(&image, include_bytes!("../tests/fixtures/sample.png"))?;
 
     let run = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
