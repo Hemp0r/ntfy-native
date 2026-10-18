@@ -126,6 +126,20 @@ Benachrichtigungen laufen über WinRT-Toasts mit der AppUserModelID `dev.hemp0r.
 - `HKCU\Software\Classes\AppUserModelId\dev.hemp0r.ntfy-native`: `DisplayName` = `ntfy-native`, `CustomActivator` = `{AE88E831-148B-400C-8273-6ABC4FDEA102}`, `IconUri` = Pfad zu `icon.png` im Datenordner (`%APPDATA%\hemp0r\ntfy-native\data\icon.png`, bei jedem Start der App geschrieben, falls fehlend oder veraltet; das Beispiel setzt `IconUri` nicht)
 - `HKCU\Software\Classes\CLSID\{AE88E831-148B-400C-8273-6ABC4FDEA102}\LocalServer32`: Standardwert `"<Pfad der exe>" -ToastActivated`
 
+Zusätzlich legt die App beim Start die Startmenü-Verknüpfung `%APPDATA%\Microsoft\Windows\Start Menu\Programs\ntfy-native.lnk` an (Ziel: die laufende `.exe`, mit `System.AppUserModel.ID` = `dev.hemp0r.ntfy-native` und `System.AppUserModel.ToastActivatorCLSID` = obige CLSID). Ohne diese Verknüpfung zeigt Windows die Toasts zwar an, behält sie aber nicht im Info-Center und führt die App nicht unter „Einstellungen“ → „System“ → „Benachrichtigungen“. Die Verknüpfung wird nur neu geschrieben, wenn sie fehlt oder Ziel bzw. Eigenschaften abweichen (etwa nach dem Verschieben der `.exe`). Auch die Demo schreibt sie (auf ihre eigene `.exe`); der nächste Start der App korrigiert das wieder.
+
+Wer den App-Ordner einfach löscht, hinterlässt Verknüpfung, Registry-Einträge und Daten. Vollständig entfernen (App vorher über „Beenden“ schließen):
+
+```powershell
+Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\ntfy-native.lnk"
+Remove-Item -Recurse "HKCU:\Software\Classes\AppUserModelId\dev.hemp0r.ntfy-native"
+Remove-Item -Recurse "HKCU:\Software\Classes\CLSID\{AE88E831-148B-400C-8273-6ABC4FDEA102}"
+Remove-Item -Recurse "$env:APPDATA\hemp0r\ntfy-native"   # Konfiguration, Einstellungen, Logs, icon.png
+Remove-Item -Recurse "$env:LOCALAPPDATA\hemp0r\ntfy-native"   # Cache (Bilder)
+```
+
+Gespeicherte Zugangsdaten liegen in der Anmeldeinformationsverwaltung (Windows-Anmeldeinformationen) und lassen sich dort löschen.
+
 Klicks auf einen Toast oder dessen Buttons erreichen die laufende App über einen COM-Server mit dieser CLSID (fest, nie ändern). Läuft die App nicht mehr (Toast im Info-Center), startet Windows die eingetragene `.exe` mit `-ToastActivated` neu und liefert den Klick nach. Dringende Nachrichten nutzen `scenario="urgent"`; ältere Windows-10-Builds lehnen das ab, dann wird der Toast ohne dieses Szenario erneut angezeigt.
 
 Manuelle Prüfung mit der Demo:

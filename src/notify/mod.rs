@@ -6,6 +6,8 @@ use std::{fs, io};
 
 use crate::notification::{ActivationSink, LogNotifier, Notifier};
 
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod shortcut;
 pub mod toast_xml;
 
 #[cfg(target_os = "macos")]

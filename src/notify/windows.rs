@@ -3,30 +3,49 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
-use windows::Win32::Foundation::{CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER, RPC_E_CHANGED_MODE};
+use windows::Win32::Foundation::{
+    CLASS_E_NOAGGREGATION, E_FAIL, E_POINTER, PROPERTYKEY, RPC_E_CHANGED_MODE,
+};
+use windows::Win32::Storage::EnhancedStorage::{
+    PKEY_AppUserModel_ID, PKEY_AppUserModel_ToastActivatorCLSID,
+};
+use windows::Win32::System::Com::StructuredStorage::{
+    InitPropVariantFromCLSID, PROPVARIANT, PropVariantClear, PropVariantToGUID,
+    PropVariantToStringAlloc,
+};
 use windows::Win32::System::Com::{
-    CLSCTX_LOCAL_SERVER, COINIT_MULTITHREADED, CoInitializeEx, CoRegisterClassObject,
-    IClassFactory, IClassFactory_Impl, REGCLS_MULTIPLEUSE,
+    CLSCTX_INPROC_SERVER, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, COINIT_MULTITHREADED,
+    CoCreateInstance, CoInitializeEx, CoRegisterClassObject, CoTaskMemFree, CoUninitialize,
+    IClassFactory, IClassFactory_Impl, IPersistFile, REGCLS_MULTIPLEUSE, STGM_READ,
 };
 use windows::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ, RegCloseKey,
     RegCreateKeyExW, RegSetValueExW,
 };
+use windows::Win32::System::Variant::VT_LPWSTR;
 use windows::Win32::System::WinRT::{RO_INIT_MULTITHREADED, RoInitialize};
 use windows::Win32::UI::Notifications::{
     INotificationActivationCallback, INotificationActivationCallback_Impl,
     NOTIFICATION_USER_INPUT_DATA,
 };
-use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
-use windows::core::{BOOL, Error, GUID, HSTRING, IUnknown, Interface, PCWSTR, Ref, implement};
+use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+use windows::Win32::UI::Shell::{
+    FOLDERID_Programs, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderPath, SLGP_RAWPATH,
+    SetCurrentProcessExplicitAppUserModelID, ShellLink,
+};
+use windows::core::{
+    BOOL, Error, GUID, HSTRING, IUnknown, Interface, PCWSTR, PWSTR, Ref, implement,
+};
 
 use super::fnv1a;
+use super::shortcut::{ShortcutProps, needs_update};
 use super::toast_xml::attempts;
 use crate::notification::{ActivationPayload, ActivationSink, Notification, Notifier};
 use crate::paths::{APP_ID, APP_NAME};
@@ -39,6 +58,9 @@ const CLSID: GUID = GUID::from_u128(0xAE88E831_148B_400C_8273_6ABC4FDEA102);
 /// Shown in toast headers and the Windows notification settings.
 const ICON_PNG: &[u8] = include_bytes!("../../assets/icon-256.png");
 const ICON_FILE_NAME: &str = "icon.png";
+const SHORTCUT_FILE_NAME: &str = "ntfy-native.lnk";
+/// Bounds the wait for the shortcut check at startup.
+const SHORTCUT_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn aumid_key() -> String {
     format!(r"Software\Classes\AppUserModelId\{APP_ID}")
@@ -53,9 +75,10 @@ pub struct WinNotifier {
 }
 
 impl WinNotifier {
-    /// Registers the app for toasts (AUMID and COM activator in HKCU) and
-    /// starts the COM server that receives clicks, also when a click
-    /// relaunched the app. Must be called before the event loop starts.
+    /// Registers the app for toasts (AUMID and COM activator in HKCU, Start
+    /// menu shortcut) and starts the COM server that receives clicks, also
+    /// when a click relaunched the app. Must be called before the event loop
+    /// starts.
     pub fn new(on_activate: ActivationSink) -> Result<Self> {
         let exe = std::env::current_exe().context("locating the executable")?;
         let clsid = format!("{{{TOAST_ACTIVATOR_CLSID}}}");
@@ -70,6 +93,8 @@ impl WinNotifier {
         // SAFETY: plain FFI call with a valid string.
         unsafe { SetCurrentProcessExplicitAppUserModelID(&HSTRING::from(APP_ID)) }
             .context("setting the AppUserModelID")?;
+        // Without it toasts show, but are not kept in the Notification Center.
+        ensure_start_menu_shortcut(exe);
 
         // Without the activator clicks are ignored, but toasts still show.
         if let Err(e) = start_activator(on_activate) {
@@ -116,6 +141,179 @@ pub fn register_icon(dir: &Path) -> Result<()> {
         tracing::warn!(error = %e, path = %path.display(), "updating the toast icon failed, keeping the old one");
     }
     set_string(&aumid_key(), Some("IconUri"), &path.display().to_string())
+}
+
+/// Creates or repairs the Start-menu shortcut on a helper thread with its own
+/// COM apartment, waiting at most [`SHORTCUT_TIMEOUT`] so the first toast
+/// usually finds it in place. Failures are logged.
+fn ensure_start_menu_shortcut(exe: PathBuf) {
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("start-menu-shortcut".into())
+        .spawn(move || {
+            // SAFETY: plain FFI call on a fresh thread.
+            let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+            let result = if init.is_ok() {
+                let r = update_shortcut(&exe);
+                // SAFETY: balances the successful CoInitializeEx; all COM
+                // objects were released inside `update_shortcut`.
+                unsafe { CoUninitialize() };
+                r
+            } else {
+                Err(anyhow!("initializing COM: {}", Error::from(init)))
+            };
+            let _ = tx.send(result);
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "starting the shortcut thread failed");
+        return;
+    }
+    match rx.recv_timeout(SHORTCUT_TIMEOUT) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(
+            error = %format!("{e:#}"),
+            "start menu shortcut unavailable, notifications may not stay in the Notification Center"
+        ),
+        Err(_) => tracing::warn!("start menu shortcut check is taking long, continuing"),
+    }
+}
+
+fn update_shortcut(exe: &Path) -> Result<()> {
+    let lnk = programs_dir()?.join(SHORTCUT_FILE_NAME);
+    let wanted = ShortcutProps {
+        target: exe.display().to_string(),
+        app_id: APP_ID.to_owned(),
+        activator_clsid: TOAST_ACTIVATOR_CLSID.to_owned(),
+    };
+    let existing = if lnk.exists() {
+        match read_shortcut(&lnk) {
+            Ok(props) => Some(props),
+            Err(e) => {
+                tracing::info!(error = %format!("{e:#}"), "existing shortcut unreadable, rewriting it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if !needs_update(existing.as_ref(), &wanted) {
+        return Ok(());
+    }
+    write_shortcut(&lnk, exe).with_context(|| format!("writing {}", lnk.display()))?;
+    tracing::info!(path = %lnk.display(), "start menu shortcut written");
+    Ok(())
+}
+
+/// `%APPDATA%\Microsoft\Windows\Start Menu\Programs` of the current user.
+fn programs_dir() -> Result<PathBuf> {
+    // SAFETY: valid folder id; the returned string is freed below.
+    let raw = unsafe { SHGetKnownFolderPath(&FOLDERID_Programs, KF_FLAG_DEFAULT, None) }
+        .context("locating the Start menu folder")?;
+    // SAFETY: `raw` is a valid NUL-terminated string from the shell.
+    let path = unsafe { raw.to_hstring() }.to_os_string();
+    // SAFETY: allocated by SHGetKnownFolderPath with the COM allocator.
+    unsafe { CoTaskMemFree(Some(raw.0 as *const c_void)) };
+    Ok(PathBuf::from(path))
+}
+
+fn new_shell_link() -> Result<IShellLinkW> {
+    // SAFETY: plain COM instantiation on an initialized thread.
+    unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER) }
+        .context("creating a shell link")
+}
+
+fn read_shortcut(lnk: &Path) -> Result<ShortcutProps> {
+    let link = new_shell_link()?;
+    let file: IPersistFile = link.cast()?;
+    // SAFETY: valid string; `buf` outlives the call.
+    let target = unsafe {
+        file.Load(&HSTRING::from(lnk), STGM_READ)?;
+        let mut buf = vec![0u16; 32 * 1024];
+        link.GetPath(&mut buf, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)?;
+        let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        String::from_utf16_lossy(&buf[..len])
+    };
+    let store: IPropertyStore = link.cast()?;
+    Ok(ShortcutProps {
+        target,
+        app_id: read_property(&store, &PKEY_AppUserModel_ID, |pv| {
+            // SAFETY: `pv` is a valid PROPVARIANT; the string is freed below.
+            let raw = unsafe { PropVariantToStringAlloc(pv) }.ok()?;
+            // SAFETY: NUL-terminated string from the property system.
+            let text = unsafe { raw.to_string() }.ok();
+            // SAFETY: allocated with the COM allocator.
+            unsafe { CoTaskMemFree(Some(raw.0 as *const c_void)) };
+            text
+        }),
+        activator_clsid: read_property(&store, &PKEY_AppUserModel_ToastActivatorCLSID, |pv| {
+            // SAFETY: `pv` is a valid PROPVARIANT.
+            unsafe { PropVariantToGUID(pv) }
+                .ok()
+                .map(|g| format!("{g:?}"))
+        }),
+    })
+}
+
+/// The property converted by `convert`, or `""` if unset or of another type.
+fn read_property(
+    store: &IPropertyStore,
+    key: &PROPERTYKEY,
+    convert: impl FnOnce(&PROPVARIANT) -> Option<String>,
+) -> String {
+    // SAFETY: valid key; the value is cleared below.
+    let Ok(mut pv) = (unsafe { store.GetValue(key) }) else {
+        return String::new();
+    };
+    let value = convert(&pv).unwrap_or_default();
+    // SAFETY: `pv` came from GetValue and is not used afterwards.
+    unsafe {
+        let _ = PropVariantClear(&mut pv);
+    }
+    value
+}
+
+fn write_shortcut(lnk: &Path, exe: &Path) -> Result<()> {
+    let link = new_shell_link()?;
+    let exe_w = HSTRING::from(exe);
+    let dir_w = HSTRING::from(exe.parent().unwrap_or(exe));
+    // SAFETY: valid strings for the duration of each call.
+    unsafe {
+        link.SetPath(&exe_w)?;
+        link.SetWorkingDirectory(&dir_w)?;
+        link.SetDescription(&HSTRING::from(APP_NAME))?;
+        link.SetIconLocation(&exe_w, 0)?;
+    }
+    let store: IPropertyStore = link.cast()?;
+    // SetValue copies the value, so the string may live in our own buffer;
+    // this PROPVARIANT must not be passed to PropVariantClear.
+    let app_id: Vec<u16> = APP_ID.encode_utf16().chain([0]).collect();
+    let mut id_value = PROPVARIANT::default();
+    // SAFETY: sets the type tag and matching member of a zeroed PROPVARIANT.
+    unsafe {
+        let inner = &mut *id_value.Anonymous.Anonymous;
+        inner.vt = VT_LPWSTR;
+        inner.Anonymous.pwszVal = PWSTR(app_id.as_ptr().cast_mut());
+    }
+    // SAFETY: valid key and value; `app_id` outlives the call.
+    unsafe { store.SetValue(&PKEY_AppUserModel_ID, &id_value) }
+        .context("setting the AppUserModelID")?;
+    // SAFETY: valid GUID; the allocated value is cleared below.
+    let mut clsid_value = unsafe { InitPropVariantFromCLSID(&CLSID) }?;
+    // SAFETY: valid key and value.
+    let set = unsafe { store.SetValue(&PKEY_AppUserModel_ToastActivatorCLSID, &clsid_value) };
+    // SAFETY: initialized by InitPropVariantFromCLSID, not used afterwards.
+    unsafe {
+        let _ = PropVariantClear(&mut clsid_value);
+    }
+    set.context("setting the toast activator CLSID")?;
+    // SAFETY: plain COM calls.
+    unsafe {
+        store.Commit().context("committing shortcut properties")?;
+        let file: IPersistFile = link.cast()?;
+        file.Save(&HSTRING::from(lnk), true)
+            .context("saving the shortcut")?;
+    }
+    Ok(())
 }
 
 fn show_toast(xml: &str, tag: &HSTRING, group: &HSTRING) -> Result<()> {
