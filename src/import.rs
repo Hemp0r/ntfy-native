@@ -238,11 +238,17 @@ fn auth_plan(imp: &ImportInstance, existing: Option<&AuthKind>) -> Result<AuthPl
             },
             password.clone(),
         ),
-        (Credentials::Username(username), Some(AuthKind::Basic { .. })) => {
+        (Credentials::Username(username), Some(AuthKind::Basic { username: stored }))
+            if stored == username =>
+        {
             AuthPlan::Keep(AuthKind::Basic {
                 username: username.clone(),
             })
         }
+        (Credentials::Username(_), Some(AuthKind::Basic { .. })) => bail!(
+            "{}: changed username needs a password / geänderter Benutzername braucht ein password",
+            imp.url
+        ),
         (Credentials::Username(_), _) => bail!(
             "{}: username without password needs an already stored password",
             imp.url
@@ -402,7 +408,12 @@ pub fn import_file(
         .and_then(|()| fs::rename(&tmp, &imported))
         .with_context(|| format!("writing {}", imported.display()))?;
     // Re-importing the sanitized file itself rewrote it in place.
-    if path.file_name() != Some(SANITIZED_NAME.as_ref()) {
+    let is_target = path.parent() == imported.parent()
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.eq_ignore_ascii_case(SANITIZED_NAME));
+    if !is_target {
         fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
     }
     Ok(settings)
@@ -481,15 +492,32 @@ instances:
         let store = MemoryStore::new();
         let y = "instances:\n  - url: https://x.org\n    username: alice\n    password: pw\n";
         let s1 = apply_import(None, &parse_import(y).unwrap(), &store).unwrap();
-        let y2 = "instances:\n  - url: https://x.org\n    username: bob\n";
+        let y2 = "instances:\n  - url: https://x.org\n    username: alice\n";
         let s2 = apply_import(Some(s1), &parse_import(y2).unwrap(), &store).unwrap();
         assert_eq!(
             s2.instances[0].auth,
             AuthKind::Basic {
-                username: "bob".into()
+                username: "alice".into()
             }
         );
         assert_eq!(store.get("instance:x.org").unwrap().as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn changed_username_requires_password() {
+        let store = MemoryStore::new();
+        let y = "instances:\n  - url: https://x.org\n    username: alice\n    password: pw\n";
+        let s1 = apply_import(None, &parse_import(y).unwrap(), &store).unwrap();
+        let y2 = "instances:\n  - url: https://x.org\n    username: bob\n";
+        let err = apply_import(Some(s1.clone()), &parse_import(y2).unwrap(), &store).unwrap_err();
+        assert!(err.to_string().contains("password"), "{err}");
+        assert_eq!(store.get("instance:x.org").unwrap().as_deref(), Some("pw"));
+        assert_eq!(
+            s1.instances[0].auth,
+            AuthKind::Basic {
+                username: "alice".into()
+            }
+        );
     }
 
     #[test]
@@ -699,6 +727,16 @@ instances:
             }
         );
         assert_eq!(store.get("instance:b.org").unwrap().as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn reimport_case_variant_path_keeps_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings_path = dir.path().join("settings.json");
+        let variant = dir.path().join("Config.Imported.yaml");
+        fs::write(&variant, one("https://x.org", &["a"])).unwrap();
+        import_file(&variant, None, &MemoryStore::new(), &settings_path).unwrap();
+        assert!(dir.path().join("config.imported.yaml").exists());
     }
 
     #[test]

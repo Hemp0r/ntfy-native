@@ -42,7 +42,7 @@ Regeln:
 - Topic-Namen: 1 bis 64 Zeichen aus `A-Z a-z 0-9 - _`.
 - `token`, `username`/`password` und `auth: none` schließen sich gegenseitig aus; `password` braucht `username`.
 - Ein erneuter Import ersetzt Topics der betroffenen Instanz (erkannt an der URL); andere Instanzen bleiben unverändert. `urgent_breaks_dnd` ändert sich nur, wenn es in der Datei steht.
-- Zugangsdaten bei einem erneuten Import: `token` bzw. `username` + `password` ersetzen die gespeicherten. Ohne Zugangsdaten-Felder bleiben die gespeicherten erhalten; nur `username` (ohne `password`) behält das gespeicherte Passwort einer Basic-Auth-Instanz. `auth: none` entfernt gespeicherte Zugangsdaten.
+- Zugangsdaten bei einem erneuten Import: `token` bzw. `username` + `password` ersetzen die gespeicherten. Ohne Zugangsdaten-Felder bleiben die gespeicherten erhalten; nur `username` (ohne `password`) behält das gespeicherte Passwort einer Basic-Auth-Instanz, solange der Benutzername unverändert ist; bei geändertem Benutzernamen ist ein `password` Pflicht. `auth: none` entfernt gespeicherte Zugangsdaten.
 
 Speicherort der Datei (`config.yaml`):
 
