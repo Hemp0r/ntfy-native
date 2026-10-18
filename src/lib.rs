@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod cli;
 pub mod connection;
 pub mod dispatcher;

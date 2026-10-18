@@ -14,6 +14,7 @@ httpdate = "1.0.3"
 humantime = "2.4.0"
 keyring-core = "1.0.1"
 lexopt = "0.3.2"
+open = "5.4.4"
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }
