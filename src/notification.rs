@@ -76,8 +76,10 @@ impl Notifier for LogNotifier {
     }
 }
 
+/// Message content (title, body) only at debug: never bodies at info.
 fn log_notification(n: &Notification) {
-    tracing::info!(id = %n.id, title = %n.title, body = %n.body, "notification");
+    tracing::info!(id = %n.id, "notification");
+    tracing::debug!(id = %n.id, title = %n.title, body = %n.body, "notification content");
 }
 
 #[derive(Default)]

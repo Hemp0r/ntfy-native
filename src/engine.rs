@@ -3,10 +3,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::ControlFlow;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
@@ -27,6 +29,7 @@ use crate::triggers::{spawn_network_watcher, spawn_wake_detector};
 
 const TICK: Duration = Duration::from_secs(5);
 const MEDIA_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+const MEDIA_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const STATE_VERSION: u32 = 1;
 /// On quit, pending notifications are shown without media within this time.
 const FLUSH_DEADLINE: Duration = Duration::from_secs(2);
@@ -113,19 +116,14 @@ pub async fn run_engine(
     } = deps;
 
     let http = http_client();
-    let media = MediaFetcher::new(http.clone(), paths.media_dir());
-    match media.cleanup(MEDIA_MAX_AGE) {
-        Ok(n) if n > 0 => tracing::debug!(removed = n, "media cache cleaned"),
-        Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "media cache cleanup failed"),
-    }
+    let media = Arc::new(MediaFetcher::new(http.clone(), paths.media_dir()));
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
     let stop_media = CancellationToken::new();
     let mut worker = tokio::spawn(delivery_worker(
         delivery_rx,
-        media,
+        media.clone(),
         notifier.clone(),
         stop_media.clone(),
     ));
@@ -139,6 +137,8 @@ pub async fn run_engine(
         tray: None,
         settings_save: SaveHealth::default(),
         state_save: SaveHealth::default(),
+        media,
+        media_cleanup: Periodic::starting_now(MEDIA_CLEANUP_INTERVAL),
         paths,
         http,
         deliveries: Some(delivery_tx),
@@ -219,7 +219,7 @@ struct Delivery {
 /// remote media.
 async fn delivery_worker(
     mut rx: mpsc::UnboundedReceiver<Delivery>,
-    media: MediaFetcher,
+    media: Arc<MediaFetcher>,
     notifier: Arc<dyn Notifier>,
     stop_media: CancellationToken,
 ) {
@@ -244,6 +244,51 @@ struct Running {
     ctl: ConnControl,
     base_url: String,
     auth: Option<Auth>,
+    /// `None` once its unexpected end has been reported.
+    task: Option<JoinHandle<()>>,
+}
+
+/// A connection task only ends when cancelled or when the engine is gone, so
+/// one that finished while the engine runs has panicked. It is reported once
+/// as disconnected (the tray then shows a connection problem) and not
+/// restarted: a panic caused by server data would likely repeat.
+fn reap_crashed_connections(
+    connections: &mut HashMap<String, Running>,
+    statuses: &mut BTreeMap<String, (ConnStatus, i64)>,
+    now: i64,
+) {
+    for (id, r) in connections.iter_mut() {
+        if r.ctl.cancel.is_cancelled() || !r.task.as_ref().is_some_and(|t| t.is_finished()) {
+            continue;
+        }
+        r.task = None;
+        tracing::error!(instance = %id, "connection task stopped unexpectedly");
+        let error = "connection task panicked".to_owned();
+        track_status(statuses, id, ConnStatus::Disconnected { error }, now);
+    }
+}
+
+/// Fires once per `every`, starting immediately.
+struct Periodic {
+    next: Instant,
+    every: Duration,
+}
+
+impl Periodic {
+    fn starting_now(every: Duration) -> Self {
+        Self {
+            next: Instant::now(),
+            every,
+        }
+    }
+
+    fn due(&mut self, now: Instant) -> bool {
+        if now < self.next {
+            return false;
+        }
+        self.next = now + self.every;
+        true
+    }
 }
 
 struct Engine {
@@ -265,6 +310,8 @@ struct Engine {
     tray: Option<TrayState>,
     settings_save: SaveHealth,
     state_save: SaveHealth,
+    media: Arc<MediaFetcher>,
+    media_cleanup: Periodic,
 }
 
 impl Engine {
@@ -292,13 +339,14 @@ impl Engine {
             tune(&mut cfg);
             let ctl = ConnControl::default();
             let state = self.instances.get(&inst.id).cloned().unwrap_or_default();
-            spawn_connection(cfg, state, self.http.clone(), tx.clone(), ctl.clone());
+            let task = spawn_connection(cfg, state, self.http.clone(), tx.clone(), ctl.clone());
             self.connections.insert(
                 inst.id.clone(),
                 Running {
                     ctl,
                     base_url: inst.url.clone(),
                     auth,
+                    task: Some(task),
                 },
             );
         }
@@ -386,6 +434,14 @@ impl Engine {
     }
 
     fn on_tick(&mut self) {
+        reap_crashed_connections(&mut self.connections, &mut self.statuses, unix_now());
+        if self.media_cleanup.due(Instant::now()) {
+            match self.media.cleanup(MEDIA_MAX_AGE) {
+                Ok(n) if n > 0 => tracing::debug!(removed = n, "media cache cleaned"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "media cache cleanup failed"),
+            }
+        }
         if self.state_dirty {
             let result = save_json(&self.paths.state_file(), &self.state());
             self.state_dirty = result.is_err();
@@ -488,10 +544,22 @@ fn track_status(
     }
 }
 
+/// Never panics: a panicking notifier must not stop further deliveries.
 fn show(notifier: &dyn Notifier, n: &Notification) {
     tracing::debug!(id = %n.id, title = %n.title, "showing notification");
-    if let Err(e) = notifier.show(n) {
-        tracing::warn!(id = %n.id, error = %format!("{e:#}"), "showing notification failed");
+    match catch_unwind(AssertUnwindSafe(|| notifier.show(n))) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            tracing::warn!(id = %n.id, error = %format!("{e:#}"), "showing notification failed")
+        }
+        Err(panic) => {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            tracing::error!(id = %n.id, panic = %msg, "notifier panicked");
+        }
     }
 }
 
@@ -638,6 +706,112 @@ mod tests {
         let n = without_remote_media(n);
         assert_eq!(n.image, None);
         assert_eq!(n.icon, Some(MediaRef::Local("/tmp/i.png".into())));
+    }
+
+    fn plain(id: &str) -> Notification {
+        Notification {
+            id: id.into(),
+            thread: "t".into(),
+            title: String::new(),
+            body: String::new(),
+            level: Level::Active,
+            default_action: None,
+            buttons: Vec::new(),
+            image: None,
+            icon: None,
+        }
+    }
+
+    /// Panics on the first notification, records the rest.
+    #[derive(Default)]
+    struct PanicOnce {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl Notifier for PanicOnce {
+        fn show(&self, n: &Notification) -> anyhow::Result<()> {
+            let first = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push(n.id.clone());
+                calls.len() == 1
+            };
+            assert!(!first, "notifier exploded");
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn panicking_notifier_does_not_stop_delivery() {
+        let dir = tempfile::tempdir().unwrap();
+        let media = Arc::new(MediaFetcher::new(http_client(), dir.path().into()));
+        let notifier = Arc::new(PanicOnce::default());
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(delivery_worker(
+            rx,
+            media,
+            notifier.clone(),
+            CancellationToken::new(),
+        ));
+        for id in ["a", "b"] {
+            let n = plain(id);
+            tx.send(Delivery {
+                n,
+                base_url: String::new(),
+                auth: None,
+            })
+            .unwrap();
+        }
+        drop(tx);
+        worker.await.expect("worker survives the panic");
+        assert_eq!(*notifier.calls.lock().unwrap(), ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn crashed_connection_reported_once() {
+        let running = |task| Running {
+            ctl: ConnControl::default(),
+            base_url: String::new(),
+            auth: None,
+            task: Some(task),
+        };
+        let crashed = tokio::spawn(async { panic!("connection bug") });
+        let alive = tokio::spawn(std::future::pending::<()>());
+        let stopped = running(tokio::spawn(async {}));
+        stopped.ctl.cancel.cancel();
+        let mut conns = HashMap::from([
+            ("crashed".to_owned(), running(crashed)),
+            ("alive".to_owned(), running(alive)),
+            ("stopped".to_owned(), stopped),
+        ]);
+        let finished = |c: &HashMap<String, Running>, id: &str| {
+            c[id].task.as_ref().is_some_and(|t| t.is_finished())
+        };
+        while !(finished(&conns, "crashed") && finished(&conns, "stopped")) {
+            tokio::task::yield_now().await;
+        }
+        let mut st = BTreeMap::from([("crashed".to_owned(), (ConnStatus::Connected, 5))]);
+        reap_crashed_connections(&mut conns, &mut st, 10);
+        assert!(matches!(
+            st["crashed"],
+            (ConnStatus::Disconnected { .. }, 10)
+        ));
+        assert_eq!(st.len(), 1, "alive and cancelled connections untouched");
+        assert!(conns["crashed"].task.is_none());
+
+        st.insert("crashed".into(), (ConnStatus::Connected, 20));
+        reap_crashed_connections(&mut conns, &mut st, 30);
+        assert_eq!(st["crashed"], (ConnStatus::Connected, 20), "reported once");
+    }
+
+    #[test]
+    fn periodic_fires_immediately_then_every_interval() {
+        let hour = Duration::from_secs(3600);
+        let mut p = Periodic::starting_now(hour);
+        let t0 = Instant::now();
+        assert!(p.due(t0));
+        assert!(!p.due(t0 + hour - Duration::from_secs(1)));
+        assert!(p.due(t0 + hour));
+        assert!(!p.due(t0 + hour + Duration::from_secs(1)));
     }
 
     #[test]

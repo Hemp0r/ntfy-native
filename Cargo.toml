@@ -15,7 +15,7 @@ humantime = "2.4.0"
 if-watch = { version = "3.2.2", features = ["tokio"] }
 keyring-core = "1.0.1"
 lexopt = "0.3.2"
-open = "5.4.4"
+open = { version = "5.4.4", features = ["shellexecute-on-windows"] }
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["native-tls"] }
 serde = { version = "1.0.229", features = ["derive"] }

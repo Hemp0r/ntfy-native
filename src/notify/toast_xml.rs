@@ -73,10 +73,13 @@ pub fn attempts(n: &Notification) -> impl Iterator<Item = String> + '_ {
     .map(move |(scenario, actions, _)| build_with(n, scenario, actions))
 }
 
-/// Escaped `file:///` URI of a local media file; remote media is not embedded.
+/// Escaped `file:` URI of a local media file; remote media and paths that
+/// have no file URI (relative paths) are not embedded.
 fn local_src(media: Option<&MediaRef>) -> Option<String> {
     match media? {
-        MediaRef::Local(path) => Some(escape(&format!("file:///{}", path.display()))),
+        MediaRef::Local(path) => url::Url::from_file_path(path)
+            .ok()
+            .map(|u| escape(u.as_str())),
         MediaRef::Remote(_) => None,
     }
 }
@@ -219,17 +222,28 @@ mod tests {
         let xml = build(&n, true);
         assert!(xml.contains("<toast") && !xml.contains("<image"), "{xml}");
 
-        n.image = Some(MediaRef::Local(PathBuf::from(r"C:\cache\a&b.png")));
-        n.icon = Some(MediaRef::Local(PathBuf::from(r"C:\cache\icon.png")));
+        #[cfg(windows)]
+        let (dir, uri) = (r"C:\cache dir", "file:///C:/cache%20dir");
+        #[cfg(not(windows))]
+        let (dir, uri) = ("/cache dir", "file:///cache%20dir");
+        n.image = Some(MediaRef::Local(PathBuf::from(dir).join("a&b.png")));
+        n.icon = Some(MediaRef::Local(PathBuf::from(dir).join("icon.png")));
         let xml = build(&n, true);
         assert!(
-            xml.contains(r#"<image placement="appLogoOverride" src="file:///C:\cache\icon.png"/>"#),
+            xml.contains(&format!(
+                r#"<image placement="appLogoOverride" src="{uri}/icon.png"/>"#
+            )),
             "{xml}"
         );
         assert!(
-            xml.contains(r#"<image src="file:///C:\cache\a&amp;b.png"/>"#),
+            xml.contains(&format!(r#"<image src="{uri}/a&amp;b.png"/>"#)),
             "{xml}"
         );
+
+        n.image = Some(MediaRef::Local(PathBuf::from("relative.png")));
+        n.icon = None;
+        let xml = build(&n, true);
+        assert!(!xml.contains("<image"), "relative path skipped: {xml}");
     }
 
     #[test]
@@ -242,7 +256,7 @@ mod tests {
             label: "\"&'".into(),
             payload: open("https://x/'\""),
         }];
-        n.image = Some(MediaRef::Local(PathBuf::from("/tmp/<a>.png")));
+        n.image = Some(MediaRef::Local(std::env::temp_dir().join("<a>&'b.png")));
         let xml = build(&n, true);
         assert!(xml.contains("<text>&lt;&amp;&gt;</text>"), "{xml}");
 

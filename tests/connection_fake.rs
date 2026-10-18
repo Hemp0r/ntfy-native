@@ -6,7 +6,7 @@ use ntfy_native::connection::{ConnEvent, ConnStatus, ConnectionConfig};
 use ntfy_native::secrets::Auth;
 use ntfy_native::state::{InstanceState, SeenMessage};
 use support::conn::{Conn, is_connected, is_disconnected, last_state, message_ids};
-use support::{FakeServer, Recorded, Reply, Script, unused_url};
+use support::{FakeServer, REFUSED_CONNECT, Recorded, Reply, Script, unused_url};
 
 const INSTANCE: &str = "inst-1";
 
@@ -418,14 +418,20 @@ async fn server_error_reports_disconnected_and_retries() {
 #[tokio::test]
 async fn server_down_retries_with_backoff() {
     let mut conn = Conn::start(config(&unused_url(), None), InstanceState::default());
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+    // Each refused connect takes 1-2 s on Windows.
+    let (window, min_attempts) = if cfg!(windows) {
+        (Duration::from_secs(6), 2)
+    } else {
+        (Duration::from_secs(1), 3)
+    };
+    let deadline = tokio::time::Instant::now() + window;
     let mut disconnected = 0;
     while let Ok(Some((_, ev))) = tokio::time::timeout_at(deadline, conn.rx.recv()).await {
         if is_disconnected(&ev) {
             disconnected += 1;
         }
     }
-    assert!(disconnected >= 3, "only {disconnected} attempts");
+    assert!(disconnected >= min_attempts, "only {disconnected} attempts");
     assert!(!conn.handle.is_finished());
 }
 
@@ -583,6 +589,7 @@ async fn cancel_stops_task() {
 
     // Also while waiting for the next attempt.
     let mut conn = Conn::start(config(&unused_url(), None), InstanceState::default());
+    conn.patience += REFUSED_CONNECT;
     conn.until(is_disconnected).await;
     conn.ctl.cancel.cancel();
     tokio::time::timeout(Duration::from_millis(200), conn.handle)

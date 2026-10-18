@@ -282,6 +282,14 @@ async fn handle(State(shared): State<Shared>, req: Request) -> Response {
     reply.into_response()
 }
 
+/// Upper bound for one refused connect to [`unused_url`]: immediate on Unix,
+/// but Windows retries a refused loopback connect for about 1-2 s.
+pub const REFUSED_CONNECT: Duration = if cfg!(windows) {
+    Duration::from_secs(3)
+} else {
+    Duration::ZERO
+};
+
 /// Base URL of a local port with nothing listening.
 pub fn unused_url() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
