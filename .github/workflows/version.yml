@@ -10,16 +10,16 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: version-main
-  cancel-in-progress: false
-
 jobs:
   bump:
-    # Defensive: never version our own release commits.
-    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
+    # Defensive: never version our own release commits (bot pushes).
+    if: ${{ github.actor != 'github-actions[bot]' && !startsWith(github.event.head_commit.message, 'chore(release):') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Only the bump is serialized; release.yml is serialized per tag.
+    concurrency:
+      group: version-main
+      cancel-in-progress: false
     permissions:
       contents: write
     outputs:
@@ -28,10 +28,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
       - name: Determine version, bump, tag and push
         id: version
         run: |
           set -euo pipefail
+
+          # A re-run of this job on an already released commit would bump again.
+          released=$(git tag --list 'v*.*.*' --contains HEAD | tr '\n' ' ')
+          if [[ -n "$released" ]]; then
+            echo "::error::Commit already released as: $released. Use 'Re-run failed jobs' or Release -> Run workflow."
+            exit 1
+          fi
 
           current=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
           read -r new action < <(git tag --list 'v*.*.*' | scripts/next-version.sh "$current")

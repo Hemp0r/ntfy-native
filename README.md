@@ -129,7 +129,8 @@ Releases entstehen vollautomatisch beim Merge auf `main`:
    - Andernfalls wird der Patch des neuesten Tags um 1 erhöht (neuestes Tag `v0.1.5` ergibt `0.1.6`). Der Workflow schreibt die Version in `Cargo.toml` und `Cargo.lock` und committet als `chore(release): vX.Y.Z`.
    - Tags, die nicht exakt `vMAJOR.MINOR.PATCH` entsprechen (z. B. `v1.0.0-rc1`), werden ignoriert. Pre-Releases gibt es nicht.
 2. Der Workflow setzt das annotierte Tag `vX.Y.Z` und pusht Commit und Tag gemeinsam (ohne Force-Push). Existiert das Tag bereits oder ist `main` zwischenzeitlich weitergelaufen, bricht der Lauf ab; der nächste Merge holt das nach.
-3. Anschließend ruft er `.github/workflows/release.yml` auf: Prüfung (fmt, clippy, Tests auf macOS und Windows), universelle macOS-DMG (Apple Silicon + Intel) sowie Windows-ZIPs (x64, ARM64), alles samt `SHA256SUMS.txt` im GitHub-Release. Ein bestehendes Tag lässt sich über „Run workflow“ auf dem Workflow „Release“ (Eingabe `tag`, z. B. `v0.1.0`) erneut veröffentlichen.
+3. Anschließend ruft er `.github/workflows/release.yml` auf: Prüfung (fmt, clippy, Tests auf macOS und Windows), universelle macOS-DMG (Apple Silicon + Intel) sowie Windows-ZIPs (x64, ARM64), alles samt `SHA256SUMS.txt` im GitHub-Release. Schlägt nur das Release fehl, genügt „Re-run failed jobs“ oder „Run workflow“ auf dem Workflow „Release“ (Eingabe `tag`, z. B. `v0.1.0`). „Re-run all jobs“ auf dem Version-Lauf bricht bewusst ab, weil der Commit bereits einem Release-Tag zugeordnet ist.
+4. Branch Protection bzw. Rulesets auf `main` müssen Pushes von `github-actions[bot]` erlauben, sonst scheitert der Push von Versions-Commit und Tag.
 
 Optionale Repository-Secrets (ohne sie wird die DMG ad-hoc signiert und der Lauf gibt Warnungen aus):
 
