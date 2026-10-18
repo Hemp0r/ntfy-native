@@ -69,10 +69,23 @@ fn valid_topic_name(name: &str) -> bool {
 }
 
 fn normalize_url(raw: &str) -> Result<String> {
+    // Never echo the raw value: it may carry credentials.
     let url = raw.trim().trim_end_matches('/');
-    let parsed = url::Url::parse(url).map_err(|e| anyhow!("invalid url {raw:?}: {e}"))?;
+    let parsed = url::Url::parse(url).map_err(|e| anyhow!("invalid instance url: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        bail!("url must start with http:// or https://: {raw:?}");
+        bail!("instance url must start with http:// or https://");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        bail!(
+            "instance url for host {} must not contain credentials; use token or username/password",
+            parsed.host_str().unwrap_or_default()
+        );
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        bail!(
+            "instance url for host {} must not contain a query or fragment",
+            parsed.host_str().unwrap_or_default()
+        );
     }
     Ok(url.to_string())
 }
@@ -139,13 +152,19 @@ fn convert_instance(raw: RawInstance) -> Result<ImportInstance> {
 
 pub fn parse_import(yaml: &str) -> Result<ImportFile> {
     let raw: RawFile = serde_yaml_ng::from_str(yaml).context("parsing config.yaml")?;
+    let instances = raw
+        .instances
+        .into_iter()
+        .map(convert_instance)
+        .collect::<Result<Vec<_>>>()?;
+    for (i, inst) in instances.iter().enumerate() {
+        if instances[..i].iter().any(|o| o.url == inst.url) {
+            bail!("duplicate instance url {}", inst.url);
+        }
+    }
     Ok(ImportFile {
         urgent_breaks_dnd: raw.urgent_breaks_dnd,
-        instances: raw
-            .instances
-            .into_iter()
-            .map(convert_instance)
-            .collect::<Result<_>>()?,
+        instances,
     })
 }
 
@@ -189,7 +208,14 @@ pub fn apply_import(
             }
         };
         inst.url = imp.url.clone();
-        inst.topics = imp.topics.clone();
+        inst.topics = imp
+            .topics
+            .iter()
+            .map(|t| Topic {
+                muted: inst.topics.iter().any(|o| o.name == t.name && o.muted),
+                ..t.clone()
+            })
+            .collect();
         if let Some(secs) = imp.cache_duration_secs {
             inst.cache_duration_secs = secs;
         }
@@ -452,5 +478,56 @@ instances:
         assert!(import_file(&cfg, None, &MemoryStore::failing(), &settings_path).is_err());
         assert_eq!(fs::read_to_string(&cfg).unwrap(), EXAMPLE);
         assert!(!settings_path.exists());
+    }
+
+    #[test]
+    fn rejects_url_with_credentials() {
+        let err = parse_import(&one("https://u:s3cretpw@host.org", &["a"])).unwrap_err();
+        assert!(!format!("{err:#}").contains("s3cretpw"), "{err:#}");
+        assert!(parse_import(&one("https://u@host.org", &["a"])).is_err());
+    }
+
+    #[test]
+    fn rejects_url_with_query_or_fragment() {
+        assert!(parse_import(&one("https://h.org/?a=b", &["a"])).is_err());
+        assert!(parse_import(&one("https://h.org/#f", &["a"])).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_urls() {
+        let y = "instances:\n  - url: https://x.org/\n  - url: https://x.org\n";
+        assert!(parse_import(y).is_err());
+    }
+
+    #[test]
+    fn rejects_password_without_username() {
+        let y = "instances:\n  - url: https://x.org\n    password: p\n";
+        assert!(parse_import(y).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_token() {
+        let y = "instances:\n  - url: https://x.org\n    token: \"\"\n";
+        assert!(parse_import(y).is_err());
+    }
+
+    #[test]
+    fn reimport_preserves_muted_by_name() {
+        let store = MemoryStore::new();
+        let mut s = apply_import(
+            None,
+            &parse_import(&one("https://a.org", &["keep", "drop"])).unwrap(),
+            &store,
+        )
+        .unwrap();
+        for t in &mut s.instances[0].topics {
+            t.muted = true;
+        }
+        let y = "instances:\n  - url: https://a.org\n    topics:\n      - keep\n      - fresh\n      - name: drop2\n        urgent_breaks_dnd: true\n";
+        let s2 = apply_import(Some(s), &parse_import(y).unwrap(), &store).unwrap();
+        let t = &s2.instances[0].topics;
+        assert!(t[0].muted && t[0].name == "keep");
+        assert!(!t[1].muted && t[1].name == "fresh");
+        assert!(!t[2].muted && t[2].urgent_breaks_dnd == Some(true));
     }
 }
