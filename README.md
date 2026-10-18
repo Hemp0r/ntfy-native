@@ -2,6 +2,24 @@
 
 Schlanke Tray-App für macOS und Windows, die ntfy-Server abonniert und jede Nachricht als native Betriebssystem-Benachrichtigung zustellt. Verpasste Nachrichten werden nachgeholt bzw. Lücken gemeldet; das Tray-Icon zeigt den Verbindungsstatus.
 
+## Starten
+
+- macOS: `scripts/macos-dev-bundle.sh` baut `target/ntfy-native.app`; per Doppelklick oder `open target/ntfy-native.app` starten. Die App erscheint nur in der Menüleiste (kein Dock-Symbol).
+- Windows: `ntfy-native.exe` starten; die App erscheint im Infobereich der Taskleiste.
+
+Bis zum Einrichtungsassistenten (Teil 2) erfolgt die Einrichtung über eine `config.yaml` (siehe [Konfiguration](#konfiguration)): Datei am angegebenen Ort anlegen und die App (neu) starten. Eine vorhandene `config.yaml` wird beim Start nur importiert, solange noch keine Instanz eingerichtet ist; danach nur noch explizit mit `--import <pfad>`. Ohne Konfiguration zeigt das Tray-Menü „Nicht eingerichtet“ mit dem erwarteten Pfad. Das Tray-Menü zeigt den Verbindungsstatus und enthält „Beenden“.
+
+Es läuft immer nur eine Instanz; ein zweiter Start beendet sich sofort.
+
+Logs liegen in `log_dir`, eine Datei pro Tag, die letzten 7 werden behalten:
+
+- macOS: `~/Library/Application Support/dev.hemp0r.ntfy-native/logs/`
+- Windows: `%APPDATA%\hemp0r\ntfy-native\data\logs\`
+
+Die Ausführlichkeit steuert die Umgebungsvariable `NTFY_NATIVE_LOG` (Standard `info`; Syntax wie `RUST_LOG`, z. B. `debug` oder `info,ntfy_native=debug`). Debug-Builds schreiben zusätzlich auf stderr.
+
+Speicherbedarf (macOS, Intel, Release-Build, zwei Instanzen mit zusammen 10 Topics, nach 1 Minute Ruhe): `phys_footprint` rund 12 MB (gemessen: 12 124 160 Byte, Ziel < 30 MB).
+
 ## Konfiguration
 
 `config.yaml` ist ein einmaliger Import. Danach ist der interne App-Zustand (`settings.json`) die einzige Quelle der Wahrheit.

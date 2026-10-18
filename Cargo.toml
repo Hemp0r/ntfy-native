@@ -22,10 +22,14 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 serde_yaml_ng = "0.10.0"
 sys-locale = "0.3.2"
+tao = { version = "0.37.1", default-features = false }
 thiserror = "2.0.21"
 tokio = { version = "1.53.3", default-features = false, features = ["rt", "macros", "time", "sync", "signal"] }
 tokio-util = { version = "0.7.20", default-features = false }
 tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "env-filter", "ansi"] }
+tray-icon = { version = "0.24.2", default-features = false }
 url = "2.5.8"
 
 [profile.release]
@@ -38,7 +42,6 @@ axum = "0.8.9"
 filetime = "0.2.29"
 tempfile = "3.27.0"
 tokio = { version = "1.53.3", features = ["net", "rt", "macros", "time", "sync", "test-util"] }
-tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
