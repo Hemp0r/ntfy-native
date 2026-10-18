@@ -7,11 +7,18 @@ Schlanke Tray-App für macOS und Windows, die ntfy-Server abonniert und jede Nac
 - macOS: `scripts/macos-dev-bundle.sh` baut `target/ntfy-native.app`; per Doppelklick oder `open target/ntfy-native.app` starten. Die App erscheint nur in der Menüleiste (kein Dock-Symbol).
 - Windows: `ntfy-native.exe` starten; die App erscheint im Infobereich der Taskleiste.
 
-Bis zum Einrichtungsassistenten (Teil 2) erfolgt die Einrichtung über eine `config.yaml` (siehe [Konfiguration](#konfiguration)): Datei am angegebenen Ort anlegen und die App (neu) starten. Eine vorhandene `config.yaml` wird beim Start nur importiert, solange noch keine Instanz eingerichtet ist; danach nur noch explizit mit `--import <pfad>`. Ohne Konfiguration zeigt das Tray-Menü „Nicht eingerichtet“ mit dem erwarteten Pfad. Das Tray-Menü zeigt den Verbindungsstatus und enthält „Beenden“.
+Bis zum Einrichtungsassistenten (Teil 2) erfolgt die Einrichtung über eine `config.yaml` (siehe [Konfiguration](#konfiguration)): Datei am angegebenen Ort anlegen und die App (neu) starten. Eine vorhandene `config.yaml` wird beim Start nur importiert, solange noch keine Instanz eingerichtet ist; danach nur noch explizit mit `--import <pfad>`. Ohne Konfiguration zeigt das Tray-Menü „Nicht eingerichtet“ mit dem erwarteten Pfad. Schlägt der Import fehl (z. B. Tippfehler oder fehlendes `url:`), zeigt es stattdessen „Konfiguration fehlerhaft – siehe Logs“, und eine Benachrichtigung „config.yaml konnte nicht gelesen werden“ nennt den Fehler (etwa ``instance 1: missing field `url` ``); die Datei bleibt dann unverändert liegen und kann korrigiert werden.
 
-Es läuft immer nur eine Instanz; ein zweiter Start beendet sich sofort (mit `--import` als Fehler, siehe [Konfiguration](#konfiguration)).
+Das Tray-Menü enthält:
 
-Logs liegen in `log_dir`, eine Datei pro Tag, die letzten 7 werden behalten:
+- den Verbindungsstatus (nicht anklickbar),
+- „Konfigurationsordner öffnen“: öffnet den Ordner für die `config.yaml` im Finder bzw. Explorer (legt ihn bei Bedarf an),
+- „Logs öffnen“: öffnet den Log-Ordner,
+- „Beenden“.
+
+Es läuft immer nur eine Instanz; ein zweiter Start beendet sich sofort (mit `--import` als Fehler, siehe [Konfiguration](#konfiguration)) und schreibt das nur ins Log. **Vor einem Neustart die laufende App daher über „Beenden“ im Tray-Menü schließen**, sonst bleibt die alte Instanz aktiv und eine neue `config.yaml` wird nicht gelesen.
+
+Logs liegen in `log_dir` (Tray-Menü „Logs öffnen“), eine Datei pro Tag, die letzten 7 werden behalten:
 
 - macOS: `~/Library/Application Support/dev.hemp0r.ntfy-native/logs/`
 - Windows: `%APPDATA%\hemp0r\ntfy-native\data\logs\`
@@ -44,12 +51,31 @@ Regeln:
 - Ein erneuter Import ersetzt Topics der betroffenen Instanz (erkannt an der URL); andere Instanzen bleiben unverändert. `urgent_breaks_dnd` ändert sich nur, wenn es in der Datei steht.
 - Zugangsdaten bei einem erneuten Import: `token` bzw. `username` + `password` ersetzen die gespeicherten. Ohne Zugangsdaten-Felder bleiben die gespeicherten erhalten; nur `username` (ohne `password`) behält das gespeicherte Passwort einer Basic-Auth-Instanz, solange der Benutzername unverändert ist; bei geändertem Benutzernamen ist ein `password` Pflicht. `auth: none` entfernt gespeicherte Zugangsdaten.
 
-Speicherort der Datei (`config.yaml`):
+Speicherort der Datei (`config.yaml`; „Konfigurationsordner öffnen“ im Tray-Menü öffnet den Ordner):
 
 - macOS: `~/Library/Application Support/dev.hemp0r.ntfy-native/config.yaml`
 - Windows: `%APPDATA%\hemp0r\ntfy-native\config\config.yaml`
 
+Fehlt `config.yaml`, wird am selben Ort auch `config.yml` akzeptiert (nur am Standardort, nicht für `--config`); gibt es beide, gilt `config.yaml`. Die Datei muss als UTF-8 gespeichert sein (nicht UTF-16).
+
+Windows blendet bekannte Dateiendungen standardmäßig aus: Eine im Editor als „config.yaml“ gespeicherte Datei heißt dann womöglich `config.yaml.txt`. Im Explorer die Dateinamenerweiterungen einblenden (Windows 11: „Anzeigen“ → „Einblenden“ → „Dateinamenerweiterungen“, Windows 10: „Ansicht“ → „Dateinamenerweiterungen“) und die Datei umbenennen. Findet die App keine Konfiguration, aber eine Datei wie `config.yaml.txt`, `config.yml.txt` oder `config.txt`, nennt eine Warnung im Log den gefundenen und den erwarteten Namen.
+
 Ein anderer Pfad lässt sich mit `--config <pfad>` angeben; `--import <pfad>` importiert eine Datei explizit. **App vor `--import` beenden:** Läuft ntfy-native bereits, bricht `--import` mit einer Fehlermeldung (stderr und Log) und einem Exit-Code ungleich 0 ab, ohne etwas zu importieren.
+
+### Ohne Anmeldung
+
+Für einen Server ohne Zugangsschutz `token`, `username` und `password` einfach weglassen:
+
+```yaml
+instances:
+  - url: https://ntfy.example.org
+    topics:
+      - backups
+```
+
+Bei einem erneuten Import behält eine Instanz ohne diese Felder allerdings ihre gespeicherten Zugangsdaten; um sie zu entfernen, `auth: none` angeben.
+
+### Import und Secrets
 
 Secrets wandern in den Schlüsselbund (macOS) bzw. die Anmeldeinformationsverwaltung (Windows), die Datei wird zu `config.imported.yaml` ohne Secrets umgeschrieben (Benutzername bleibt erhalten, ein Kommentar am Anfang erklärt das) und das Original gelöscht. `config.imported.yaml` kann bearbeitet und mit `--import` erneut importiert werden; sie wird dann an Ort und Stelle neu geschrieben, die gespeicherten Zugangsdaten bleiben erhalten.
 
@@ -97,7 +123,7 @@ Ohne das Entitlement (oder ohne erlaubte zeitkritische Mitteilungen in den Syste
 
 Benachrichtigungen laufen über WinRT-Toasts mit der AppUserModelID `dev.hemp0r.ntfy-native`. Beim Start registriert sich die App (bzw. das gestartete Beispiel) selbst, nur unter `HKEY_CURRENT_USER` und bei jedem Start neu (der Pfad der `.exe` kann sich ändern):
 
-- `HKCU\Software\Classes\AppUserModelId\dev.hemp0r.ntfy-native`: `DisplayName` = `ntfy-native`, `CustomActivator` = `{AE88E831-148B-400C-8273-6ABC4FDEA102}`
+- `HKCU\Software\Classes\AppUserModelId\dev.hemp0r.ntfy-native`: `DisplayName` = `ntfy-native`, `CustomActivator` = `{AE88E831-148B-400C-8273-6ABC4FDEA102}`, `IconUri` = Pfad zu `icon.png` im Datenordner (`%APPDATA%\hemp0r\ntfy-native\data\icon.png`, bei jedem Start der App geschrieben, falls fehlend oder veraltet; das Beispiel setzt `IconUri` nicht)
 - `HKCU\Software\Classes\CLSID\{AE88E831-148B-400C-8273-6ABC4FDEA102}\LocalServer32`: Standardwert `"<Pfad der exe>" -ToastActivated`
 
 Klicks auf einen Toast oder dessen Buttons erreichen die laufende App über einen COM-Server mit dieser CLSID (fest, nie ändern). Läuft die App nicht mehr (Toast im Info-Center), startet Windows die eingetragene `.exe` mit `-ToastActivated` neu und liefert den Klick nach. Dringende Nachrichten nutzen `scenario="urgent"`; ältere Windows-10-Builds lehnen das ab, dann wird der Toast ohne dieses Szenario erneut angezeigt.
@@ -118,6 +144,10 @@ cargo run --example notify_demo
 ```
 
 Die Demo legt ihr Bild dann in diesem Ordner ab. Fehlen Bild und App-Logo im aktiven Toast, muss der Pfad prozentkodiert werden.
+
+### App-Icon
+
+Quelle ist `assets/icon.svg` (weiße Glocke auf grünem, abgerundetem Quadrat). `scripts/gen-icons.sh` (nur macOS: `sips`, `iconutil`, `python3`) erzeugt daraus die eingecheckten Dateien `assets/AppIcon.icns` (macOS-Bundle, `CFBundleIconFile`), `assets/icon.ico` (16, 32, 48 und 256 px; per `build.rs` und `winresource` in die `.exe` eingebettet, nur bei einem Build auf Windows für Windows) und `assets/icon-256.png` (Toast- und Einstellungs-Icon unter Windows). Nach einer Änderung am SVG das Skript ausführen und die erzeugten Dateien mit committen. Die Tray-Icons sind davon unabhängig.
 
 ## Release
 
