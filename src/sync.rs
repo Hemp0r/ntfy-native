@@ -14,10 +14,6 @@ pub fn catch_up_since(st: &InstanceState) -> Option<i64> {
     Some(oldest.saturating_sub(DEDUP_MARGIN_SECS))
 }
 
-pub fn stream_since(server_now: i64) -> i64 {
-    server_now.saturating_sub(DEDUP_MARGIN_SECS)
-}
-
 impl InstanceState {
     /// Returns true if the message id has not been seen and should be delivered.
     /// Deduplication is by id only, so a server clock jump cannot drop messages.
@@ -183,11 +179,6 @@ mod tests {
         assert_eq!(catch_up_since(&st(Some(1000), Some(("a", 900)))), Some(870));
         assert_eq!(catch_up_since(&st(Some(1000), None)), Some(970));
         assert_eq!(catch_up_since(&st(None, Some(("a", 900)))), Some(870));
-    }
-
-    #[test]
-    fn stream_since_subtracts_margin() {
-        assert_eq!(stream_since(1000), 970);
     }
 
     #[test]

@@ -77,7 +77,7 @@ impl Notifier for LogNotifier {
 }
 
 fn log_notification(n: &Notification) {
-    eprintln!("notification {}: {} | {}", n.id, n.title, n.body);
+    tracing::info!(id = %n.id, title = %n.title, body = %n.body, "notification");
 }
 
 #[derive(Default)]

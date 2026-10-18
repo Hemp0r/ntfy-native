@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod connection;
 pub mod emoji;
 mod emoji_table;
 pub mod i18n;
