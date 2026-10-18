@@ -4,10 +4,10 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
 use windows::Data::Xml::Dom::XmlDocument;
 use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
 use windows::Win32::Foundation::{
@@ -37,7 +37,7 @@ use windows::Win32::UI::Notifications::{
 };
 use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 use windows::Win32::UI::Shell::{
-    FOLDERID_Programs, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderPath, SLGP_RAWPATH,
+    FOLDERID_Programs, IShellLinkW, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
     SetCurrentProcessExplicitAppUserModelID, ShellLink,
 };
 use windows::core::{
@@ -145,7 +145,8 @@ pub fn register_icon(dir: &Path) -> Result<()> {
 
 /// Creates or repairs the Start-menu shortcut on a helper thread with its own
 /// COM apartment, waiting at most [`SHORTCUT_TIMEOUT`] so the first toast
-/// usually finds it in place. Failures are logged.
+/// usually finds it in place. The thread logs its own outcome, so a failure
+/// after the timeout is not lost.
 fn ensure_start_menu_shortcut(exe: PathBuf) {
     let (tx, rx) = mpsc::channel();
     let spawned = std::thread::Builder::new()
@@ -154,27 +155,36 @@ fn ensure_start_menu_shortcut(exe: PathBuf) {
             // SAFETY: plain FFI call on a fresh thread.
             let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
             let result = if init.is_ok() {
-                let r = update_shortcut(&exe);
+                // Formatted (and the error dropped) before CoUninitialize, so
+                // no COM error info outlives the apartment.
+                let r = update_shortcut(&exe).map_err(|e| format!("{e:#}"));
                 // SAFETY: balances the successful CoInitializeEx; all COM
                 // objects were released inside `update_shortcut`.
                 unsafe { CoUninitialize() };
                 r
             } else {
-                Err(anyhow!("initializing COM: {}", Error::from(init)))
+                Err(format!("initializing COM: {}", Error::from(init)))
             };
-            let _ = tx.send(result);
+            if let Err(e) = result {
+                tracing::warn!(
+                    error = %e,
+                    "start menu shortcut unavailable, notifications may not stay in the Notification Center"
+                );
+            }
+            let _ = tx.send(());
         });
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "starting the shortcut thread failed");
         return;
     }
     match rx.recv_timeout(SHORTCUT_TIMEOUT) {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(
-            error = %format!("{e:#}"),
-            "start menu shortcut unavailable, notifications may not stay in the Notification Center"
-        ),
-        Err(_) => tracing::warn!("start menu shortcut check is taking long, continuing"),
+        Ok(()) => {}
+        Err(RecvTimeoutError::Timeout) => {
+            tracing::warn!("start menu shortcut check is taking long, continuing");
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            tracing::warn!("start menu shortcut thread failed");
+        }
     }
 }
 
@@ -229,7 +239,7 @@ fn read_shortcut(lnk: &Path) -> Result<ShortcutProps> {
     let target = unsafe {
         file.Load(&HSTRING::from(lnk), STGM_READ)?;
         let mut buf = vec![0u16; 32 * 1024];
-        link.GetPath(&mut buf, std::ptr::null_mut(), SLGP_RAWPATH.0 as u32)?;
+        link.GetPath(&mut buf, std::ptr::null_mut(), 0)?;
         let len = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
         String::from_utf16_lossy(&buf[..len])
     };
