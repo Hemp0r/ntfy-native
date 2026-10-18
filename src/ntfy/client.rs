@@ -122,7 +122,11 @@ pub async fn subscribe(
     Ok(Box::pin(stream))
 }
 
-fn request(http: &reqwest::Client, url: &str, auth: Option<&Auth>) -> reqwest::RequestBuilder {
+pub(crate) fn request(
+    http: &reqwest::Client,
+    url: &str,
+    auth: Option<&Auth>,
+) -> reqwest::RequestBuilder {
     let req = http.get(url);
     match auth {
         None => req,
