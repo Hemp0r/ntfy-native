@@ -1,0 +1,17 @@
+[package]
+name = "ntfy-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Lightweight tray app bridging ntfy servers to native OS notifications"
+
+[dependencies]
+anyhow = "1.0.104"
+directories = "6.0.0"
+lexopt = "0.3.2"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
