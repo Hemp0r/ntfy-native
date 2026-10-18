@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::Path;
 use std::sync::mpsc;
 
 use anyhow::{Context, Result};
@@ -35,6 +36,14 @@ use crate::paths::{APP_ID, APP_NAME};
 pub const TOAST_ACTIVATOR_CLSID: &str = "AE88E831-148B-400C-8273-6ABC4FDEA102";
 const CLSID: GUID = GUID::from_u128(0xAE88E831_148B_400C_8273_6ABC4FDEA102);
 
+/// Shown in toast headers and the Windows notification settings.
+const ICON_PNG: &[u8] = include_bytes!("../../assets/icon-256.png");
+const ICON_FILE_NAME: &str = "icon.png";
+
+fn aumid_key() -> String {
+    format!(r"Software\Classes\AppUserModelId\{APP_ID}")
+}
+
 thread_local! {
     static WINRT_READY: Cell<bool> = const { Cell::new(false) };
 }
@@ -50,7 +59,7 @@ impl WinNotifier {
     pub fn new(on_activate: ActivationSink) -> Result<Self> {
         let exe = std::env::current_exe().context("locating the executable")?;
         let clsid = format!("{{{TOAST_ACTIVATOR_CLSID}}}");
-        let aumid_key = format!(r"Software\Classes\AppUserModelId\{APP_ID}");
+        let aumid_key = aumid_key();
         set_string(&aumid_key, Some("DisplayName"), APP_NAME)?;
         set_string(&aumid_key, Some("CustomActivator"), &clsid)?;
         set_string(
@@ -93,6 +102,15 @@ impl Notifier for WinNotifier {
             .unwrap_or_else(|| anyhow::anyhow!("no toast to show"))
             .context(format!("showing toast {}", n.id)))
     }
+}
+
+/// Writes the app icon to `dir` (if missing or outdated) and registers it
+/// as `IconUri` next to `DisplayName`.
+pub fn register_icon(dir: &Path) -> Result<()> {
+    let path = std::path::absolute(dir.join(ICON_FILE_NAME)).context("resolving the icon path")?;
+    super::write_if_changed(&path, ICON_PNG)
+        .with_context(|| format!("writing {}", path.display()))?;
+    set_string(&aumid_key(), Some("IconUri"), &path.display().to_string())
 }
 
 fn show_toast(xml: &str, tag: &HSTRING, group: &HSTRING) -> Result<()> {

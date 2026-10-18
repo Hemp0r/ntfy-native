@@ -97,7 +97,7 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
             let _ = proxy.send_event(UserEvent::Activated(p));
         })
     };
-    let notifier = platform_notifier(on_activate);
+    let notifier = platform_notifier(on_activate, &paths.data_dir);
 
     let strings = strings();
     if let Some(error) = &import_error {

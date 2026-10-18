@@ -14,8 +14,9 @@ assemble_app() {
   root=$(repo_root)
   version=$(cargo_version)
   rm -rf "$app"
-  mkdir -p "$app/Contents/MacOS"
+  mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
   cp "$bin" "$app/Contents/MacOS/ntfy-native"
+  cp "$root/assets/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
   sed "s/@VERSION@/$version/g" "$root/packaging/macos/Info.plist" > "$app/Contents/Info.plist"
 }
 
