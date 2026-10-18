@@ -7,13 +7,14 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::Response;
+use futures_util::StreamExt;
 use tokio::sync::{Notify, mpsc};
 
 /// One request as seen by the server.
@@ -24,6 +25,8 @@ pub struct Recorded {
     pub query: Option<String>,
     pub headers: HeaderMap,
     pub body: Bytes,
+    /// When the request arrived.
+    pub at: Instant,
 }
 
 impl Recorded {
@@ -47,6 +50,8 @@ impl Recorded {
 
 enum ReplyBody {
     Full(Bytes),
+    /// Sends the bytes, then stays open without ending.
+    FullThenStall(Bytes),
     Channel(mpsc::UnboundedReceiver<Bytes>),
     Stall,
 }
@@ -100,6 +105,14 @@ impl Reply {
         }
     }
 
+    /// Keeps the connection open after a fixed body instead of ending it.
+    pub fn keep_open(mut self) -> Self {
+        if let ReplyBody::Full(b) = self.body {
+            self.body = ReplyBody::FullThenStall(b);
+        }
+        self
+    }
+
     pub fn with_status(mut self, code: u16) -> Self {
         self.status = StatusCode::from_u16(code).expect("valid status code");
         self
@@ -113,6 +126,10 @@ impl Reply {
     fn into_response(self) -> Response {
         let body = match self.body {
             ReplyBody::Full(b) => Body::from(b),
+            ReplyBody::FullThenStall(b) => Body::from_stream(
+                futures_util::stream::iter([Ok::<_, Infallible>(b)])
+                    .chain(futures_util::stream::pending()),
+            ),
             ReplyBody::Channel(rx) => {
                 Body::from_stream(futures_util::stream::unfold(rx, |mut rx| async move {
                     rx.recv().await.map(|b| (Ok::<_, Infallible>(b), rx))
@@ -150,23 +167,38 @@ impl StreamTx {
     }
 }
 
-/// Replies in push order; when the queue is empty, requests stall.
-#[derive(Clone, Default)]
-pub struct Script(Arc<Mutex<VecDeque<Reply>>>);
+/// Replies in push order; when the queue is empty, the fallback answers
+/// (default: [`Reply::stall`]).
+#[derive(Clone)]
+pub struct Script {
+    queue: Arc<Mutex<VecDeque<Reply>>>,
+    fallback: fn(&Recorded) -> Reply,
+}
+
+impl Default for Script {
+    fn default() -> Self {
+        Self::with_fallback(|_| Reply::stall())
+    }
+}
 
 impl Script {
+    pub fn with_fallback(fallback: fn(&Recorded) -> Reply) -> Self {
+        Self {
+            queue: Arc::default(),
+            fallback,
+        }
+    }
+
     pub fn push(&self, reply: Reply) {
-        self.0.lock().unwrap().push_back(reply);
+        self.queue.lock().unwrap().push_back(reply);
     }
 
     pub fn handler(&self) -> impl FnMut(&Recorded) -> Reply + Send + 'static {
-        let queue = self.0.clone();
-        move |_| {
-            queue
-                .lock()
-                .unwrap()
-                .pop_front()
-                .unwrap_or_else(Reply::stall)
+        let queue = self.queue.clone();
+        let fallback = self.fallback;
+        move |req| {
+            let next = queue.lock().unwrap().pop_front();
+            next.unwrap_or_else(|| fallback(req))
         }
     }
 }
@@ -242,6 +274,7 @@ async fn handle(State(shared): State<Shared>, req: Request) -> Response {
         query: parts.uri.query().map(str::to_owned),
         headers: parts.headers,
         body,
+        at: Instant::now(),
     };
     let reply = (shared.handler.lock().unwrap())(&recorded);
     shared.log.lock().unwrap().push(recorded);

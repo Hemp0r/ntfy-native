@@ -1,9 +1,9 @@
 use std::collections::VecDeque;
 use std::pin::Pin;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::Stream;
-use reqwest::header::{DATE, HeaderMap};
+use reqwest::header::{DATE, HeaderMap, RETRY_AFTER};
 
 use crate::ntfy::model::{Event, Message, parse_event};
 use crate::secrets::Auth;
@@ -18,6 +18,9 @@ pub enum NtfyError {
     Auth(u16),
     #[error("unexpected HTTP status {0}")]
     Status(u16),
+    /// HTTP 429, with the server's `Retry-After` if it sent a usable one.
+    #[error("rate limited by server (HTTP 429)")]
+    RateLimited { retry_after: Option<Duration> },
     #[error("network error: {0}")]
     Network(String),
 }
@@ -132,9 +135,22 @@ fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, NtfyError>
     let status = resp.status();
     match status.as_u16() {
         401 | 403 => Err(NtfyError::Auth(status.as_u16())),
+        429 => Err(NtfyError::RateLimited {
+            retry_after: retry_after(resp.headers()),
+        }),
         _ if !status.is_success() => Err(NtfyError::Status(status.as_u16())),
         _ => Ok(resp),
     }
+}
+
+/// `Retry-After` as delay-seconds or HTTP date.
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?.to_str().ok()?.trim();
+    if let Ok(secs) = value.parse::<u64>() {
+        return Some(Duration::from_secs(secs));
+    }
+    let at = httpdate::parse_http_date(value).ok()?;
+    Some(at.duration_since(SystemTime::now()).unwrap_or_default())
 }
 
 /// Includes the error's source chain, which carries the actual cause.
@@ -249,6 +265,28 @@ mod tests {
         assert_eq!(
             parse_line(r#"{"id":"k","time":5,"event":"keepalive"}"#),
             Some(Event::Keepalive { time: 5 })
+        );
+    }
+
+    #[test]
+    fn retry_after_seconds_or_date() {
+        let mut h = HeaderMap::new();
+        assert_eq!(retry_after(&h), None);
+        h.insert(RETRY_AFTER, " 120 ".parse().unwrap());
+        assert_eq!(retry_after(&h), Some(Duration::from_secs(120)));
+        h.insert(RETRY_AFTER, "soon".parse().unwrap());
+        assert_eq!(retry_after(&h), None);
+        h.insert(
+            RETRY_AFTER,
+            "Sun, 18 Oct 2020 10:00:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(retry_after(&h), Some(Duration::ZERO));
+        let later = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(90));
+        h.insert(RETRY_AFTER, later.parse().unwrap());
+        let d = retry_after(&h).unwrap();
+        assert!(
+            d > Duration::from_secs(80) && d <= Duration::from_secs(90),
+            "{d:?}"
         );
     }
 

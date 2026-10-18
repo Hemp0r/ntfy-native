@@ -16,6 +16,9 @@ use crate::sync::catch_up_since;
 
 /// Minimum interval between `State` events caused by keepalives alone.
 const KEEPALIVE_STATE_INTERVAL: Duration = Duration::from_secs(60);
+/// Upper bound for a server-requested `Retry-After` wait (lower bound:
+/// `backoff_initial`, so `Retry-After: 0` cannot cause a tight loop).
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Debug)]
 pub struct ConnectionConfig {
@@ -158,11 +161,8 @@ impl Connection {
             Some(Ok(Err(e))) => return self.handle_error(e).await,
             Some(Ok(Ok(stream))) => stream,
         };
-        self.emit(ConnEvent::Status(ConnStatus::Connected))?;
-        tracing::info!(instance = %self.cfg.instance_id, "connected");
-        self.backoff = self.cfg.backoff_initial;
 
-        match self.read_stream(stream).await? {
+        match self.read_stream(stream, since.is_none()).await? {
             StreamEnd::Reconnect => Ok(()),
             StreamEnd::Lost(error) => {
                 tracing::warn!(instance = %self.cfg.instance_id, %error, "connection lost");
@@ -194,7 +194,16 @@ impl Connection {
         self.emit(ConnEvent::State(self.state.clone()))
     }
 
-    async fn read_stream(&mut self, mut stream: EventStream) -> Result<StreamEnd, Stop> {
+    /// Reports `Connected` (and resets the backoff) only once the first event
+    /// parsed, so a server that answers 200 and closes, or sends something
+    /// other than ntfy JSON, keeps backing off. Without `since` the stream
+    /// replays nothing, so its `open` time is a safe catch-up starting point.
+    async fn read_stream(
+        &mut self,
+        mut stream: EventStream,
+        without_since: bool,
+    ) -> Result<StreamEnd, Stop> {
+        let mut connected = false;
         let mut last_state: Option<Instant> = None;
         loop {
             let next = tokio::time::timeout(self.cfg.keepalive_timeout, stream.next());
@@ -208,7 +217,18 @@ impl Connection {
                 Some(Ok(Some(Err(e)))) => return Ok(StreamEnd::Lost(e.to_string())),
                 Some(Ok(Some(Ok(event)))) => event,
             };
+            if !connected {
+                connected = true;
+                self.emit(ConnEvent::Status(ConnStatus::Connected))?;
+                tracing::info!(instance = %self.cfg.instance_id, "connected");
+                self.backoff = self.cfg.backoff_initial;
+            }
             match event {
+                Event::Open { time } if without_since => {
+                    self.state.observe_time(time);
+                    self.emit(ConnEvent::State(self.state.clone()))?;
+                    last_state = Some(Instant::now());
+                }
                 Event::Keepalive { time } => {
                     self.state.observe_time(time);
                     if last_state.is_none_or(|t| t.elapsed() >= KEEPALIVE_STATE_INTERVAL) {
@@ -240,15 +260,20 @@ impl Connection {
         let error = e.to_string();
         tracing::warn!(instance = %self.cfg.instance_id, %error, "connection failed");
         self.emit(ConnEvent::Status(ConnStatus::Disconnected { error }))?;
-        let delay = self.next_backoff();
+        let delay = match e {
+            NtfyError::RateLimited { retry_after } => retry_after
+                .map_or(self.cfg.backoff_max, |d| {
+                    d.clamp(self.cfg.backoff_initial, MAX_RETRY_AFTER)
+                }),
+            _ => self.next_backoff(),
+        };
         self.wait(delay).await
     }
 
-    /// Current backoff with ±20 % jitter; doubles the next one up to the maximum.
     fn next_backoff(&mut self) -> Duration {
-        let current = self.backoff;
-        self.backoff = (current * 2).min(self.cfg.backoff_max);
-        current.mul_f64(rand::random_range(0.8..=1.2))
+        let (delay, next) = backoff_step(self.backoff, self.cfg.backoff_max);
+        self.backoff = next;
+        delay
     }
 
     /// Sleeps; a reconnect request ends the wait early.
@@ -274,10 +299,46 @@ impl Connection {
     }
 }
 
+/// Returns the delay to wait now (`current` ±20 % jitter) and the next
+/// backoff (doubled, capped at `max`).
+fn backoff_step(current: Duration, max: Duration) -> (Duration, Duration) {
+    let factor: f64 = rand::random_range(0.8..=1.2);
+    let delay =
+        Duration::try_from_secs_f64(current.as_secs_f64() * factor).unwrap_or(Duration::MAX);
+    (delay, current.saturating_mul(2).min(max))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::settings::{AuthKind, Topic};
+
+    #[test]
+    fn backoff_doubles_up_to_max_with_jitter() {
+        let ms = Duration::from_millis;
+        let max = ms(400);
+        let mut current = ms(50);
+        let mut nexts = Vec::new();
+        for _ in 0..5 {
+            let (delay, next) = backoff_step(current, max);
+            assert!(delay >= current.mul_f64(0.8) && delay <= current.mul_f64(1.2));
+            nexts.push(next);
+            current = next;
+        }
+        assert_eq!(nexts, [ms(100), ms(200), ms(400), ms(400), ms(400)]);
+        assert_eq!(backoff_step(Duration::MAX, max).1, max);
+    }
+
+    #[test]
+    fn backoff_jitter_bounds() {
+        let base = Duration::from_millis(1000);
+        let delays: Vec<_> = (0..1000).map(|_| backoff_step(base, base).0).collect();
+        let (lo, hi) = (base.mul_f64(0.8), base.mul_f64(1.2));
+        assert!(delays.iter().all(|d| (lo..=hi).contains(d)));
+        // Actually spread out, not a constant factor.
+        assert!(delays.iter().any(|d| *d < base.mul_f64(0.9)));
+        assert!(delays.iter().any(|d| *d > base.mul_f64(1.1)));
+    }
 
     #[test]
     fn production_config_values() {
