@@ -9,7 +9,7 @@ Schlanke Tray-App für macOS und Windows, die ntfy-Server abonniert und jede Nac
 
 Bis zum Einrichtungsassistenten (Teil 2) erfolgt die Einrichtung über eine `config.yaml` (siehe [Konfiguration](#konfiguration)): Datei am angegebenen Ort anlegen und die App (neu) starten. Eine vorhandene `config.yaml` wird beim Start nur importiert, solange noch keine Instanz eingerichtet ist; danach nur noch explizit mit `--import <pfad>`. Ohne Konfiguration zeigt das Tray-Menü „Nicht eingerichtet“ mit dem erwarteten Pfad. Das Tray-Menü zeigt den Verbindungsstatus und enthält „Beenden“.
 
-Es läuft immer nur eine Instanz; ein zweiter Start beendet sich sofort.
+Es läuft immer nur eine Instanz; ein zweiter Start beendet sich sofort (mit `--import` als Fehler, siehe [Konfiguration](#konfiguration)).
 
 Logs liegen in `log_dir`, eine Datei pro Tag, die letzten 7 werden behalten:
 
@@ -28,7 +28,7 @@ Speicherbedarf (macOS, Intel, Release-Build, zwei Instanzen mit zusammen 10 Topi
 urgent_breaks_dnd: false          # optional, global
 instances:
   - url: https://ntfy.example.org
-    token: tk_xxxxxxxx            # ODER username + password, ODER nichts
+    token: tk_xxxxxxxx            # ODER username + password, ODER auth: none, ODER nichts
     cache_duration: 12h           # optional, humantime; muss zur Server-Einstellung passen
     topics:
       - backups                   # Kurzform
@@ -38,19 +38,20 @@ instances:
 
 Regeln:
 
-- `url` muss mit `http://` oder `https://` beginnen; ein abschließender `/` wird entfernt.
+- `url` muss mit `http://` oder `https://` beginnen. Die URL wird normalisiert (Hostname klein, Standard-Port wie `:443` entfernt, kein abschließender `/`), sodass `https://NTFY.example.org:443/` und `https://ntfy.example.org` dieselbe Instanz sind.
 - Topic-Namen: 1 bis 64 Zeichen aus `A-Z a-z 0-9 - _`.
-- `token` und `username`/`password` schließen sich aus; `username` und `password` gehören zusammen.
-- Ein erneuter Import ersetzt Topics und Zugangsdaten der betroffenen Instanz (erkannt an der URL); andere Instanzen bleiben unverändert. `urgent_breaks_dnd` ändert sich nur, wenn es in der Datei steht.
+- `token`, `username`/`password` und `auth: none` schließen sich gegenseitig aus; `password` braucht `username`.
+- Ein erneuter Import ersetzt Topics der betroffenen Instanz (erkannt an der URL); andere Instanzen bleiben unverändert. `urgent_breaks_dnd` ändert sich nur, wenn es in der Datei steht.
+- Zugangsdaten bei einem erneuten Import: `token` bzw. `username` + `password` ersetzen die gespeicherten. Ohne Zugangsdaten-Felder bleiben die gespeicherten erhalten; nur `username` (ohne `password`) behält das gespeicherte Passwort einer Basic-Auth-Instanz. `auth: none` entfernt gespeicherte Zugangsdaten.
 
 Speicherort der Datei (`config.yaml`):
 
 - macOS: `~/Library/Application Support/dev.hemp0r.ntfy-native/config.yaml`
 - Windows: `%APPDATA%\hemp0r\ntfy-native\config\config.yaml`
 
-Ein anderer Pfad lässt sich mit `--config <pfad>` angeben; `--import <pfad>` importiert eine Datei explizit.
+Ein anderer Pfad lässt sich mit `--config <pfad>` angeben; `--import <pfad>` importiert eine Datei explizit. **App vor `--import` beenden:** Läuft ntfy-native bereits, bricht `--import` mit einer Fehlermeldung (stderr und Log) und einem Exit-Code ungleich 0 ab, ohne etwas zu importieren.
 
-Secrets wandern in den Schlüsselbund (macOS) bzw. die Anmeldeinformationsverwaltung (Windows), die Datei wird zu `config.imported.yaml` ohne Secrets umgeschrieben (Benutzername bleibt erhalten) und das Original gelöscht.
+Secrets wandern in den Schlüsselbund (macOS) bzw. die Anmeldeinformationsverwaltung (Windows), die Datei wird zu `config.imported.yaml` ohne Secrets umgeschrieben (Benutzername bleibt erhalten, ein Kommentar am Anfang erklärt das) und das Original gelöscht. `config.imported.yaml` kann bearbeitet und mit `--import` erneut importiert werden; sie wird dann an Ort und Stelle neu geschrieben, die gespeicherten Zugangsdaten bleiben erhalten.
 
 ## Server-Empfehlungen
 

@@ -18,11 +18,32 @@ pub struct ImportFile {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImportInstance {
     pub url: String,
-    pub token: Option<String>,
-    pub username: Option<String>,
-    pub password: Option<String>,
+    pub credentials: Credentials,
     pub cache_duration_secs: Option<i64>,
     pub topics: Vec<Topic>,
+}
+
+/// The credential fields of an instance in the import file.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Credentials {
+    /// No credential fields: an existing instance keeps its credentials.
+    Unspecified,
+    /// `auth: none`: removes stored credentials.
+    None,
+    Token(String),
+    Basic {
+        username: String,
+        password: String,
+    },
+    /// `username` without `password` (as written to `config.imported.yaml`):
+    /// keeps the stored password of an existing basic-auth instance.
+    Username(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum RawAuth {
+    None,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -40,6 +61,8 @@ enum RawTopic {
 #[serde(deny_unknown_fields)]
 struct RawInstance {
     url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth: Option<RawAuth>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -68,10 +91,11 @@ fn valid_topic_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
+/// The parsed URL's serialization (lowercase host, no default port) without
+/// trailing `/`, so equivalent spellings map to the same instance.
 fn normalize_url(raw: &str) -> Result<String> {
     // Never echo the raw value: it may carry credentials.
-    let url = raw.trim().trim_end_matches('/');
-    let parsed = url::Url::parse(url).map_err(|e| anyhow!("invalid instance url: {e}"))?;
+    let parsed = url::Url::parse(raw.trim()).map_err(|e| anyhow!("invalid instance url: {e}"))?;
     if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
         bail!("instance url must start with http:// or https://");
     }
@@ -87,7 +111,16 @@ fn normalize_url(raw: &str) -> Result<String> {
             parsed.host_str().unwrap_or_default()
         );
     }
-    Ok(url.to_string())
+    Ok(parsed.as_str().trim_end_matches('/').to_owned())
+}
+
+/// Whether a stored instance URL (possibly saved in an older, unnormalized
+/// form) denotes the normalized import URL.
+fn same_url(stored: &str, normalized: &str) -> bool {
+    match normalize_url(stored) {
+        Ok(n) => n == normalized,
+        Err(_) => stored.trim_end_matches('/') == normalized,
+    }
 }
 
 fn convert_instance(raw: RawInstance) -> Result<ImportInstance> {
@@ -95,8 +128,13 @@ fn convert_instance(raw: RawInstance) -> Result<ImportInstance> {
     if raw.token.is_some() && (raw.username.is_some() || raw.password.is_some()) {
         bail!("{url}: token and username/password are mutually exclusive");
     }
-    if raw.username.is_some() != raw.password.is_some() {
-        bail!("{url}: username and password must be set together");
+    if raw.auth.is_some()
+        && (raw.token.is_some() || raw.username.is_some() || raw.password.is_some())
+    {
+        bail!("{url}: auth: none excludes token, username and password");
+    }
+    if raw.password.is_some() && raw.username.is_none() {
+        bail!("{url}: password requires a username");
     }
     for (field, value) in [("token", &raw.token), ("password", &raw.password)] {
         if value.as_deref() == Some("") {
@@ -140,11 +178,16 @@ fn convert_instance(raw: RawInstance) -> Result<ImportInstance> {
             urgent_breaks_dnd: urgent,
         });
     }
+    let credentials = match (raw.auth, raw.token, raw.username, raw.password) {
+        (Some(RawAuth::None), ..) => Credentials::None,
+        (None, Some(token), _, _) => Credentials::Token(token),
+        (None, None, Some(username), Some(password)) => Credentials::Basic { username, password },
+        (None, None, Some(username), None) => Credentials::Username(username),
+        (None, None, None, _) => Credentials::Unspecified,
+    };
     Ok(ImportInstance {
         url,
-        token: raw.token,
-        username: raw.username,
-        password: raw.password,
+        credentials,
         cache_duration_secs,
         topics,
     })
@@ -179,7 +222,40 @@ fn unique_id(settings: &Settings, base: &str) -> String {
         .expect("unbounded range")
 }
 
-/// Stores secrets in `secrets` and returns the new settings; does not persist them.
+/// How an import changes an instance's credentials.
+enum AuthPlan {
+    Set(AuthKind, String),
+    Keep(AuthKind),
+    Remove,
+}
+
+fn auth_plan(imp: &ImportInstance, existing: Option<&AuthKind>) -> Result<AuthPlan> {
+    Ok(match (&imp.credentials, existing) {
+        (Credentials::Token(token), _) => AuthPlan::Set(AuthKind::Token, token.clone()),
+        (Credentials::Basic { username, password }, _) => AuthPlan::Set(
+            AuthKind::Basic {
+                username: username.clone(),
+            },
+            password.clone(),
+        ),
+        (Credentials::Username(username), Some(AuthKind::Basic { .. })) => {
+            AuthPlan::Keep(AuthKind::Basic {
+                username: username.clone(),
+            })
+        }
+        (Credentials::Username(_), _) => bail!(
+            "{}: username without password needs an already stored password",
+            imp.url
+        ),
+        (Credentials::Unspecified, Some(kind)) if *kind != AuthKind::None => {
+            AuthPlan::Keep(kind.clone())
+        }
+        (Credentials::Unspecified | Credentials::None, _) => AuthPlan::Remove,
+    })
+}
+
+/// Stores secrets in `secrets` and returns the new settings; does not persist
+/// them. All instances are validated before any secret is touched.
 pub fn apply_import(
     existing: Option<Settings>,
     file: &ImportFile,
@@ -189,11 +265,22 @@ pub fn apply_import(
     if let Some(v) = file.urgent_breaks_dnd {
         settings.urgent_breaks_dnd = v;
     }
-    for imp in &file.instances {
-        let pos = settings
+    let position = |settings: &Settings, url: &str| {
+        settings
             .instances
             .iter()
-            .position(|i| i.url.trim_end_matches('/') == imp.url);
+            .position(|i| same_url(&i.url, url))
+    };
+    let plans = file
+        .instances
+        .iter()
+        .map(|imp| {
+            let existing = position(&settings, &imp.url).map(|p| &settings.instances[p].auth);
+            auth_plan(imp, existing)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (imp, plan) in file.instances.iter().zip(plans) {
+        let pos = position(&settings, &imp.url);
         let mut inst = match pos {
             Some(p) => settings.instances[p].clone(),
             None => {
@@ -220,22 +307,17 @@ pub fn apply_import(
             inst.cache_duration_secs = secs;
         }
         let account = account_for(&inst.id);
-        match (&imp.token, &imp.username, &imp.password) {
-            (Some(token), _, _) => {
-                secrets.set(&account, token)?;
-                inst.auth = AuthKind::Token;
+        inst.auth = match plan {
+            AuthPlan::Set(kind, secret) => {
+                secrets.set(&account, &secret)?;
+                kind
             }
-            (None, Some(username), Some(password)) => {
-                secrets.set(&account, password)?;
-                inst.auth = AuthKind::Basic {
-                    username: username.clone(),
-                };
-            }
-            _ => {
+            AuthPlan::Keep(kind) => kind,
+            AuthPlan::Remove => {
                 secrets.delete(&account)?;
-                inst.auth = AuthKind::None;
+                AuthKind::None
             }
-        }
+        };
         match pos {
             Some(p) => settings.instances[p] = inst,
             None => settings.instances.push(inst),
@@ -243,6 +325,24 @@ pub fn apply_import(
     }
     Ok(settings)
 }
+
+/// Starts `config.imported.yaml`.
+const SANITIZED_HEADER: &str = "\
+# ntfy-native – importierte Konfiguration / imported configuration
+#
+# DE: Token und Passwörter wurden in den Schlüsselbund (macOS) bzw. die
+#     Windows-Anmeldeinformationsverwaltung verschoben und aus dieser Datei
+#     entfernt. Die Datei kann bearbeitet und mit
+#     `ntfy-native --import <pfad>` erneut importiert werden (App vorher
+#     beenden). Gespeicherte Zugangsdaten bleiben dabei erhalten;
+#     `auth: none` bei einer Instanz entfernt sie.
+# EN: Tokens and passwords were moved to the Keychain (macOS) or the Windows
+#     Credential Manager and removed from this file. You can edit this file
+#     and re-import it with `ntfy-native --import <path>` (quit the app
+#     first). Stored credentials are kept; `auth: none` on an instance
+#     removes them.
+
+";
 
 /// Everything except token/password, so the file stays a readable record.
 pub fn sanitized_yaml(file: &ImportFile) -> String {
@@ -253,8 +353,14 @@ pub fn sanitized_yaml(file: &ImportFile) -> String {
             .iter()
             .map(|i| RawInstance {
                 url: i.url.clone(),
+                auth: (i.credentials == Credentials::None).then_some(RawAuth::None),
                 token: None,
-                username: i.username.clone(),
+                username: match &i.credentials {
+                    Credentials::Basic { username, .. } | Credentials::Username(username) => {
+                        Some(username.clone())
+                    }
+                    _ => None,
+                },
                 password: None,
                 cache_duration: i
                     .cache_duration_secs
@@ -273,8 +379,11 @@ pub fn sanitized_yaml(file: &ImportFile) -> String {
             })
             .collect(),
     };
-    serde_yaml_ng::to_string(&raw).expect("plain data serializes")
+    let yaml = serde_yaml_ng::to_string(&raw).expect("plain data serializes");
+    format!("{SANITIZED_HEADER}{yaml}")
 }
+
+const SANITIZED_NAME: &str = "config.imported.yaml";
 
 pub fn import_file(
     path: &Path,
@@ -287,12 +396,15 @@ pub fn import_file(
     let settings = apply_import(existing, &file, secrets)?;
     save_json(settings_path, &settings)?;
 
-    let imported = path.with_file_name("config.imported.yaml");
+    let imported = path.with_file_name(SANITIZED_NAME);
     let tmp = path.with_file_name("config.imported.yaml.tmp");
     fs::write(&tmp, sanitized_yaml(&file))
         .and_then(|()| fs::rename(&tmp, &imported))
         .with_context(|| format!("writing {}", imported.display()))?;
-    fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+    // Re-importing the sanitized file itself rewrote it in place.
+    if path.file_name() != Some(SANITIZED_NAME.as_ref()) {
+        fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+    }
     Ok(settings)
 }
 
@@ -354,9 +466,38 @@ instances:
     }
 
     #[test]
-    fn rejects_username_without_password() {
+    fn username_without_password_needs_stored_password() {
+        let store = MemoryStore::new();
         let y = "instances:\n  - url: https://x.org\n    username: u\n";
-        assert!(parse_import(y).is_err());
+        let f = parse_import(y).unwrap();
+        assert!(apply_import(None, &f, &store).is_err());
+        let token = "instances:\n  - url: https://x.org\n    token: tk\n";
+        let s = apply_import(None, &parse_import(token).unwrap(), &store).unwrap();
+        assert!(apply_import(Some(s), &f, &store).is_err());
+    }
+
+    #[test]
+    fn username_only_keeps_stored_password() {
+        let store = MemoryStore::new();
+        let y = "instances:\n  - url: https://x.org\n    username: alice\n    password: pw\n";
+        let s1 = apply_import(None, &parse_import(y).unwrap(), &store).unwrap();
+        let y2 = "instances:\n  - url: https://x.org\n    username: bob\n";
+        let s2 = apply_import(Some(s1), &parse_import(y2).unwrap(), &store).unwrap();
+        assert_eq!(
+            s2.instances[0].auth,
+            AuthKind::Basic {
+                username: "bob".into()
+            }
+        );
+        assert_eq!(store.get("instance:x.org").unwrap().as_deref(), Some("pw"));
+    }
+
+    #[test]
+    fn failed_validation_touches_no_secret() {
+        let store = MemoryStore::new();
+        let y = "instances:\n  - url: https://a.org\n    token: tk\n  - url: https://b.org\n    username: u\n";
+        assert!(apply_import(None, &parse_import(y).unwrap(), &store).is_err());
+        assert_eq!(store.get("instance:a.org").unwrap(), None);
     }
 
     #[test]
@@ -415,13 +556,67 @@ instances:
     }
 
     #[test]
-    fn reimport_without_auth_deletes_secret() {
+    fn reimport_without_credentials_keeps_secret() {
         let store = MemoryStore::new();
         let s1 = apply_import(None, &parse_import(EXAMPLE).unwrap(), &store).unwrap();
         let y = one("https://ntfy.example.org", &["a"]);
         let s2 = apply_import(Some(s1), &parse_import(&y).unwrap(), &store).unwrap();
+        assert_eq!(s2.instances[0].auth, AuthKind::Token);
+        assert_eq!(
+            store.get("instance:ntfy.example.org").unwrap().as_deref(),
+            Some("tk_xxxxxxxx")
+        );
+    }
+
+    #[test]
+    fn explicit_auth_none_removes_secret() {
+        let store = MemoryStore::new();
+        let s1 = apply_import(None, &parse_import(EXAMPLE).unwrap(), &store).unwrap();
+        let y = "instances:\n  - url: https://ntfy.example.org\n    auth: none\n    topics: [a]\n";
+        let f = parse_import(y).unwrap();
+        assert!(sanitized_yaml(&f).contains("auth: none"));
+        let s2 = apply_import(Some(s1), &f, &store).unwrap();
         assert_eq!(s2.instances[0].auth, AuthKind::None);
         assert_eq!(store.get("instance:ntfy.example.org").unwrap(), None);
+    }
+
+    #[test]
+    fn auth_none_excludes_credentials() {
+        let y = "instances:\n  - url: https://x.org\n    auth: none\n    token: tk\n";
+        assert!(parse_import(y).is_err());
+        let y = "instances:\n  - url: https://x.org\n    auth: basic\n";
+        assert!(parse_import(y).is_err());
+    }
+
+    #[test]
+    fn normalize_url_case_and_default_port() {
+        let url = |raw: &str| normalize_url(raw).unwrap();
+        assert_eq!(
+            url(" https://NTFY.Example.org:443/ "),
+            "https://ntfy.example.org"
+        );
+        assert_eq!(url("http://h.org:80"), "http://h.org");
+        assert_eq!(url("https://h.org:8443/sub/"), "https://h.org:8443/sub");
+        let y = "instances:\n  - url: https://X.org\n  - url: https://x.org:443\n";
+        assert!(parse_import(y).is_err(), "same instance twice");
+
+        // Settings saved with an unnormalized URL still match on re-import.
+        let store = MemoryStore::new();
+        let mut s = apply_import(
+            None,
+            &parse_import(&one("https://x.org", &["a"])).unwrap(),
+            &store,
+        )
+        .unwrap();
+        s.instances[0].url = "https://X.ORG:443/".into();
+        let s2 = apply_import(
+            Some(s),
+            &parse_import(&one("https://x.org/", &["b"])).unwrap(),
+            &store,
+        )
+        .unwrap();
+        assert_eq!(s2.instances.len(), 1);
+        assert_eq!(s2.instances[0].url, "https://x.org");
     }
 
     #[test]
@@ -467,6 +662,43 @@ instances:
         let out = fs::read_to_string(dir.path().join("config.imported.yaml")).unwrap();
         assert!(!out.contains("tk_") && !out.contains("password:"), "{out}");
         assert!(settings_path.exists());
+    }
+
+    #[test]
+    fn reimport_of_sanitized_file_keeps_file_and_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        let settings_path = dir.path().join("settings.json");
+        let store = MemoryStore::new();
+        let y = EXAMPLE.to_string() + "  - url: https://b.org\n    username: u\n    password: pw\n";
+        fs::write(&cfg, y).unwrap();
+        let s1 = import_file(&cfg, None, &store, &settings_path).unwrap();
+
+        let imported = dir.path().join("config.imported.yaml");
+        let text = fs::read_to_string(&imported).unwrap();
+        assert!(text.starts_with("# ntfy-native"), "{text}");
+        assert!(
+            text.contains("Schlüsselbund") && text.contains("--import"),
+            "{text}"
+        );
+        fs::write(&imported, text.replace("- backups", "- backups2")).unwrap();
+
+        let s2 = import_file(&imported, Some(s1), &store, &settings_path).unwrap();
+        assert!(imported.exists());
+        assert!(fs::read_to_string(&imported).unwrap().contains("backups2"));
+        assert_eq!(s2.instances[0].topics[0].name, "backups2");
+        assert_eq!(s2.instances[0].auth, AuthKind::Token);
+        assert_eq!(
+            store.get("instance:ntfy.example.org").unwrap().as_deref(),
+            Some("tk_xxxxxxxx")
+        );
+        assert_eq!(
+            s2.instances[1].auth,
+            AuthKind::Basic {
+                username: "u".into()
+            }
+        );
+        assert_eq!(store.get("instance:b.org").unwrap().as_deref(), Some("pw"));
     }
 
     #[test]

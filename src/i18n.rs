@@ -10,6 +10,7 @@ pub struct Strings {
     pub tray_paused: &'static str,
     pub tray_not_configured: &'static str,
     pub menu_quit: &'static str,
+    pub import_while_running: &'static str,
 }
 
 pub static DE: Strings = Strings {
@@ -24,6 +25,7 @@ pub static DE: Strings = Strings {
     tray_paused: "Pausiert",
     tray_not_configured: "Nicht eingerichtet – {path} anlegen",
     menu_quit: "Beenden",
+    import_while_running: "ntfy-native läuft bereits – bitte beenden und --import {path} erneut ausführen",
 };
 
 pub static EN: Strings = Strings {
@@ -38,6 +40,7 @@ pub static EN: Strings = Strings {
     tray_paused: "Paused",
     tray_not_configured: "Not set up – create {path}",
     menu_quit: "Quit",
+    import_while_running: "ntfy-native is already running – quit it and run --import {path} again",
 };
 
 pub fn strings_for(locale: &str) -> &'static Strings {

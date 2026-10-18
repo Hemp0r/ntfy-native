@@ -15,7 +15,7 @@ use tray_icon::menu::MenuEvent;
 use crate::actions::SystemOpener;
 use crate::cli::Cli;
 use crate::engine::{Command, EngineDeps, EngineHandle, spawn_engine_thread};
-use crate::i18n::strings;
+use crate::i18n::{Strings, fill, strings};
 use crate::import::import_file;
 use crate::instance_lock;
 use crate::logging;
@@ -54,8 +54,7 @@ pub fn run(cli: Cli) -> anyhow::Result<()> {
 
 fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
     let Some(_lock) = instance_lock::acquire(&paths.lock_file())? else {
-        tracing::info!("another instance is already running, exiting");
-        return Ok(());
+        return already_running(cli, strings());
     };
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "starting");
 
@@ -159,6 +158,24 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
     });
     tracing::info!("stopped");
     Ok(())
+}
+
+/// A second start exits quietly; a second start with `--import` fails (stderr,
+/// log, exit code), because the running instance would ignore the import.
+fn already_running(cli: &Cli, strings: &Strings) -> anyhow::Result<()> {
+    match &cli.import {
+        None => {
+            tracing::info!("another instance is already running, exiting");
+            Ok(())
+        }
+        Some(path) => {
+            let path = path.display().to_string();
+            Err(anyhow::anyhow!(fill(
+                strings.import_while_running,
+                &[("path", &path)]
+            )))
+        }
+    }
 }
 
 /// Asks the engine to quit (a no-op if it already has) and waits a bounded
@@ -302,6 +319,23 @@ mod tests {
             .iter()
             .flat_map(|i| i.topics.iter().map(|t| t.name.clone()))
             .collect()
+    }
+
+    #[test]
+    fn second_start_exits_quietly_unless_importing() {
+        use crate::i18n::{DE, EN};
+        assert!(already_running(&Cli::default(), &EN).is_ok());
+        let cli = Cli {
+            import: Some(PathBuf::from("/x/new.yaml")),
+            ..Cli::default()
+        };
+        let err = already_running(&cli, &EN).unwrap_err().to_string();
+        assert!(
+            err.contains("already running") && err.contains("--import /x/new.yaml"),
+            "{err}"
+        );
+        let err = already_running(&cli, &DE).unwrap_err().to_string();
+        assert!(err.contains("läuft bereits"), "{err}");
     }
 
     #[test]
