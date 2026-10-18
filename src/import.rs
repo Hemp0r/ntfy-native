@@ -193,14 +193,15 @@ fn convert_instance(raw: RawInstance) -> Result<ImportInstance> {
     })
 }
 
-/// serde_yaml_ng prefixes errors with a 0-based path like `instances[1]: `;
-/// users count instances from 1.
+/// Makes a serde_yaml_ng error fit for users and notifications: counts
+/// instances from 1 (serde prints a 0-based path like `instances[1]: `) and
+/// drops quoted values, which may be secrets pasted into the wrong field.
 fn humanize_yaml_error(msg: &str) -> String {
     let index = msg
         .strip_prefix("instances[")
         .and_then(|rest| rest.split_once(']'))
         .and_then(|(n, rest)| Some((n.parse::<usize>().ok()?, rest)));
-    match index {
+    let msg = match index {
         Some((n, rest)) => {
             let rest = rest.strip_prefix('.').unwrap_or(rest);
             format!(
@@ -210,7 +211,56 @@ fn humanize_yaml_error(msg: &str) -> String {
             )
         }
         None => msg.to_owned(),
+    };
+    redact_values(&msg)
+}
+
+/// Removes `` `value` `` and `"value"` from a serde message, except key
+/// names after "field " (missing/unknown/duplicate field) and everything
+/// from the first unquoted "expected" on, which describes the schema.
+fn redact_values(msg: &str) -> String {
+    let mut out = String::with_capacity(msg.len());
+    let mut rest = msg;
+    loop {
+        let quote = rest.find(['`', '"']);
+        let schema = rest.find("expected");
+        let start = match (quote, schema) {
+            (Some(q), Some(e)) if q < e => q,
+            (Some(q), None) => q,
+            _ => {
+                out.push_str(rest);
+                return out;
+            }
+        };
+        out.push_str(&rest[..start]);
+        let delim = rest.as_bytes()[start];
+        let after = &rest[start + 1..];
+        let Some(len) = closing_quote(after, delim) else {
+            // Unterminated: drop the rest.
+            return out.trim_end().to_owned();
+        };
+        if delim == b'`' && out.ends_with("field ") {
+            out.push_str(&rest[start..start + len + 2]);
+        } else {
+            out.truncate(out.trim_end().len());
+        }
+        rest = &after[len + 1..];
     }
+}
+
+/// Byte length of the quoted text before the closing `delim`; `"` strings
+/// are Rust-debug-escaped.
+fn closing_quote(s: &str, delim: u8) -> Option<usize> {
+    let mut escaped = false;
+    for (i, b) in s.bytes().enumerate() {
+        match b {
+            _ if escaped => escaped = false,
+            b'\\' if delim == b'"' => escaped = true,
+            _ if b == delim => return Some(i),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Errors are self-contained in their outermost message (shown in a
@@ -863,10 +913,59 @@ instances:
             "instances:\n  - url: https://a.org\n    token: tk_s3cret\n    topics: [a\n",
             // A secret of the wrong type.
             "instances:\n  - url: https://a.org\n    username: u\n    password: [tk_s3cret]\n",
+            // A secret pasted into the wrong field: serde quotes the value.
+            "instances:\n  - url: https://a.org\n    auth: tk_s3cret\n",
+            "instances:\n  - url: https://a.org\n    auth: Bearer tk_s3cret\n",
+            "instances:\n  - url: https://a.org\n    topics: tk_s3cret\n",
+            "urgent_breaks_dnd: tk_s3cret\n",
+            "urgent_breaks_dnd: 4711s3cret0815\n",
+            "instances: tk_s3cret\n",
+            "instances:\n  - tk_s3cret\n",
+            "instances:\n  - url: https://a.org\n    topics:\n      - name: a\n        urgent_breaks_dnd: tk_s3cret\n",
         ];
         for y in cases {
             let err = format!("{:#}", parse_import(y).unwrap_err());
             assert!(!err.contains("s3cret"), "{y}\n=> {err}");
+        }
+    }
+
+    #[test]
+    fn yaml_errors_drop_quoted_values_but_keep_keys() {
+        let cases = [
+            (
+                "instances[0].auth: unknown variant `tk_x`, expected `none` at line 3 column 11",
+                "instance 1: auth: unknown variant, expected `none` at line 3 column 11",
+            ),
+            (
+                "instances[0].topics: invalid type: string \"tk \\\"x\\\" y\", expected a sequence",
+                "instance 1: topics: invalid type: string, expected a sequence",
+            ),
+            (
+                "urgent_breaks_dnd: invalid value: integer `4711`, expected a boolean",
+                "urgent_breaks_dnd: invalid value: integer, expected a boolean",
+            ),
+            (
+                "instances[1]: unknown field `topcs`, expected one of `url`, `topics`",
+                "instance 2: unknown field `topcs`, expected one of `url`, `topics`",
+            ),
+            (
+                "instances[0]: missing field `url` at line 2 column 5",
+                "instance 1: missing field `url` at line 2 column 5",
+            ),
+            (
+                "duplicate field `url` at line 3",
+                "duplicate field `url` at line 3",
+            ),
+            // "expected" inside a value does not end the redaction.
+            (
+                "unknown variant `expected tk_x`, expected `none`",
+                "unknown variant, expected `none`",
+            ),
+            // An unterminated quote drops the rest.
+            ("invalid type: string \"tk_x", "invalid type: string"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(humanize_yaml_error(raw), want, "{raw}");
         }
     }
 
