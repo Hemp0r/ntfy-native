@@ -121,11 +121,15 @@ Die Demo legt ihr Bild dann in diesem Ordner ab. Fehlen Bild und App-Logo im akt
 
 ## Release
 
-Ein Release entsteht automatisch über `.github/workflows/release.yml`:
+Releases entstehen vollautomatisch beim Merge auf `main`:
 
-1. Version in `Cargo.toml` anheben und committen.
-2. `git tag vX.Y.Z && git push --tags` (das Tag muss exakt der Version entsprechen, sonst bricht der Lauf ab). Vorabversionen wie `v0.2.0-rc1` werden als Pre-Release veröffentlicht.
-3. Der Workflow prüft (fmt, clippy, Tests auf macOS und Windows), baut eine universelle macOS-DMG (Apple Silicon + Intel) sowie Windows-ZIPs (x64, ARM64) und legt alles samt `SHA256SUMS.txt` im GitHub-Release ab. Ein bestehendes Tag lässt sich über „Run workflow“ (Eingabe `tag`) erneut veröffentlichen.
+1. `.github/workflows/version.yml` bestimmt die nächste Version (Logik in `scripts/next-version.sh`, getestet über `scripts/test-next-version.sh` in der CI):
+   - Gibt es noch kein Tag `vX.Y.Z`, wird die Version aus `Cargo.toml` unverändert veröffentlicht (erstes Release: `0.1.0`, ohne zusätzlichen Commit).
+   - Ist die Version in `Cargo.toml` höher als das neueste Tag (numerischer Semver-Vergleich), wird sie unverändert veröffentlicht. Für ein neues MAJOR/MINOR setzt man sie daher im PR in `Cargo.toml`: `0.2.0` ergibt exakt das Release `0.2.0`.
+   - Andernfalls wird der Patch des neuesten Tags um 1 erhöht (neuestes Tag `v0.1.5` ergibt `0.1.6`). Der Workflow schreibt die Version in `Cargo.toml` und `Cargo.lock` und committet als `chore(release): vX.Y.Z`.
+   - Tags, die nicht exakt `vMAJOR.MINOR.PATCH` entsprechen (z. B. `v1.0.0-rc1`), werden ignoriert. Pre-Releases gibt es nicht.
+2. Der Workflow setzt das annotierte Tag `vX.Y.Z` und pusht Commit und Tag gemeinsam (ohne Force-Push). Existiert das Tag bereits oder ist `main` zwischenzeitlich weitergelaufen, bricht der Lauf ab; der nächste Merge holt das nach.
+3. Anschließend ruft er `.github/workflows/release.yml` auf: Prüfung (fmt, clippy, Tests auf macOS und Windows), universelle macOS-DMG (Apple Silicon + Intel) sowie Windows-ZIPs (x64, ARM64), alles samt `SHA256SUMS.txt` im GitHub-Release. Ein bestehendes Tag lässt sich über „Run workflow“ auf dem Workflow „Release“ (Eingabe `tag`, z. B. `v0.1.0`) erneut veröffentlichen.
 
 Optionale Repository-Secrets (ohne sie wird die DMG ad-hoc signiert und der Lauf gibt Warnungen aus):
 
