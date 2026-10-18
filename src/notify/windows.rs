@@ -105,11 +105,16 @@ impl Notifier for WinNotifier {
 }
 
 /// Writes the app icon to `dir` (if missing or outdated) and registers it
-/// as `IconUri` next to `DisplayName`.
+/// as `IconUri` next to `DisplayName`. An outdated icon that cannot be
+/// replaced (e.g. locked by the shell) is still registered.
 pub fn register_icon(dir: &Path) -> Result<()> {
     let path = std::path::absolute(dir.join(ICON_FILE_NAME)).context("resolving the icon path")?;
-    super::write_if_changed(&path, ICON_PNG)
-        .with_context(|| format!("writing {}", path.display()))?;
+    if let Err(e) = super::write_if_changed(&path, ICON_PNG) {
+        if !path.is_file() {
+            return Err(e).with_context(|| format!("writing {}", path.display()));
+        }
+        tracing::warn!(error = %e, path = %path.display(), "updating the toast icon failed, keeping the old one");
+    }
     set_string(&aumid_key(), Some("IconUri"), &path.display().to_string())
 }
 

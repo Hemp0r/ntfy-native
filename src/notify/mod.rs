@@ -63,9 +63,11 @@ pub(crate) fn write_if_changed(path: &Path, bytes: &[u8]) -> io::Result<bool> {
     }
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)?;
-    Ok(true)
+    let written = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.map(|()| true)
 }
 
 /// Stable identifier for a notification category with the given button
@@ -116,6 +118,21 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["icon.png"], "no temporary file left behind");
+    }
+
+    #[test]
+    fn write_if_changed_cleans_up_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory in the way makes the final rename fail.
+        let path = dir.path().join("icon.png");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep"), "").unwrap();
+        assert!(write_if_changed(&path, b"one").is_err());
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["icon.png"], "temporary file removed");
     }
 
     #[test]
