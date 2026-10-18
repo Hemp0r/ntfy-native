@@ -1,0 +1,57 @@
+[package]
+name = "ntfy-native"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Lightweight tray app bridging ntfy servers to native OS notifications"
+
+[dependencies]
+anyhow = "1.0.104"
+directories = "6.0.0"
+futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
+httpdate = "1.0.3"
+humantime = "2.4.0"
+if-watch = { version = "3.2.2", features = ["tokio"] }
+keyring-core = "1.0.1"
+lexopt = "0.3.2"
+open = { version = "5.4.4", features = ["shellexecute-on-windows"] }
+rand = "0.10.3"
+reqwest = { version = "0.13.5", default-features = false, features = ["native-tls"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+serde_yaml_ng = "0.10.0"
+sys-locale = "0.3.2"
+tao = { version = "0.37.1", default-features = false }
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", default-features = false, features = ["rt", "macros", "time", "sync", "signal"] }
+tokio-util = { version = "0.7.20", default-features = false }
+tracing = "0.1.44"
+tracing-appender = "0.2.5"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "env-filter", "ansi"] }
+tray-icon = { version = "0.24.2", default-features = false }
+url = "2.5.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+[dev-dependencies]
+axum = "0.8.9"
+filetime = "0.2.29"
+quick-xml = "0.42.0"
+tempfile = "3.27.0"
+tokio = { version = "1.53.3", features = ["net", "rt", "macros", "time", "sync", "test-util"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", features = ["keychain"] }
+block2 = "0.6.2"
+objc2 = "0.6.5"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSDictionary", "NSError", "NSObject", "NSSet", "NSString", "NSURL"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNError", "UNNotification", "UNNotificationAction", "UNNotificationAttachment", "UNNotificationCategory", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationTrigger", "UNUserNotificationCenter"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62.2", features = ["Data_Xml_Dom", "UI_Notifications", "Win32_Foundation", "Win32_Security", "Win32_System_Com", "Win32_System_Registry", "Win32_System_WinRT", "Win32_UI_Notifications", "Win32_UI_Shell"] }
+windows-core = "0.62.2"
+windows-native-keyring-store = { version = "1.1.0", default-features = false }

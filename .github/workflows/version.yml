@@ -1,0 +1,107 @@
+name: Version
+
+# On every merge to main: pick the next version, tag it and call the release
+# workflow. Decision logic lives in scripts/next-version.sh (tested in CI).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  bump:
+    # Defensive: never version our own release commits (bot pushes).
+    if: ${{ github.actor != 'github-actions[bot]' && !startsWith(github.event.head_commit.message, 'chore(release):') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only the bump is serialized; release.yml is serialized per tag.
+    concurrency:
+      group: version-main
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Determine version, bump, tag and push
+        id: version
+        run: |
+          set -euo pipefail
+
+          # A re-run of this job on an already released commit would bump again.
+          released=$(git tag --list 'v*.*.*' --contains HEAD | tr '\n' ' ')
+          if [[ -n "$released" ]]; then
+            echo "::error::Commit already released as: $released. Use 'Re-run failed jobs' or Release -> Run workflow."
+            exit 1
+          fi
+
+          current=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+          read -r new action < <(git tag --list 'v*.*.*' | scripts/next-version.sh "$current")
+          tag="v$new"
+          echo "Cargo.toml version: $current -> release $new ($action)"
+
+          if git rev-parse --verify --quiet "refs/tags/$tag" > /dev/null; then
+            echo "::error::Tag $tag already exists"
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [[ "$action" == "bump" ]]; then
+            # Rewrite only the first `version = "..."` inside [package].
+            awk -v new="$new" '
+              /^\[/ { in_package = ($0 ~ /^\[package\][[:space:]]*$/) }
+              in_package && !done && /^version[[:space:]]*=/ {
+                sub(/"[^"]*"/, "\"" new "\"")
+                done = 1
+              }
+              { print }
+              END { if (!done) exit 1 }
+            ' Cargo.toml > Cargo.toml.new
+            mv Cargo.toml.new Cargo.toml
+            cargo update --workspace
+
+            changed=$(git diff --name-only | sort | tr '\n' ' ')
+            git diff --stat
+            if [[ "$changed" != "Cargo.lock Cargo.toml " ]]; then
+              echo "::error::Unexpected changed files: $changed"
+              exit 1
+            fi
+            # Cargo.toml: exactly the version line. Cargo.lock: exactly one
+            # line, inside the ntfy-native package entry.
+            if [[ "$(git diff --numstat Cargo.toml | cut -f1,2)" != $'1\t1' ]]; then
+              echo "::error::Cargo.toml changed beyond the version line"
+              git diff Cargo.toml
+              exit 1
+            fi
+            if [[ "$(git diff --numstat Cargo.lock | cut -f1,2)" != $'1\t1' ]] ||
+              ! git diff -U1 Cargo.lock | grep -qx ' name = "ntfy-native"'; then
+              echo "::error::Cargo.lock changed beyond the ntfy-native entry"
+              git diff Cargo.lock
+              exit 1
+            fi
+
+            git add Cargo.toml Cargo.lock
+            git commit -m "chore(release): $tag"
+          fi
+
+          git tag -a "$tag" -m "Release $tag"
+          # No force: if main moved meanwhile this fails and the next run catches up.
+          git push --atomic origin HEAD:main "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+  release:
+    needs: bump
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.bump.outputs.tag }}
+    secrets: inherit
