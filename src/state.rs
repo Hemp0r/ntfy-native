@@ -27,6 +27,7 @@ pub struct InstanceState {
 pub struct SeenMessage {
     pub id: String,
     pub time: i64,
+    pub expires: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

@@ -1,7 +1,7 @@
 use crate::ntfy::model::Message;
 use crate::state::{InstanceState, SEEN_RING, SeenMessage};
 
-pub const DEDUP_MARGIN_SECS: i64 = 10;
+pub const DEDUP_MARGIN_SECS: i64 = 30;
 
 /// Server-time `since` for the catch-up poll; `None` without history.
 pub fn catch_up_since(st: &InstanceState) -> Option<i64> {
@@ -11,22 +11,18 @@ pub fn catch_up_since(st: &InstanceState) -> Option<i64> {
         (Some(t), None) | (None, Some(t)) => t,
         (None, None) => return None,
     };
-    Some(oldest - DEDUP_MARGIN_SECS)
+    Some(oldest.saturating_sub(DEDUP_MARGIN_SECS))
 }
 
 pub fn stream_since(server_now: i64) -> i64 {
-    server_now - DEDUP_MARGIN_SECS
+    server_now.saturating_sub(DEDUP_MARGIN_SECS)
 }
 
 impl InstanceState {
-    /// Returns true if the message is new and should be delivered.
+    /// Returns true if the message id has not been seen and should be delivered.
+    /// Deduplication is by id only, so a server clock jump cannot drop messages.
     pub fn accept(&mut self, msg: &Message) -> bool {
         if self.seen_ids.contains(&msg.id) {
-            return false;
-        }
-        if let Some(w) = self.watermark
-            && msg.time < w - DEDUP_MARGIN_SECS
-        {
             return false;
         }
         self.seen_ids.push_back(msg.id.clone());
@@ -42,23 +38,44 @@ impl InstanceState {
             self.last_message = Some(SeenMessage {
                 id: msg.id.clone(),
                 time: msg.time,
+                expires: msg.expires,
             });
         }
         true
     }
 
+    /// Raises the watermark. A time more than the margin behind the watermark
+    /// means the server clock went backwards: follow it and cap `last_message`.
     pub fn observe_time(&mut self, server_time: i64) {
-        self.watermark = Some(self.watermark.map_or(server_time, |w| w.max(server_time)));
+        match self.watermark {
+            Some(w) if server_time < w.saturating_sub(DEDUP_MARGIN_SECS) => {
+                self.watermark = Some(server_time);
+                if let Some(l) = self.last_message.as_mut() {
+                    l.time = l.time.min(server_time);
+                }
+            }
+            Some(w) => self.watermark = Some(w.max(server_time)),
+            None => self.watermark = Some(server_time),
+        }
+    }
+
+    /// Call after `detect_gap` returned true and before accepting the polled
+    /// messages, so the "possibly missed" hint fires only once.
+    pub fn rebaseline_after_gap(&mut self, server_now: i64) {
+        self.watermark = Some(self.watermark.map_or(server_now, |w| w.max(server_now)));
+        self.last_message = None;
     }
 }
 
 /// Detects possibly missed messages. Call with the state from before `accept`
 /// was applied to the poll results. A gap exists if either
-/// (a) we were offline longer than the server caches (`server_now - watermark
-/// > cache_duration`), or
-/// (b) our last known message is still within the cache window but the poll
-/// no longer returns it, which means the server lost its cache (e.g. restart
-/// without `cache-file`). Only server times are compared.
+/// (a) we were offline longer than the server caches
+/// (`server_now - watermark > cache_duration`), or
+/// (b) the last known message carries an `expires` still in the future (so the
+/// server cache must still hold it) but the poll does not return it, i.e. the
+/// server lost its cache (restart without `cache-file`). Messages without
+/// `expires` (`Cache: no`) are never sentinels. Only server times are compared.
+/// Without a recent message in the server cache a lost cache is undetectable.
 pub fn detect_gap(
     st: &InstanceState,
     polled: &[Message],
@@ -67,12 +84,12 @@ pub fn detect_gap(
 ) -> bool {
     if st
         .watermark
-        .is_some_and(|w| server_now - w > cache_duration)
+        .is_some_and(|w| server_now.saturating_sub(w) > cache_duration)
     {
         return true;
     }
     st.last_message.as_ref().is_some_and(|l| {
-        server_now - l.time < cache_duration && !polled.iter().any(|m| m.id == l.id)
+        l.expires.is_some_and(|e| server_now < e) && !polled.iter().any(|m| m.id == l.id)
     })
 }
 
@@ -93,6 +110,7 @@ mod tests {
             icon: None,
             actions: vec![],
             attachment: None,
+            expires: None,
         }
     }
 
@@ -102,6 +120,7 @@ mod tests {
             last_message: last.map(|(id, time)| SeenMessage {
                 id: id.into(),
                 time,
+                expires: Some(time + 43_200),
             }),
             seen_ids: Default::default(),
         }
@@ -114,14 +133,14 @@ mod tests {
 
     #[test]
     fn since_uses_min_minus_margin() {
-        assert_eq!(catch_up_since(&st(Some(1000), Some(("a", 900)))), Some(890));
-        assert_eq!(catch_up_since(&st(Some(1000), None)), Some(990));
-        assert_eq!(catch_up_since(&st(None, Some(("a", 900)))), Some(890));
+        assert_eq!(catch_up_since(&st(Some(1000), Some(("a", 900)))), Some(870));
+        assert_eq!(catch_up_since(&st(Some(1000), None)), Some(970));
+        assert_eq!(catch_up_since(&st(None, Some(("a", 900)))), Some(870));
     }
 
     #[test]
     fn stream_since_subtracts_margin() {
-        assert_eq!(stream_since(1000), 990);
+        assert_eq!(stream_since(1000), 970);
     }
 
     #[test]
@@ -133,11 +152,10 @@ mod tests {
     }
 
     #[test]
-    fn old_message_rejected_recent_unseen_accepted() {
+    fn old_unseen_message_accepted() {
         let mut s = st(Some(1000), None);
-        assert!(!s.accept(&msg("old", 900)));
-        assert!(s.accept(&msg("new", 995)));
-        assert!(!s.seen_ids.contains(&"old".to_string()));
+        assert!(s.accept(&msg("old", 900)));
+        assert!(s.seen_ids.contains(&"old".to_string()));
     }
 
     #[test]
@@ -152,11 +170,20 @@ mod tests {
     }
 
     #[test]
-    fn watermark_monotonic() {
+    fn watermark_monotonic_within_margin() {
         let mut s = InstanceState::default();
         s.observe_time(100);
-        s.observe_time(50);
+        s.observe_time(80);
         assert_eq!(s.watermark, Some(100));
+    }
+
+    #[test]
+    fn watermark_follows_clock_regression() {
+        let mut s = st(None, Some(("a", 1000)));
+        s.observe_time(1000);
+        s.observe_time(100);
+        assert_eq!(s.watermark, Some(100));
+        assert_eq!(s.last_message.as_ref().unwrap().time, 100);
     }
 
     #[test]
@@ -186,6 +213,16 @@ mod tests {
     }
 
     #[test]
+    fn no_gap_at_exact_cache_duration() {
+        assert!(!detect_gap(
+            &st(Some(1000), None),
+            &[],
+            1000 + 43_200,
+            43_200
+        ));
+    }
+
+    #[test]
     fn no_gap_when_last_message_in_poll() {
         let now = 1_000_000;
         let s = st(Some(now - 60), Some(("a", now - 100)));
@@ -193,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn gap_when_recent_last_message_missing() {
+    fn gap_when_unexpired_last_message_missing() {
         let now = 1_000_000;
         let s = st(Some(now - 60), Some(("a", now - 100)));
         assert!(detect_gap(&s, &[], now, 43_200));
@@ -204,5 +241,38 @@ mod tests {
         let now = 1_000_000;
         let s = st(Some(now - 60), Some(("a", now - 100_000)));
         assert!(!detect_gap(&s, &[], now, 43_200));
+    }
+
+    #[test]
+    fn no_gap_when_last_message_has_no_expires() {
+        let now = 1_000_000;
+        let mut s = st(Some(now - 60), Some(("a", now - 100)));
+        s.last_message.as_mut().unwrap().expires = None;
+        assert!(!detect_gap(&s, &[], now, 43_200));
+    }
+
+    #[test]
+    fn gap_fires_once_after_rebaseline() {
+        let now = 1_000_000;
+        let mut s = st(Some(now - 60), Some(("a", now - 100)));
+        assert!(detect_gap(&s, &[], now, 43_200));
+        s.rebaseline_after_gap(now);
+        assert_eq!(s.watermark, Some(now));
+        assert!(s.last_message.is_none());
+        assert!(!detect_gap(&s, &[], now, 43_200));
+    }
+
+    #[test]
+    fn poll_then_overlapping_stream_replay_accepts_each_once() {
+        let mut s = InstanceState::default();
+        let polled = [msg("a", 100), msg("b", 101), msg("c", 102)];
+        assert!(polled.iter().all(|m| s.accept(m)));
+        let replay = [msg("b", 101), msg("c", 102), msg("d", 103)];
+        let accepted: Vec<_> = replay
+            .iter()
+            .filter(|m| s.accept(m))
+            .map(|m| &m.id)
+            .collect();
+        assert_eq!(accepted, ["d"]);
     }
 }

@@ -123,6 +123,7 @@ mod tests {
             icon: None,
             actions: vec![],
             attachment: None,
+            expires: None,
         }
     }
 

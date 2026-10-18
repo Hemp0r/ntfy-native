@@ -28,6 +28,8 @@ pub struct Message {
     pub icon: Option<String>,
     pub actions: Vec<Action>,
     pub attachment: Option<Attachment>,
+    /// Server time at which the cache drops this message; `None` if unset or not a number.
+    pub expires: Option<i64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -105,6 +107,7 @@ pub fn parse_event(line: &str) -> Result<Event, serde_json::Error> {
                     .map(|a| a.iter().filter_map(action).collect())
                     .unwrap_or_default(),
                 attachment: obj.get("attachment").and_then(attachment),
+                expires: obj.get("expires").and_then(Value::as_i64),
             }))
         }
         _ => Ok(Event::Other { event, time }),
@@ -210,7 +213,15 @@ mod tests {
                 body: None
             }
         );
+        assert_eq!(m.expires, Some(1700043200));
         assert!(m.attachment.unwrap().is_image());
+    }
+
+    #[test]
+    fn non_numeric_expires_is_none() {
+        let l = format!(r#"{{{BASE},"expires":"soon"}}"#);
+        assert_eq!(msg(&l).expires, None);
+        assert_eq!(msg(&format!(r#"{{{BASE}}}"#)).expires, None);
     }
 
     #[test]
