@@ -9,7 +9,7 @@ use ntfy_native::connection::ConnectionConfig;
 use ntfy_native::engine::{Command, EngineDeps, EngineHandle, spawn_engine_thread};
 use ntfy_native::i18n::EN;
 use ntfy_native::instance_edit::{AuthDraft, InstanceDraft};
-use ntfy_native::ipc::{CoreMsg, UiRequest};
+use ntfy_native::ipc::{CoreMsg, TestOutcome, TopicAccess, UiRequest};
 use ntfy_native::notification::{ActivationPayload, Level, Notification, RecordingNotifier};
 use ntfy_native::paths::AppPaths;
 use ntfy_native::secrets::{MemoryStore, SecretStore, account_for};
@@ -86,6 +86,7 @@ fn load<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Option<T> {
 }
 
 type SaveResults = Arc<Mutex<Vec<(u64, Result<String, String>)>>>;
+type TestResults = Arc<Mutex<Vec<(u64, TestOutcome)>>>;
 
 /// An engine on its own thread (as in production) with recording fakes.
 struct TestEngine {
@@ -96,6 +97,7 @@ struct TestEngine {
     trays: Arc<Mutex<Vec<TrayState>>>,
     snapshots: Arc<Mutex<Vec<UiSnapshot>>>,
     save_results: SaveResults,
+    test_results: TestResults,
     exited: Arc<AtomicBool>,
     paths: AppPaths,
 }
@@ -116,6 +118,7 @@ impl TestEngine {
         let trays = Arc::new(Mutex::new(Vec::new()));
         let snapshots = Arc::new(Mutex::new(Vec::new()));
         let save_results = SaveResults::default();
+        let test_results = TestResults::default();
         let exited = Arc::new(AtomicBool::new(false));
         let deps = EngineDeps {
             paths: paths.clone(),
@@ -136,7 +139,12 @@ impl TestEngine {
             on_ui: {
                 let snapshots = snapshots.clone();
                 let save_results = save_results.clone();
+                let test_results = test_results.clone();
                 Box::new(move |m| match m {
+                    CoreMsg::TestResult {
+                        request_id,
+                        outcome,
+                    } => test_results.lock().unwrap().push((request_id, outcome)),
                     CoreMsg::Snapshot(s) => snapshots.lock().unwrap().push(s),
                     CoreMsg::SaveResult { request_id, result } => {
                         save_results.lock().unwrap().push((request_id, result))
@@ -156,6 +164,7 @@ impl TestEngine {
             trays,
             snapshots,
             save_results,
+            test_results,
             exited,
             paths: paths.clone(),
         }
@@ -1156,4 +1165,99 @@ async fn url_change_clears_gap_flags_of_the_instance() {
             e.last_snapshot().is_some_and(|s| s.gaps.is_empty())
         })
         .await;
+}
+
+const HEALTHY: &str = r#"{"healthy":true}"#;
+
+fn test_outcome(e: &TestEngine, request_id: u64) -> Option<TestOutcome> {
+    let results = e.test_results.lock().unwrap();
+    results
+        .iter()
+        .find(|(id, _)| *id == request_id)
+        .map(|(_, o)| o.clone())
+}
+
+#[tokio::test]
+async fn engine_answers_test_request_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    // Every request hangs: the test sits in its 10 s timeout.
+    let hanging = FakeServer::start(|_| Reply::stall()).await;
+    let engine = TestEngine::start(&paths, Settings::default(), State::default());
+    engine.send(ui(UiRequest::TestConnection {
+        request_id: 7,
+        draft: draft(None, &hanging.url(), &["alerts"]),
+    }));
+    hanging.wait_requests(1).await;
+
+    engine.send(ui(UiRequest::PauseAll {
+        until: Some(i64::MAX),
+    }));
+    engine
+        .wait_for("pause applied while the test hangs", |e| {
+            e.last_snapshot().is_some_and(|s| s.paused_until.is_some())
+        })
+        .await;
+    assert_eq!(test_outcome(&engine, 7), None, "test still running");
+    // Still responsive: another request is answered meanwhile.
+    assert_eq!(
+        engine
+            .save(8, draft(None, &hanging.url(), &["alerts"]))
+            .await,
+        Ok("127.0.0.1".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn engine_reports_test_result_with_stored_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let server = FakeServer::start(|req| {
+        if req.path == "/v1/health" {
+            return Reply::bytes(HEALTHY);
+        }
+        match req.header("authorization") {
+            Some("Bearer stored") => Reply::lines::<&str>(&[]),
+            _ => Reply::status(401),
+        }
+    })
+    .await;
+    let secrets = Arc::new(MemoryStore::new());
+    secrets.set(&account_for(INSTANCE), "stored").unwrap();
+    let engine = TestEngine::start_with(
+        &paths,
+        token_instance_settings(&server.url()),
+        State::default(),
+        secrets,
+    );
+    let mut keep = draft(Some(INSTANCE), &server.url(), &["alerts"]);
+    keep.auth = AuthDraft::Token { token: None };
+    engine.send(ui(UiRequest::TestConnection {
+        request_id: 1,
+        draft: keep.clone(),
+    }));
+    engine
+        .wait_for("test result", |e| test_outcome(e, 1).is_some())
+        .await;
+    assert_eq!(
+        test_outcome(&engine, 1),
+        Some(TestOutcome::Ok {
+            topics: vec![TopicAccess {
+                name: "alerts".into(),
+                readable: true
+            }]
+        })
+    );
+
+    keep.auth = AuthDraft::Token {
+        token: Some("wrong".into()),
+    };
+    engine.send(ui(UiRequest::TestConnection {
+        request_id: 2,
+        draft: keep,
+    }));
+    engine
+        .wait_for("second result", |e| test_outcome(e, 2).is_some())
+        .await;
+    assert_eq!(test_outcome(&engine, 2), Some(TestOutcome::AuthFailed));
 }

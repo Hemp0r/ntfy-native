@@ -14,10 +14,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::actions::{self, UrlOpener};
 use crate::connection::{ConnControl, ConnEvent, ConnStatus, ConnectionConfig, spawn_connection};
+use crate::conntest::test_connection;
 use crate::dispatcher::Dispatcher;
 use crate::i18n::{Strings, fill};
 use crate::instance_edit::{AuthDraft, InstanceDraft, apply_draft, remove_instance};
-use crate::ipc::{CoreMsg, UiRequest};
+use crate::ipc::{CoreMsg, TestOutcome, UiRequest};
 use crate::media::MediaFetcher;
 use crate::notification::{ActivationPayload, Level, MediaRef, Notification, Notifier};
 use crate::ntfy::client::http_client;
@@ -137,6 +138,7 @@ pub async fn run_engine(
     let media = Arc::new(MediaFetcher::new(http.clone(), paths.media_dir()));
 
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+    let (test_tx, test_results) = mpsc::unbounded_channel();
     let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
     let stop_media = CancellationToken::new();
     let mut worker = tokio::spawn(delivery_worker(
@@ -170,6 +172,8 @@ pub async fn run_engine(
         tune,
         events_tx: ev_tx,
         events: ev_rx,
+        test_tx,
+        test_results,
     };
     engine.start_connections();
 
@@ -201,6 +205,9 @@ pub async fn run_engine(
         tokio::select! {
             biased;
             Some((id, ev)) = engine.events.recv() => engine.on_conn_event(&id, ev),
+            Some((request_id, outcome)) = engine.test_results.recv() => {
+                (engine.on_ui)(CoreMsg::TestResult { request_id, outcome });
+            }
             cmd = rx.recv() => {
                 if engine.on_command(cmd).is_break() {
                     break;
@@ -343,6 +350,9 @@ struct Engine {
     tune: fn(&mut ConnectionConfig),
     events_tx: mpsc::UnboundedSender<(String, ConnEvent)>,
     events: mpsc::UnboundedReceiver<(String, ConnEvent)>,
+    /// Outcomes of connection tests running in their own tasks.
+    test_tx: mpsc::UnboundedSender<(u64, TestOutcome)>,
+    test_results: mpsc::UnboundedReceiver<(u64, TestOutcome)>,
 }
 
 impl Engine {
@@ -636,7 +646,37 @@ impl Engine {
                 (self.on_ui)(CoreMsg::SaveResult { request_id, result });
             }
             UiRequest::RemoveInstance { instance_id } => self.remove_instance(&instance_id),
+            UiRequest::TestConnection { request_id, draft } => {
+                self.spawn_connection_test(request_id, draft);
+            }
             other => tracing::debug!(request = ?other, "UI request not handled by the engine"),
+        }
+    }
+
+    /// Runs off the event loop: a hanging server must not delay anything.
+    fn spawn_connection_test(&self, request_id: u64, draft: InstanceDraft) {
+        let stored = self.stored_auth_for_test(&draft);
+        let http = self.http.clone();
+        let results = self.test_tx.clone();
+        tokio::spawn(async move {
+            let outcome = test_connection(&http, &draft, stored).await;
+            let _ = results.send((request_id, outcome));
+        });
+    }
+
+    /// The saved credential of the edited instance, for drafts that keep it.
+    fn stored_auth_for_test(&self, draft: &InstanceDraft) -> Option<Auth> {
+        let keeps_secret = matches!(
+            draft.auth,
+            AuthDraft::Token { token: None } | AuthDraft::Basic { password: None, .. }
+        );
+        let inst = self.dispatcher.settings.instance(draft.id.as_deref()?);
+        match resolve_auth(self.secrets.as_ref(), inst.filter(|_| keeps_secret)?) {
+            Ok(auth) => auth,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "stored credential unavailable for connection test");
+                None
+            }
         }
     }
 
@@ -1094,6 +1134,7 @@ mod tests {
             CancellationToken::new(),
         ));
         let (events_tx, events) = mpsc::unbounded_channel();
+        let (test_tx, test_results) = mpsc::unbounded_channel();
         let mut engine = Engine {
             paths: AppPaths::under(dir.path()),
             http: http_client(),
@@ -1127,6 +1168,8 @@ mod tests {
             tune: |_| {},
             events_tx,
             events,
+            test_tx,
+            test_results,
         };
 
         let message = match parse_event(

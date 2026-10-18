@@ -2,6 +2,7 @@ pub mod actions;
 pub mod app;
 pub mod cli;
 pub mod connection;
+pub mod conntest;
 pub mod dispatcher;
 pub mod emoji;
 mod emoji_table;

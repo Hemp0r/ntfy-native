@@ -191,3 +191,39 @@ async fn e2e_gap_after_restart_without_cache() {
     );
     conn.stop().await;
 }
+
+#[tokio::test]
+async fn connection_test_against_real_server() {
+    let Some(url) = e2e_url() else { return };
+    let http = http_client();
+    assert!(
+        ntfy_native::ntfy::client::health(&http, &url)
+            .await
+            .unwrap()
+    );
+    let topic = unique_topic();
+    assert!(
+        ntfy_native::ntfy::client::topic_readable(&http, &url, &topic, None)
+            .await
+            .unwrap()
+    );
+    let draft = ntfy_native::instance_edit::InstanceDraft {
+        id: None,
+        url: url.clone(),
+        auth: ntfy_native::instance_edit::AuthDraft::None,
+        cache_duration_secs: 43200,
+        topics: vec![ntfy_native::settings::Topic {
+            name: topic.clone(),
+            ..Default::default()
+        }],
+    };
+    assert_eq!(
+        ntfy_native::conntest::test_connection(&http, &draft, None).await,
+        ntfy_native::ipc::TestOutcome::Ok {
+            topics: vec![ntfy_native::ipc::TopicAccess {
+                name: topic,
+                readable: true
+            }]
+        }
+    );
+}

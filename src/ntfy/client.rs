@@ -9,6 +9,9 @@ use crate::ntfy::model::{Event, Message, parse_event};
 use crate::secrets::Auth;
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Topic used by `health` on servers without `/v1/health`.
+const PROBE_TOPIC: &str = "ntfy-native-probe";
 /// Longer lines (no newline from a broken server) are dropped instead of buffered.
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 
@@ -120,6 +123,68 @@ pub async fn subscribe(
         },
     );
     Ok(Box::pin(stream))
+}
+
+/// Whether `base` is an ntfy server: `/v1/health` answers `{"healthy":true}`.
+/// Servers without that endpoint (404) are recognized by the NDJSON content
+/// type of a poll. Sends no credentials. Anything else is `Ok(false)`.
+pub async fn health(http: &reqwest::Client, base: &str) -> Result<bool, NtfyError> {
+    let base = base.trim_end_matches('/');
+    let resp = http
+        .get(format!("{base}/v1/health"))
+        .timeout(PROBE_TIMEOUT)
+        .send()
+        .await
+        .map_err(network)?;
+    if resp.status().as_u16() == 404 {
+        return probe_ndjson(http, base).await;
+    }
+    let resp = check_status(resp)?;
+    let body = resp.bytes().await.map_err(network)?;
+    Ok(serde_json::from_slice::<serde_json::Value>(&body)
+        .is_ok_and(|v| v.get("healthy").and_then(|h| h.as_bool()) == Some(true)))
+}
+
+async fn probe_ndjson(http: &reqwest::Client, base: &str) -> Result<bool, NtfyError> {
+    let url = format!("{base}/{PROBE_TOPIC}/json?poll=1&since=1s");
+    let resp = http
+        .get(url)
+        .timeout(PROBE_TIMEOUT)
+        .send()
+        .await
+        .map_err(network)?;
+    if resp.status().as_u16() == 404 {
+        return Ok(false);
+    }
+    let resp = check_status(resp)?;
+    Ok(resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim_start().starts_with("application/x-ndjson")))
+}
+
+/// Whether the credentials may read `topic`: 403 is `false`, 401 an error.
+pub async fn topic_readable(
+    http: &reqwest::Client,
+    base: &str,
+    topic: &str,
+    auth: Option<&Auth>,
+) -> Result<bool, NtfyError> {
+    let url = format!(
+        "{}/{topic}/json?poll=1&since=1s",
+        base.trim_end_matches('/')
+    );
+    let resp = request(http, &url, auth)
+        .timeout(PROBE_TIMEOUT)
+        .send()
+        .await
+        .map_err(network)?;
+    if resp.status().as_u16() == 403 {
+        return Ok(false);
+    }
+    check_status(resp)?;
+    Ok(true)
 }
 
 pub(crate) fn request(
