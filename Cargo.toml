@@ -10,8 +10,14 @@ description = "Lightweight tray app bridging ntfy servers to native OS notificat
 anyhow = "1.0.104"
 directories = "6.0.0"
 lexopt = "0.3.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+url = "2.5.8"
 
 [profile.release]
 lto = true
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
