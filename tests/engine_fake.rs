@@ -8,10 +8,12 @@ use ntfy_native::actions::RecordingOpener;
 use ntfy_native::connection::ConnectionConfig;
 use ntfy_native::engine::{Command, EngineDeps, EngineHandle, spawn_engine_thread};
 use ntfy_native::i18n::EN;
+use ntfy_native::ipc::{CoreMsg, UiRequest};
 use ntfy_native::notification::{ActivationPayload, Level, Notification, RecordingNotifier};
 use ntfy_native::paths::AppPaths;
 use ntfy_native::secrets::{MemoryStore, SecretStore};
 use ntfy_native::settings::{AuthKind, Instance, Settings, Topic};
+use ntfy_native::snapshot::{InstanceStatus, UiSnapshot};
 use ntfy_native::state::State;
 use ntfy_native::status::TrayState;
 use ntfy_native::store::{Loaded, load_json};
@@ -89,6 +91,7 @@ struct TestEngine {
     notifier: Arc<RecordingNotifier>,
     opener: Arc<RecordingOpener>,
     trays: Arc<Mutex<Vec<TrayState>>>,
+    snapshots: Arc<Mutex<Vec<UiSnapshot>>>,
     exited: Arc<AtomicBool>,
     paths: AppPaths,
 }
@@ -107,6 +110,7 @@ impl TestEngine {
         let notifier = Arc::new(RecordingNotifier::default());
         let opener = Arc::new(RecordingOpener::default());
         let trays = Arc::new(Mutex::new(Vec::new()));
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
         let exited = Arc::new(AtomicBool::new(false));
         let deps = EngineDeps {
             paths: paths.clone(),
@@ -124,6 +128,14 @@ impl TestEngine {
                 let exited = exited.clone();
                 Box::new(move || exited.store(true, Ordering::SeqCst))
             },
+            on_ui: {
+                let snapshots = snapshots.clone();
+                Box::new(move |m| {
+                    if let CoreMsg::Snapshot(s) = m {
+                        snapshots.lock().unwrap().push(s);
+                    }
+                })
+            },
             tune: fast,
             enable_triggers: false,
         };
@@ -134,6 +146,7 @@ impl TestEngine {
             notifier,
             opener,
             trays,
+            snapshots,
             exited,
             paths: paths.clone(),
         }
@@ -153,6 +166,14 @@ impl TestEngine {
 
     fn trays(&self) -> Vec<TrayState> {
         self.trays.lock().unwrap().clone()
+    }
+
+    fn snapshots(&self) -> Vec<UiSnapshot> {
+        self.snapshots.lock().unwrap().clone()
+    }
+
+    fn last_snapshot(&self) -> Option<UiSnapshot> {
+        self.snapshots().pop()
     }
 
     fn saved_settings(&self) -> Option<Settings> {
@@ -523,4 +544,182 @@ async fn commands_processed_while_media_stalls() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(engine.shown().is_empty(), "image still downloading");
+}
+
+fn ui(req: UiRequest) -> Command {
+    Command::Ui(req)
+}
+
+#[tokio::test]
+async fn snapshot_sent_on_start_and_on_change_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let t = now();
+    let script = ntfy_script();
+    let (reply, stream) = Reply::stream();
+    script.push(reply);
+    let server = FakeServer::scripted(&script).await;
+    let engine = TestEngine::start(&paths, settings_for(&server.url()), State::default());
+
+    engine
+        .wait_for("first snapshot", |e| !e.snapshots().is_empty())
+        .await;
+    let first = engine.snapshots().remove(0);
+    assert!(first.configured);
+    assert!(first.recent.is_empty());
+
+    stream.line(&open(t));
+    engine
+        .wait_for("connected", |e| {
+            e.last_snapshot()
+                .is_some_and(|s| s.instances[0].status == InstanceStatus::Connected)
+        })
+        .await;
+    stream.line(&msg("m1", t));
+    engine
+        .wait_for("recent message", |e| {
+            e.last_snapshot().is_some_and(|s| !s.recent.is_empty())
+        })
+        .await;
+    assert_eq!(engine.last_snapshot().unwrap().recent[0].message_id, "m1");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let all = engine.snapshots();
+    assert!(
+        all.windows(2).all(|w| w[0] != w[1]),
+        "unchanged snapshots are not resent"
+    );
+    let n = all.len();
+    engine.send(Command::ResendSnapshot);
+    engine
+        .wait_for("resend", |e| e.snapshots().len() == n + 1)
+        .await;
+    let all = engine.snapshots();
+    assert_eq!(all[n], all[n - 1], "resend repeats the current snapshot");
+}
+
+#[tokio::test]
+async fn ui_mute_and_urgent_are_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let engine = TestEngine::start(&paths, settings_for(&unused_url()), State::default());
+    engine.send(ui(UiRequest::SetTopicMuted {
+        instance_id: INSTANCE.into(),
+        topic: "alerts".into(),
+        muted: true,
+    }));
+    engine.send(ui(UiRequest::SetTopicUrgent {
+        instance_id: INSTANCE.into(),
+        topic: "backup".into(),
+        urgent: Some(true),
+    }));
+    engine.send(ui(UiRequest::SetUrgentGlobal { enabled: true }));
+    engine
+        .wait_for("settings.json", |e| {
+            e.saved_settings().is_some_and(|s| {
+                s.instances[0].topics[0].muted
+                    && s.instances[0].topics[1].urgent_breaks_dnd == Some(true)
+                    && s.urgent_breaks_dnd
+            })
+        })
+        .await;
+    engine
+        .wait_for("snapshot", |e| {
+            e.last_snapshot().is_some_and(|s| {
+                let topics = &s.instances[0].topics;
+                topics[0].muted && topics[1].urgent_breaks_dnd == Some(true) && s.urgent_breaks_dnd
+            })
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn dismiss_gap_removes_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let gap = |topic: &str| ntfy_native::state::GapFlag {
+        instance_id: INSTANCE.into(),
+        topic: topic.into(),
+        detected_at: 1,
+    };
+    let state = State {
+        gaps: vec![gap("alerts"), gap("backup")],
+        ..State::default()
+    };
+    let engine = TestEngine::start(&paths, settings_for(&unused_url()), state);
+    engine
+        .wait_for("two gaps", |e| {
+            e.last_snapshot().is_some_and(|s| s.gaps.len() == 2)
+        })
+        .await;
+    engine.send(ui(UiRequest::DismissGap {
+        instance_id: INSTANCE.into(),
+        topic: "alerts".into(),
+    }));
+    engine
+        .wait_for("one gap", |e| {
+            e.last_snapshot()
+                .is_some_and(|s| s.gaps.len() == 1 && s.gaps[0].topic == "backup")
+        })
+        .await;
+    let engine = engine.quit().await;
+    let state: State = load(&engine.paths.state_file()).unwrap();
+    assert_eq!(state.gaps.len(), 1);
+}
+
+#[tokio::test]
+async fn open_recent_uses_stored_click_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let recent = |id: &str, click: Option<&str>| ntfy_native::state::RecentMessage {
+        instance_id: INSTANCE.into(),
+        topic: "alerts".into(),
+        id: id.into(),
+        time: 1,
+        title: String::new(),
+        body: String::new(),
+        click: click.map(str::to_owned),
+    };
+    let state = State {
+        recent: [
+            recent("a", Some("https://example.org/a")),
+            recent("b", None),
+            recent("c", Some("file:///etc/passwd")),
+        ]
+        .into(),
+        ..State::default()
+    };
+    let engine = TestEngine::start(&paths, settings_for(&unused_url()), state);
+    for id in ["unknown", "b", "c", "a"] {
+        engine.send(ui(UiRequest::OpenRecent {
+            instance_id: INSTANCE.into(),
+            message_id: id.into(),
+        }));
+    }
+    engine
+        .wait_for("opener", |e| !e.opener.opened.lock().unwrap().is_empty())
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        *engine.opener.opened.lock().unwrap(),
+        ["https://example.org/a"]
+    );
+}
+
+#[tokio::test]
+async fn test_notification_is_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TestEngine::start(
+        &AppPaths::under(dir.path()),
+        Settings::default(),
+        State::default(),
+    );
+    engine.send(ui(UiRequest::SendTestNotification));
+    engine
+        .wait_for("test notification", |e| !e.shown().is_empty())
+        .await;
+    let n = &engine.shown()[0];
+    assert_eq!(n.title, "ntfy-native");
+    assert_eq!(n.body, "Notifications work.");
+    assert_eq!(n.level, Level::Active);
 }

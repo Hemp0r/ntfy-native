@@ -180,6 +180,41 @@ impl Dispatcher {
         changed
     }
 
+    /// `None` falls back to the global setting.
+    pub fn set_topic_urgent(
+        &mut self,
+        instance_id: &str,
+        topic: &str,
+        urgent: Option<bool>,
+    ) -> bool {
+        let Some(t) = self
+            .settings
+            .instances
+            .iter_mut()
+            .find(|i| i.id == instance_id)
+            .and_then(|i| i.topics.iter_mut().find(|t| t.name == topic))
+        else {
+            return false;
+        };
+        let changed = t.urgent_breaks_dnd != urgent;
+        t.urgent_breaks_dnd = urgent;
+        changed
+    }
+
+    pub fn set_urgent_global(&mut self, enabled: bool) -> bool {
+        let changed = self.settings.urgent_breaks_dnd != enabled;
+        self.settings.urgent_breaks_dnd = enabled;
+        changed
+    }
+
+    /// Returns whether a flag was removed.
+    pub fn dismiss_gap(&mut self, instance_id: &str, topic: &str) -> bool {
+        let before = self.gaps.len();
+        self.gaps
+            .retain(|g| !(g.instance_id == instance_id && g.topic == topic));
+        self.gaps.len() != before
+    }
+
     pub fn is_paused(&mut self, now: i64) -> bool {
         match self.settings.paused_until {
             Some(t) if t > now => true,
@@ -222,6 +257,23 @@ mod tests {
 
     fn disp(topics: &[(&str, bool)]) -> Dispatcher {
         Dispatcher::new(settings(topics), VecDeque::new(), Vec::new(), &EN)
+    }
+
+    #[test]
+    fn urgent_and_gap_setters_report_changes() {
+        let mut d = disp(&[("t", false)]);
+        assert!(d.set_topic_urgent("i", "t", Some(true)));
+        assert!(!d.set_topic_urgent("i", "t", Some(true)));
+        assert!(!d.set_topic_urgent("i", "nope", Some(true)));
+        assert!(d.settings.urgent_allowed("i", "t"));
+        assert!(d.set_topic_urgent("i", "t", None));
+        assert!(d.set_urgent_global(true));
+        assert!(!d.set_urgent_global(true));
+
+        d.on_gap("i", 5);
+        assert!(d.dismiss_gap("i", "t"));
+        assert!(!d.dismiss_gap("i", "t"));
+        assert!(d.gaps.is_empty());
     }
 
     fn msg(id: &str, topic: &str, time: i64) -> Message {

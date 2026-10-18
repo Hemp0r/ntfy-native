@@ -129,6 +129,7 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
                 let _ = proxy.send_event(UserEvent::Exit);
             }
         }),
+        on_ui: Box::new(|_| {}),
         tune: |_| {},
         enable_triggers: true,
     });

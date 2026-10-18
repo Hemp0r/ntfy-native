@@ -15,6 +15,8 @@ pub struct Strings {
     pub tray_config_invalid: &'static str,
     pub import_failed_title: &'static str,
     pub import_while_running: &'static str,
+    pub test_title: &'static str,
+    pub test_body: &'static str,
 }
 
 pub static DE: Strings = Strings {
@@ -34,6 +36,8 @@ pub static DE: Strings = Strings {
     tray_config_invalid: "Konfiguration fehlerhaft – siehe Logs",
     import_failed_title: "Konfiguration konnte nicht gelesen werden",
     import_while_running: "ntfy-native läuft bereits – bitte beenden und --import {path} erneut ausführen",
+    test_title: "ntfy-native",
+    test_body: "Benachrichtigungen funktionieren.",
 };
 
 pub static EN: Strings = Strings {
@@ -53,6 +57,8 @@ pub static EN: Strings = Strings {
     tray_config_invalid: "Configuration invalid – see logs",
     import_failed_title: "Could not read the configuration",
     import_while_running: "ntfy-native is already running – quit it and run --import {path} again",
+    test_title: "ntfy-native",
+    test_body: "Notifications work.",
 };
 
 pub fn strings_for(locale: &str) -> &'static Strings {

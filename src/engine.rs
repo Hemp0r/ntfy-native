@@ -16,12 +16,14 @@ use crate::actions::{self, UrlOpener};
 use crate::connection::{ConnControl, ConnEvent, ConnStatus, ConnectionConfig, spawn_connection};
 use crate::dispatcher::Dispatcher;
 use crate::i18n::{Strings, fill};
+use crate::ipc::{CoreMsg, UiRequest};
 use crate::media::MediaFetcher;
 use crate::notification::{ActivationPayload, Level, MediaRef, Notification, Notifier};
 use crate::ntfy::client::http_client;
 use crate::paths::AppPaths;
 use crate::secrets::{Auth, SecretStore, resolve_auth};
 use crate::settings::Settings;
+use crate::snapshot::{UiSnapshot, build_snapshot};
 use crate::state::{InstanceState, State};
 use crate::status::{TrayState, aggregate};
 use crate::store::save_json;
@@ -44,6 +46,10 @@ pub enum Command {
         topic: String,
         muted: bool,
     },
+    /// Request from the UI process.
+    Ui(UiRequest),
+    /// Sends the current snapshot even if unchanged (a UI just connected).
+    ResendSnapshot,
     Quit,
 }
 
@@ -57,6 +63,8 @@ pub struct EngineDeps {
     pub strings: &'static Strings,
     pub on_tray: Box<dyn Fn(TrayState) + Send>,
     pub on_exit: Box<dyn FnOnce() + Send>,
+    /// Snapshots and test/save results for the UI process.
+    pub on_ui: Box<dyn Fn(CoreMsg) + Send>,
     /// Adjusts each connection's config; production: `|_| {}`.
     pub tune: fn(&mut ConnectionConfig),
     /// Wake/network reconnect triggers and Ctrl-C/SIGTERM handling.
@@ -111,6 +119,7 @@ pub async fn run_engine(
         strings,
         on_tray,
         on_exit,
+        on_ui,
         tune,
         enable_triggers,
     } = deps;
@@ -146,6 +155,8 @@ pub async fn run_engine(
         opener,
         strings,
         on_tray,
+        on_ui,
+        snapshot: None,
     };
     engine.start_connections(secrets.as_ref(), tune, &ev_tx);
 
@@ -300,6 +311,9 @@ struct Engine {
     opener: Arc<dyn UrlOpener>,
     strings: &'static Strings,
     on_tray: Box<dyn Fn(TrayState) + Send>,
+    on_ui: Box<dyn Fn(CoreMsg) + Send>,
+    /// Last snapshot sent to the UI.
+    snapshot: Option<UiSnapshot>,
     dispatcher: Dispatcher,
     /// Last successfully written `settings.json` content.
     saved_settings: Settings,
@@ -411,8 +425,92 @@ impl Engine {
             }) => {
                 self.dispatcher.set_topic_muted(&instance_id, &topic, muted);
             }
+            Some(Command::Ui(req)) => self.on_ui_request(req),
+            Some(Command::ResendSnapshot) => {
+                let snap = self.build_snapshot(unix_now());
+                (self.on_ui)(CoreMsg::Snapshot(snap.clone()));
+                self.snapshot = Some(snap);
+            }
         }
         ControlFlow::Continue(())
+    }
+
+    fn on_ui_request(&mut self, req: UiRequest) {
+        match req {
+            UiRequest::PauseAll { until } => self.dispatcher.pause_all(until),
+            UiRequest::SetTopicMuted {
+                instance_id,
+                topic,
+                muted,
+            } => {
+                self.dispatcher.set_topic_muted(&instance_id, &topic, muted);
+            }
+            UiRequest::SetTopicUrgent {
+                instance_id,
+                topic,
+                urgent,
+            } => {
+                self.dispatcher
+                    .set_topic_urgent(&instance_id, &topic, urgent);
+            }
+            UiRequest::SetUrgentGlobal { enabled } => {
+                self.dispatcher.set_urgent_global(enabled);
+            }
+            UiRequest::DismissGap { instance_id, topic } => {
+                self.dispatcher.dismiss_gap(&instance_id, &topic);
+                self.state_dirty = true;
+            }
+            UiRequest::OpenRecent {
+                instance_id,
+                message_id,
+            } => {
+                let click = self
+                    .dispatcher
+                    .recent
+                    .iter()
+                    .find(|m| m.instance_id == instance_id && m.id == message_id)
+                    .and_then(|m| m.click.clone());
+                match click {
+                    Some(url) if actions::is_openable(&url) => {
+                        self.spawn_action(ActivationPayload::Open { url });
+                    }
+                    _ => tracing::debug!("recent message has no openable click URL"),
+                }
+            }
+            UiRequest::SendTestNotification => self.enqueue_test_notification(),
+            other => tracing::debug!(request = ?other, "UI request not handled by the engine"),
+        }
+    }
+
+    fn enqueue_test_notification(&self) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        self.enqueue(
+            "",
+            Notification {
+                id: format!("test:{stamp}"),
+                thread: "test".into(),
+                title: self.strings.test_title.to_owned(),
+                body: self.strings.test_body.to_owned(),
+                level: Level::Active,
+                default_action: None,
+                buttons: Vec::new(),
+                image: None,
+                icon: None,
+            },
+        );
+    }
+
+    fn build_snapshot(&self, now: i64) -> UiSnapshot {
+        build_snapshot(
+            &self.dispatcher.settings,
+            &self.statuses,
+            &self.dispatcher.recent,
+            &self.dispatcher.gaps,
+            now,
+        )
     }
 
     /// Runs the action off the event loop so a slow HTTP action cannot delay
@@ -464,6 +562,11 @@ impl Engine {
         if self.tray.as_ref() != Some(&tray) {
             (self.on_tray)(tray.clone());
             self.tray = Some(tray);
+        }
+        let snap = self.build_snapshot(now);
+        if self.snapshot.as_ref() != Some(&snap) {
+            (self.on_ui)(CoreMsg::Snapshot(snap.clone()));
+            self.snapshot = Some(snap);
         }
     }
 
