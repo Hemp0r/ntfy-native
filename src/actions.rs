@@ -19,10 +19,8 @@ pub struct SystemOpener;
 
 impl UrlOpener for SystemOpener {
     fn open(&self, url: &str) -> anyhow::Result<()> {
-        if !is_openable(url) {
-            bail!("refusing to open URL with scheme {}", scheme_of(url));
-        }
-        open::that_detached(url).context("failed to open URL")
+        let parsed = openable_url(url)?;
+        open::that_detached(parsed.as_str()).context("failed to open URL")
     }
 }
 
@@ -40,14 +38,16 @@ impl UrlOpener for RecordingOpener {
 
 /// Only http, https and mailto may be handed to the OS.
 pub fn is_openable(url: &str) -> bool {
-    url::Url::parse(url)
-        .map(|u| {
-            matches!(
-                u.scheme().to_ascii_lowercase().as_str(),
-                "http" | "https" | "mailto"
-            )
-        })
-        .unwrap_or(false)
+    openable_url(url).is_ok()
+}
+
+/// Parsed URL (the parser lowercases the scheme), or an error that names
+/// only the scheme.
+fn openable_url(url: &str) -> anyhow::Result<url::Url> {
+    match url::Url::parse(url) {
+        Ok(u) if matches!(u.scheme(), "http" | "https" | "mailto") => Ok(u),
+        _ => bail!("refusing to open URL with scheme {}", scheme_of(url)),
+    }
 }
 
 fn scheme_of(url: &str) -> String {
@@ -63,10 +63,8 @@ pub async fn perform(
 ) -> anyhow::Result<()> {
     match payload {
         ActivationPayload::Open { url } => {
-            if !is_openable(url) {
-                bail!("refusing to open URL with scheme {}", scheme_of(url));
-            }
-            opener.open(url)
+            let parsed = openable_url(url)?;
+            opener.open(parsed.as_str())
         }
         ActivationPayload::Http {
             method,
@@ -100,6 +98,7 @@ pub async fn perform(
             let status = req
                 .send()
                 .await
+                .map_err(|e| e.without_url())
                 .context("HTTP action request failed")?
                 .status();
             if !status.is_success() {

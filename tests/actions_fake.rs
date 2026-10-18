@@ -2,7 +2,7 @@ mod support;
 
 use std::collections::BTreeMap;
 
-use ntfy_native::actions::{RecordingOpener, UrlOpener, is_openable, perform};
+use ntfy_native::actions::{RecordingOpener, SystemOpener, UrlOpener, is_openable, perform};
 use ntfy_native::notification::ActivationPayload;
 use ntfy_native::ntfy::client::http_client;
 use support::{FakeServer, Reply};
@@ -34,7 +34,7 @@ async fn open_https_calls_opener() {
     perform(&http_client(), &p, &opener).await.unwrap();
     assert_eq!(
         *opener.opened.lock().unwrap(),
-        vec!["https://x".to_string()]
+        vec!["https://x/".to_string()]
     );
 }
 
@@ -44,7 +44,10 @@ async fn open_rejects_file_and_javascript() {
     for url in ["file:///etc/passwd", "javascript:alert(1)", "not a url"] {
         let p = ActivationPayload::Open { url: url.into() };
         let err = perform(&http_client(), &p, &opener).await.unwrap_err();
-        assert!(!err.to_string().contains("passwd"), "{err}");
+        let msg = format!("{err:#}");
+        for leak in ["passwd", "alert", "not a url"] {
+            assert!(!msg.contains(leak), "{msg}");
+        }
     }
     assert!(opener.opened.lock().unwrap().is_empty());
 }
@@ -127,4 +130,28 @@ fn recording_opener_records_via_trait() {
     let o = RecordingOpener::default();
     (&o as &dyn UrlOpener).open("https://a").unwrap();
     assert_eq!(o.opened.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn http_action_error_hides_url() {
+    let p = http(
+        "POST",
+        format!("{}/hook?token=s3cret", support::unused_url()),
+        &[],
+        None,
+    );
+    let err = perform(&http_client(), &p, &RecordingOpener::default())
+        .await
+        .unwrap_err();
+    assert!(!format!("{err:#}").contains("s3cret"));
+    assert!(!format!("{err:?}").contains("s3cret"));
+}
+
+#[test]
+fn system_opener_refuses_dangerous_schemes() {
+    for url in ["file:///etc/passwd", "javascript:alert(1)"] {
+        let err = SystemOpener.open(url).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(!msg.contains("passwd") && !msg.contains("alert"), "{msg}");
+    }
 }
