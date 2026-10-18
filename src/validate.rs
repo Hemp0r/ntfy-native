@@ -1,12 +1,28 @@
 use anyhow::{Result, anyhow, bail};
 
-use crate::settings::Settings;
+use crate::settings::{Settings, Topic};
 
 pub fn valid_topic_name(name: &str) -> bool {
     (1..=64).contains(&name.len())
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Errors name the position, never the entered value.
+pub fn validate_topics(topics: &[Topic]) -> Result<()> {
+    for (i, topic) in topics.iter().enumerate() {
+        let pos = i + 1;
+        if !valid_topic_name(&topic.name) {
+            bail!(
+                "topic {pos}: invalid topic name (allowed: letters, digits, '-' and '_', 1-64 characters)"
+            );
+        }
+        if topics[..i].iter().any(|o| o.name == topic.name) {
+            bail!("topic {pos}: duplicate topic");
+        }
+    }
+    Ok(())
 }
 
 /// The parsed URL's serialization (lowercase host, no default port) without

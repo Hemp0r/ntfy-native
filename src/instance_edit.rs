@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::secrets::{SecretStore, account_for};
 use crate::settings::{AuthKind, Instance, Settings, Topic};
-use crate::validate::{normalize_url, same_url, unique_id, valid_topic_name};
+use crate::validate::{normalize_url, same_url, unique_id, validate_topics};
 
 const MIN_CACHE_SECS: i64 = 3600;
 const MAX_CACHE_SECS: i64 = 2_592_000;
@@ -112,17 +112,7 @@ fn validate_fields(draft: &InstanceDraft) -> Result<String> {
     if draft.topics.is_empty() {
         bail!("at least one topic is required");
     }
-    for (i, topic) in draft.topics.iter().enumerate() {
-        let pos = i + 1;
-        if !valid_topic_name(&topic.name) {
-            bail!(
-                "topic {pos}: invalid topic name (allowed: letters, digits, '-' and '_', 1-64 characters)"
-            );
-        }
-        if draft.topics[..i].iter().any(|o| o.name == topic.name) {
-            bail!("topic {pos}: duplicate topic");
-        }
-    }
+    validate_topics(&draft.topics)?;
     if !(MIN_CACHE_SECS..=MAX_CACHE_SECS).contains(&draft.cache_duration_secs) {
         bail!("cache duration must be between 1 hour and 30 days");
     }

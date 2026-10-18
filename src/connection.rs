@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::ntfy::client::{self, EventStream, NtfyError, PollResult};
+use crate::ntfy::client::{self, EventStream, NetworkKind, NtfyError, PollResult};
 use crate::ntfy::model::{Event, Message};
 use crate::secrets::Auth;
 use crate::settings::Instance;
@@ -155,7 +155,10 @@ impl Connection {
         let stream = match self.interruptible(subscribed).await? {
             None => return Ok(()),
             Some(Err(_elapsed)) => {
-                let e = NtfyError::Network("timed out waiting for the server to respond".into());
+                let e = NtfyError::Network {
+                    kind: NetworkKind::Timeout,
+                    message: "timed out waiting for the server to respond".into(),
+                };
                 return self.handle_error(e).await;
             }
             Some(Ok(Err(e))) => return self.handle_error(e).await,

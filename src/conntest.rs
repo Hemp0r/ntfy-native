@@ -8,7 +8,7 @@ use crate::instance_edit::{AuthDraft, InstanceDraft};
 use crate::ipc::{TestOutcome, TopicAccess};
 use crate::ntfy::client::{NtfyError, health, topic_readable};
 use crate::secrets::Auth;
-use crate::validate::{normalize_url, valid_topic_name};
+use crate::validate::{normalize_url, validate_topics};
 
 /// Probed when the draft has no topics, only to check the credentials.
 const AUTH_CHECK_TOPIC: &str = "ntfy-native-auth-check";
@@ -25,17 +25,15 @@ pub async fn test_connection(
         Ok(url) => url,
         Err(e) => return invalid(e.to_string()),
     };
-    for (i, topic) in draft.topics.iter().enumerate() {
-        if !valid_topic_name(&topic.name) {
-            return invalid(format!("topic {}: invalid topic name", i + 1));
-        }
+    if let Err(e) = validate_topics(&draft.topics) {
+        return invalid(e.to_string());
     }
     let auth = match auth_from(&draft.auth, stored) {
         Ok(auth) => auth,
         Err(message) => return invalid(message.into()),
     };
 
-    match health(http, &base).await {
+    match health(http, &base, auth.as_ref()).await {
         Ok(true) => {}
         Ok(false) => return TestOutcome::NotNtfy,
         Err(e) => return failure(e),
@@ -106,56 +104,9 @@ fn auth_from(draft: &AuthDraft, stored: Option<Auth>) -> Result<Option<Auth>, &'
 fn failure(e: NtfyError) -> TestOutcome {
     let message = match e {
         NtfyError::Auth(_) => return TestOutcome::AuthFailed,
-        NtfyError::Network(text) => category(&text).to_owned(),
+        NtfyError::Network { kind, .. } => kind.label().to_owned(),
         NtfyError::RateLimited { .. } => "rate limited".to_owned(),
         NtfyError::Status(code) => format!("HTTP {code}"),
     };
     TestOutcome::Unreachable { message }
-}
-
-/// Short error kind from a network error text, which may contain the URL.
-fn category(text: &str) -> &'static str {
-    let t = text.to_ascii_lowercase();
-    let has = |needles: &[&str]| needles.iter().any(|n| t.contains(n));
-    if has(&["timed out", "timeout"]) {
-        "timeout"
-    } else if has(&["dns", "lookup", "resolve", "nodename", "no such host"]) {
-        "DNS"
-    } else if has(&["certificate", "tls", "ssl", "handshake"]) {
-        "TLS error"
-    } else if has(&["refused"]) {
-        "connection refused"
-    } else {
-        "connection failed"
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn categories_hide_the_url() {
-        for (text, want) in [
-            (
-                "error sending request for url (http://x/) : operation timed out",
-                "timeout",
-            ),
-            (
-                "client error (Connect): dns error: failed to lookup address",
-                "DNS",
-            ),
-            (
-                "client error (Connect): Connection refused (os error 61)",
-                "connection refused",
-            ),
-            (
-                "client error (Connect): invalid peer certificate: UnknownIssuer",
-                "TLS error",
-            ),
-            ("something else entirely", "connection failed"),
-        ] {
-            assert_eq!(category(text), want, "{text}");
-        }
-    }
 }

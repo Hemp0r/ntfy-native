@@ -21,7 +21,7 @@ use crate::instance_edit::{AuthDraft, InstanceDraft, apply_draft, remove_instanc
 use crate::ipc::{CoreMsg, TestOutcome, UiRequest};
 use crate::media::MediaFetcher;
 use crate::notification::{ActivationPayload, Level, MediaRef, Notification, Notifier};
-use crate::ntfy::client::http_client;
+use crate::ntfy::client::{NetworkKind, http_client};
 use crate::paths::AppPaths;
 use crate::secrets::{Auth, SecretStore, resolve_auth};
 use crate::settings::{Instance, Settings};
@@ -36,6 +36,8 @@ const TICK: Duration = Duration::from_secs(5);
 const MEDIA_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MEDIA_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const STATE_VERSION: u32 = 1;
+/// Upper bound for a whole connection test.
+const TEST_DEADLINE: Duration = Duration::from_secs(15);
 /// On quit, pending notifications are shown without media within this time.
 const FLUSH_DEADLINE: Duration = Duration::from_secs(2);
 
@@ -174,6 +176,7 @@ pub async fn run_engine(
         events: ev_rx,
         test_tx,
         test_results,
+        test_task: None,
     };
     engine.start_connections();
 
@@ -353,6 +356,8 @@ struct Engine {
     /// Outcomes of connection tests running in their own tasks.
     test_tx: mpsc::UnboundedSender<(u64, TestOutcome)>,
     test_results: mpsc::UnboundedReceiver<(u64, TestOutcome)>,
+    /// The running connection test; a new request replaces it.
+    test_task: Option<tokio::task::AbortHandle>,
 }
 
 impl Engine {
@@ -654,14 +659,23 @@ impl Engine {
     }
 
     /// Runs off the event loop: a hanging server must not delay anything.
-    fn spawn_connection_test(&self, request_id: u64, draft: InstanceDraft) {
+    fn spawn_connection_test(&mut self, request_id: u64, draft: InstanceDraft) {
+        if let Some(previous) = self.test_task.take() {
+            previous.abort();
+        }
         let stored = self.stored_auth_for_test(&draft);
         let http = self.http.clone();
         let results = self.test_tx.clone();
-        tokio::spawn(async move {
-            let outcome = test_connection(&http, &draft, stored).await;
+        let task = tokio::spawn(async move {
+            let outcome =
+                tokio::time::timeout(TEST_DEADLINE, test_connection(&http, &draft, stored))
+                    .await
+                    .unwrap_or_else(|_| TestOutcome::Unreachable {
+                        message: NetworkKind::Timeout.label().into(),
+                    });
             let _ = results.send((request_id, outcome));
         });
+        self.test_task = Some(task.abort_handle());
     }
 
     /// The saved credential of the edited instance, for drafts that keep it.
@@ -1170,6 +1184,7 @@ mod tests {
             events,
             test_tx,
             test_results,
+            test_task: None,
         };
 
         let message = match parse_event(

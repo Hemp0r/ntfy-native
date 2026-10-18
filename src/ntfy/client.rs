@@ -10,6 +10,8 @@ use crate::secrets::Auth;
 
 const POLL_TIMEOUT: Duration = Duration::from_secs(30);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Probe bodies (health JSON, ntfy error JSON) are tiny; more is not ntfy.
+const PROBE_BODY_MAX: usize = 4096;
 /// Topic used by `health` on servers without `/v1/health`.
 const PROBE_TOPIC: &str = "ntfy-native-probe";
 /// Longer lines (no newline from a broken server) are dropped instead of buffered.
@@ -24,8 +26,31 @@ pub enum NtfyError {
     /// HTTP 429, with the server's `Retry-After` if it sent a usable one.
     #[error("rate limited by server (HTTP 429)")]
     RateLimited { retry_after: Option<Duration> },
-    #[error("network error: {0}")]
-    Network(String),
+    #[error("network error: {message}")]
+    Network { kind: NetworkKind, message: String },
+}
+
+/// Coarse cause of a network failure, derived from the error's structure and
+/// safe to show: it never contains the URL.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NetworkKind {
+    Timeout,
+    Dns,
+    Tls,
+    Refused,
+    Other,
+}
+
+impl NetworkKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            NetworkKind::Timeout => "timeout",
+            NetworkKind::Dns => "DNS",
+            NetworkKind::Tls => "TLS error",
+            NetworkKind::Refused => "connection refused",
+            NetworkKind::Other => "connection failed",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -127,34 +152,52 @@ pub async fn subscribe(
 
 /// Whether `base` is an ntfy server: `/v1/health` answers `{"healthy":true}`.
 /// Servers without that endpoint (404) are recognized by the NDJSON content
-/// type of a poll. Sends no credentials. Anything else is `Ok(false)`.
-pub async fn health(http: &reqwest::Client, base: &str) -> Result<bool, NtfyError> {
+/// type of a poll, or by ntfy's JSON 403 error. `auth` is sent so servers
+/// behind authentication can be recognized. Anything else is `Ok(false)`.
+pub async fn health(
+    http: &reqwest::Client,
+    base: &str,
+    auth: Option<&Auth>,
+) -> Result<bool, NtfyError> {
     let base = base.trim_end_matches('/');
-    let resp = http
-        .get(format!("{base}/v1/health"))
+    let resp = request(http, &format!("{base}/v1/health"), auth)
         .timeout(PROBE_TIMEOUT)
         .send()
         .await
         .map_err(network)?;
     if resp.status().as_u16() == 404 {
-        return probe_ndjson(http, base).await;
+        return probe_ndjson(http, base, auth).await;
     }
     let resp = check_status(resp)?;
-    let body = resp.bytes().await.map_err(network)?;
+    let Some(body) = read_capped(resp).await? else {
+        return Ok(false);
+    };
     Ok(serde_json::from_slice::<serde_json::Value>(&body)
         .is_ok_and(|v| v.get("healthy").and_then(|h| h.as_bool()) == Some(true)))
 }
 
-async fn probe_ndjson(http: &reqwest::Client, base: &str) -> Result<bool, NtfyError> {
+async fn probe_ndjson(
+    http: &reqwest::Client,
+    base: &str,
+    auth: Option<&Auth>,
+) -> Result<bool, NtfyError> {
     let url = format!("{base}/{PROBE_TOPIC}/json?poll=1&since=1s");
-    let resp = http
-        .get(url)
+    let resp = request(http, &url, auth)
         .timeout(PROBE_TIMEOUT)
         .send()
         .await
         .map_err(network)?;
-    if resp.status().as_u16() == 404 {
-        return Ok(false);
+    match resp.status().as_u16() {
+        404 => return Ok(false),
+        // ntfy answers a topic the user may not read with a JSON error.
+        403 => {
+            let Some(body) = read_capped(resp).await? else {
+                return Ok(false);
+            };
+            return Ok(serde_json::from_slice::<serde_json::Value>(&body)
+                .is_ok_and(|v| v.get("http").and_then(|h| h.as_u64()) == Some(403)));
+        }
+        _ => {}
     }
     let resp = check_status(resp)?;
     Ok(resp
@@ -162,6 +205,24 @@ async fn probe_ndjson(http: &reqwest::Client, base: &str) -> Result<bool, NtfyEr
         .get(reqwest::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.trim_start().starts_with("application/x-ndjson")))
+}
+
+/// The body, or `None` if it exceeds `PROBE_BODY_MAX`.
+async fn read_capped(mut resp: reqwest::Response) -> Result<Option<Vec<u8>>, NtfyError> {
+    if resp
+        .content_length()
+        .is_some_and(|n| n > PROBE_BODY_MAX as u64)
+    {
+        return Ok(None);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.map_err(network)? {
+        body.extend_from_slice(&chunk);
+        if body.len() > PROBE_BODY_MAX {
+            return Ok(None);
+        }
+    }
+    Ok(Some(body))
 }
 
 /// Whether the credentials may read `topic`: 403 is `false`, 401 an error.
@@ -224,6 +285,7 @@ fn retry_after(headers: &HeaderMap) -> Option<Duration> {
 
 /// Includes the error's source chain, which carries the actual cause.
 fn network(e: reqwest::Error) -> NtfyError {
+    let kind = classify(&e);
     let mut text = e.to_string();
     let mut source = std::error::Error::source(&e);
     while let Some(s) = source {
@@ -231,7 +293,50 @@ fn network(e: reqwest::Error) -> NtfyError {
         text.push_str(&s.to_string());
         source = s.source();
     }
-    NtfyError::Network(text)
+    NtfyError::Network {
+        kind,
+        message: text,
+    }
+}
+
+/// Looks at error types and at the Display of the *sources* only: the
+/// top-level error and its URL are never searched.
+fn classify(e: &reqwest::Error) -> NetworkKind {
+    if e.is_timeout() {
+        return NetworkKind::Timeout;
+    }
+    let mut sources = Vec::new();
+    let mut cur = std::error::Error::source(e);
+    while let Some(s) = cur {
+        sources.push(s);
+        cur = s.source();
+    }
+    for s in &sources {
+        if let Some(io) = s.downcast_ref::<std::io::Error>() {
+            match io.kind() {
+                std::io::ErrorKind::ConnectionRefused => return NetworkKind::Refused,
+                std::io::ErrorKind::TimedOut => return NetworkKind::Timeout,
+                _ => {}
+            }
+        }
+    }
+    let texts: Vec<String> = sources
+        .iter()
+        .map(|s| s.to_string().to_lowercase())
+        .collect();
+    let any = |needles: &[&str]| texts.iter().any(|t| needles.iter().any(|n| t.contains(n)));
+    if any(&[
+        "dns error",
+        "failed to lookup",
+        "name or service not known",
+        "nodename nor servname",
+    ]) {
+        NetworkKind::Dns
+    } else if any(&["certificate", "tls", "ssl", "handshake"]) {
+        NetworkKind::Tls
+    } else {
+        NetworkKind::Other
+    }
 }
 
 fn server_time(headers: &HeaderMap) -> Option<i64> {

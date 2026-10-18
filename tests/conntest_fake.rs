@@ -82,9 +82,9 @@ async fn html_server_is_not_ntfy() {
 #[tokio::test]
 async fn other_json_is_not_ntfy() {
     let server = FakeServer::start(|_| Reply::bytes(r#"{"status":"ok"}"#)).await;
-    assert!(!health(&http_client(), &server.url()).await.unwrap());
+    assert!(!health(&http_client(), &server.url(), None).await.unwrap());
     let server = FakeServer::start(|_| Reply::bytes(r#"{"healthy":false}"#)).await;
-    assert!(!health(&http_client(), &server.url()).await.unwrap());
+    assert!(!health(&http_client(), &server.url(), None).await.unwrap());
 }
 
 #[tokio::test]
@@ -96,7 +96,7 @@ async fn old_server_without_health_endpoint_is_detected_by_content_type() {
         _ => Reply::status(404),
     })
     .await;
-    assert!(health(&http_client(), &ntfy.url()).await.unwrap());
+    assert!(health(&http_client(), &ntfy.url(), None).await.unwrap());
     let probe = &ntfy.requests()[1];
     assert_eq!(probe.query_param("poll"), Some("1"));
     assert_eq!(probe.query_param("since"), Some("1s"));
@@ -106,10 +106,10 @@ async fn old_server_without_health_endpoint_is_detected_by_content_type() {
         _ => Reply::bytes("<html></html>").header("content-type", "text/html"),
     })
     .await;
-    assert!(!health(&http_client(), &html.url()).await.unwrap());
+    assert!(!health(&http_client(), &html.url(), None).await.unwrap());
 
     let nothing = FakeServer::start(|_| Reply::status(404)).await;
-    assert!(!health(&http_client(), &nothing.url()).await.unwrap());
+    assert!(!health(&http_client(), &nothing.url(), None).await.unwrap());
 }
 
 fn token_server() -> impl FnMut(&Recorded) -> Reply + Send + 'static {
@@ -149,11 +149,7 @@ async fn bad_token_is_auth_failed() {
         .into_iter()
         .find(|r| r.path == "/v1/health")
         .unwrap();
-    assert_eq!(
-        health_req.header("authorization"),
-        None,
-        "no creds to /v1/health"
-    );
+    assert_eq!(health_req.header("authorization"), Some("Bearer bad"));
 }
 
 #[tokio::test]
@@ -337,4 +333,96 @@ async fn stalled_server_times_out_after_ten_seconds() {
         }
     );
     assert_eq!(started.elapsed().as_secs(), 10);
+    assert!(!server.requests().is_empty(), "the server saw the request");
+}
+
+#[tokio::test]
+async fn category_ignores_words_in_host_and_topic() {
+    // The URL contains "dns", "tls" and "timeout", the cause is a refusal.
+    let port = unused_url().rsplit(':').next().unwrap().to_owned();
+    let url = format!("http://dns-tls-timeout.localhost:{port}");
+    let refused = TestOutcome::Unreachable {
+        message: "connection refused".into(),
+    };
+    let out = test_connection(&http_client(), &draft(&url, &["tls-alerts"]), None).await;
+    assert_eq!(out, refused);
+    let out = test_connection(&http_client(), &draft(&unused_url(), &["tls-alerts"]), None).await;
+    assert_eq!(out, refused);
+}
+
+#[tokio::test]
+async fn duplicate_topics_are_invalid_input() {
+    let d = draft("http://h.example", &["a", "a"]);
+    let out = test_connection(&http_client(), &d, None).await;
+    let TestOutcome::InvalidInput { message } = out else {
+        panic!("{out:?}");
+    };
+    assert!(message.starts_with("topic 2: duplicate"), "{message}");
+}
+
+#[tokio::test]
+async fn health_behind_basic_auth_proxy_uses_draft_credentials() {
+    let server = FakeServer::start(|req| match req.header("authorization") {
+        Some("Basic dTpwdw==") if req.path == "/v1/health" => Reply::bytes(HEALTHY),
+        Some("Basic dTpwdw==") => Reply::lines::<&str>(&[]),
+        _ => Reply::status(401),
+    })
+    .await;
+    let mut d = draft(&server.url(), &["a"]);
+    d.auth = AuthDraft::Basic {
+        username: "u".into(),
+        password: Some("pw".into()),
+    };
+    assert_eq!(
+        test_connection(&http_client(), &d, None).await,
+        TestOutcome::Ok {
+            topics: vec![access("a", true)]
+        }
+    );
+    d.auth = AuthDraft::None;
+    assert_eq!(
+        test_connection(&http_client(), &d, None).await,
+        TestOutcome::AuthFailed
+    );
+}
+
+#[tokio::test]
+async fn old_server_with_403_json_probe_is_ntfy() {
+    let ntfy_403 = r#"{"code":40301,"http":403,"error":"forbidden"}"#;
+    let server = FakeServer::start(move |req| match (req.path.as_str(), topic_of(req)) {
+        ("/v1/health", _) => Reply::status(404),
+        (_, "ntfy-native-probe") => Reply::bytes(ntfy_403).with_status(403),
+        _ => Reply::lines::<&str>(&[]),
+    })
+    .await;
+    let mut d = draft(&server.url(), &["a"]);
+    d.auth = AuthDraft::Token {
+        token: Some("good".into()),
+    };
+    assert_eq!(
+        test_connection(&http_client(), &d, None).await,
+        TestOutcome::Ok {
+            topics: vec![access("a", true)]
+        }
+    );
+    let probe = &server.requests()[1];
+    assert_eq!(probe.header("authorization"), Some("Bearer good"));
+
+    // A plain 403 (no ntfy JSON) is not ntfy.
+    let other = FakeServer::start(|req| match req.path.as_str() {
+        "/v1/health" => Reply::status(404),
+        _ => Reply::bytes("Forbidden").with_status(403),
+    })
+    .await;
+    assert_eq!(
+        test_connection(&http_client(), &draft(&other.url(), &["a"]), None).await,
+        TestOutcome::NotNtfy
+    );
+}
+
+#[tokio::test]
+async fn oversized_health_body_is_not_ntfy() {
+    let big = format!(r#"{{"healthy":true,"pad":"{}"}}"#, "x".repeat(10_000));
+    let server = FakeServer::start(move |_| Reply::bytes(big.clone())).await;
+    assert!(!health(&http_client(), &server.url(), None).await.unwrap());
 }

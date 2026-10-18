@@ -197,7 +197,7 @@ async fn connection_test_against_real_server() {
     let Some(url) = e2e_url() else { return };
     let http = http_client();
     assert!(
-        ntfy_native::ntfy::client::health(&http, &url)
+        ntfy_native::ntfy::client::health(&http, &url, None)
             .await
             .unwrap()
     );
