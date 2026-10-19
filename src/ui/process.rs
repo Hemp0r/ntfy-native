@@ -278,13 +278,16 @@ fn run_window(
         }));
     }
     let mode = args.mode;
+    let placement = args.clone();
     eframe::run_native_ext(
         strings.popover_title,
         options,
         Some(ctx),
         Box::new(move |cc| {
             fonts::install(&cc.egui_ctx);
-            Ok(Box::new(UiApp::new(mode, strings, inbox, outbox)))
+            Ok(Box::new(
+                UiApp::new(mode, strings, inbox, outbox).with_placement(&placement),
+            ))
         }),
     )
     .map_err(|e| anyhow!("ui window failed: {e}"))
@@ -293,7 +296,6 @@ fn run_window(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
 
     use super::*;
 
@@ -320,17 +322,22 @@ mod tests {
 
     #[test]
     fn bridge_delivers_in_order_and_disconnects_at_eof() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let c = calls.clone();
+        let (calls_tx, calls) = mpsc::channel();
+        let calls_tx = Mutex::new(calls_tx);
         let input = lines(&[CoreMsg::Hello { version: 1 }, CoreMsg::Close]);
         let b = start_bridge_with(io::Cursor::new(input), io::sink(), move || {
-            c.fetch_add(1, Ordering::SeqCst);
+            let _ = calls_tx.lock().unwrap().send(());
         });
         assert_eq!(b.inbox.recv().unwrap(), CoreMsg::Hello { version: 1 });
         assert_eq!(b.inbox.recv().unwrap(), CoreMsg::Close);
         assert!(b.inbox.recv().is_err());
-        // two messages + EOF
-        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        // two messages + EOF; the last call may follow the disconnect
+        for _ in 0..3 {
+            calls
+                .recv_timeout(Duration::from_secs(5))
+                .expect("on_message call");
+        }
+        assert!(calls.recv_timeout(Duration::from_millis(50)).is_err());
         drop(b.outbox);
         b.tail.finish().unwrap();
     }

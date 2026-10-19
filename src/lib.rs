@@ -1,4 +1,5 @@
 pub mod actions;
+pub mod activation;
 pub mod app;
 pub mod cli;
 pub mod connection;
@@ -30,4 +31,5 @@ pub mod sync;
 pub mod tray;
 pub mod triggers;
 pub mod ui;
+pub mod ui_host;
 pub mod validate;

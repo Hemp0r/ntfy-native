@@ -1,7 +1,7 @@
 //! The eframe app of the UI process: one window per process, kind by mode.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui;
 
@@ -9,7 +9,7 @@ use crate::cli::{UiArgs, UiMode};
 use crate::ipc::{CoreMsg, UiMsg, UiRequest};
 use crate::snapshot::UiSnapshot;
 use crate::ui::focus;
-use crate::ui::layout::popover_position;
+use crate::ui::layout::{AnchorRect, popover_position};
 use crate::ui::popover::{PopoverState, popover_ui};
 use crate::ui::settings_view::{SettingsState, settings_ui};
 use crate::ui::text::UiStrings;
@@ -20,6 +20,12 @@ pub const SETTINGS_SIZE: (f32, f32) = (560.0, 620.0);
 pub const WIZARD_SIZE: (f32, f32) = (520.0, 560.0);
 /// Keeps relative ages ("5 min ago") current while the popover is open.
 const AGE_REFRESH: Duration = Duration::from_secs(30);
+/// Activation is cooperative on macOS and may be refused before the core
+/// has yielded it: ask again a few times until the window has focus.
+const ACTIVATION_RETRY: Duration = Duration::from_millis(150);
+const ACTIVATION_RETRIES: u8 = 4;
+/// Scale difference above which the popover is placed again.
+const SCALE_TOLERANCE: f32 = 0.01;
 
 /// Window title and builder for a window mode. `Probe` has no window.
 pub fn viewport(args: &UiArgs, strings: &UiStrings) -> Option<egui::ViewportBuilder> {
@@ -60,6 +66,14 @@ enum Flow {
     Close,
 }
 
+/// Tray anchor, monitor and the scale the core computed the position with.
+#[derive(Clone, Copy)]
+struct Placement {
+    anchor: AnchorRect,
+    monitor: (f64, f64, f64, f64),
+    scale: f32,
+}
+
 pub struct UiApp {
     mode: UiMode,
     strings: &'static UiStrings,
@@ -74,6 +88,9 @@ pub struct UiApp {
     /// Frames drawn so far, saturating.
     frames: u8,
     had_focus: bool,
+    activations: u8,
+    last_activation: Option<Instant>,
+    placement: Option<Placement>,
     closing: bool,
 }
 
@@ -96,8 +113,40 @@ impl UiApp {
             next_id: 1,
             frames: 0,
             had_focus: false,
+            activations: 0,
+            last_activation: None,
+            placement: None,
             closing: false,
         }
+    }
+
+    /// Remembers where the popover was placed, see [`UiApp::position_fix`].
+    pub fn with_placement(mut self, args: &UiArgs) -> UiApp {
+        self.placement = match (args.anchor, args.monitor, args.scale) {
+            (Some(anchor), Some(monitor), Some(scale)) => Some(Placement {
+                anchor,
+                monitor,
+                scale,
+            }),
+            _ => None,
+        };
+        self
+    }
+
+    /// Mixed DPI: the monitor's real scale (known once the window is shown)
+    /// differs from the one passed by the core, so the position is off.
+    fn position_fix(&self, native_ppp: Option<f32>) -> Option<egui::Pos2> {
+        let Placement {
+            anchor,
+            monitor,
+            scale,
+        } = self.placement?;
+        let ppp = native_ppp?;
+        if self.mode != UiMode::Popover || (ppp - scale).abs() <= SCALE_TOLERANCE {
+            return None;
+        }
+        let (x, y) = popover_position(&anchor, POPOVER_SIZE, ppp, monitor);
+        Some(egui::pos2(x, y))
     }
 
     fn drain_inbox(&mut self) -> Flow {
@@ -143,10 +192,32 @@ impl UiApp {
             && (self.wizard.step == WizardStep::Done || self.wizard.cancelled)
     }
 
-    /// eframe shows the window only after the first frame, so activate on the second, once.
-    fn activation_due(&mut self) -> bool {
+    /// eframe shows the window only after the first frame, so activate on
+    /// the second, then retry a few times while the window has no focus.
+    fn activation_due(&mut self, now: Instant) -> bool {
         self.frames = self.frames.saturating_add(1);
-        self.frames == 2
+        let due = match (self.frames, self.last_activation) {
+            (0 | 1, _) => false,
+            (2, _) => true,
+            (_, Some(last)) => self.activation_pending() && now - last >= ACTIVATION_RETRY,
+            (_, None) => false,
+        };
+        if due {
+            self.activations += 1;
+            self.last_activation = Some(now);
+        }
+        due
+    }
+
+    /// Another activation attempt may follow.
+    fn activation_pending(&self) -> bool {
+        !self.had_focus && self.activations <= ACTIVATION_RETRIES
+    }
+
+    fn note_focus(&mut self, focused: Option<bool>) {
+        if focused == Some(true) {
+            self.had_focus = true;
+        }
     }
 
     fn forward(&self, requests: Vec<UiRequest>) {
@@ -177,6 +248,7 @@ impl eframe::App for UiApp {
         if self.closing {
             return;
         }
+        self.note_focus(focused);
         if self.drain_inbox() == Flow::Close || self.popover_dismissed(focused, escape) {
             self.closing = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -188,8 +260,19 @@ impl eframe::App for UiApp {
             // Make sure a second frame follows, on which the window is visible.
             ui.ctx().request_repaint();
         }
-        if self.activation_due() {
+        if self.activation_due(Instant::now()) {
             focus::activate(frame);
+            if self.frames == 2 {
+                let ppp = ui.ctx().input(|i| i.viewport().native_pixels_per_point);
+                if let Some(pos) = self.position_fix(ppp) {
+                    tracing::debug!(?ppp, "monitor scale differs, moving the popover");
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
+                }
+            }
+        }
+        if self.frames >= 2 && self.activation_pending() {
+            ui.ctx().request_repaint_after(ACTIVATION_RETRY);
         }
         if let (UiMode::Popover, Some(snap)) = (self.mode, &self.snapshot) {
             let mut out = Vec::new();
@@ -243,6 +326,7 @@ impl eframe::App for UiApp {
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc::channel;
+    use std::time::Instant;
 
     use super::*;
     use crate::i18n::UI_EN;
@@ -390,10 +474,71 @@ mod tests {
     #[test]
     fn focus_is_activated_once_on_the_second_frame() {
         let (mut a, _tx) = app(UiMode::Popover);
-        assert!(!a.activation_due());
-        assert!(a.activation_due());
-        assert!(!a.activation_due());
-        assert!(!a.activation_due());
+        let t = Instant::now();
+        assert!(!a.activation_due(t));
+        assert!(a.activation_due(t));
+        a.had_focus = true;
+        for i in 1..10 {
+            assert!(!a.activation_due(t + ACTIVATION_RETRY * i));
+        }
+    }
+
+    #[test]
+    fn activation_is_retried_until_focused_a_few_times() {
+        let (mut a, _tx) = app(UiMode::Settings);
+        let t = Instant::now();
+        assert!(!a.activation_due(t));
+        assert!(a.activation_due(t));
+        assert!(!a.activation_due(t + ACTIVATION_RETRY / 2), "too soon");
+        let mut retries = 0;
+        for i in 1..=20 {
+            if a.activation_due(t + ACTIVATION_RETRY * i) {
+                retries += 1;
+            }
+        }
+        assert_eq!(retries, ACTIVATION_RETRIES);
+        assert!(!a.activation_pending());
+    }
+
+    #[test]
+    fn focus_is_tracked_in_every_mode() {
+        let (mut a, _tx) = app(UiMode::Wizard);
+        assert!(a.activation_pending());
+        a.note_focus(Some(true));
+        assert!(a.had_focus && !a.activation_pending());
+    }
+
+    fn placed(scale: f32) -> UiArgs {
+        let mut a = args(UiMode::Popover);
+        a.anchor = Some(AnchorRect {
+            x: 2400.0,
+            y: 0.0,
+            w: 48.0,
+            h: 48.0,
+        });
+        a.monitor = Some((0.0, 0.0, 2880.0, 1800.0));
+        a.scale = Some(scale);
+        a
+    }
+
+    #[test]
+    fn popover_is_moved_when_the_real_scale_differs() {
+        let (a, _tx) = app(UiMode::Popover);
+        let a = a.with_placement(&placed(1.0));
+        assert_eq!(a.position_fix(Some(1.005)), None);
+        assert_eq!(a.position_fix(None), None);
+        let anchor = placed(2.0).anchor.unwrap();
+        let (x, y) = popover_position(&anchor, POPOVER_SIZE, 2.0, (0.0, 0.0, 2880.0, 1800.0));
+        assert_eq!(a.position_fix(Some(2.0)), Some(egui::pos2(x, y)));
+    }
+
+    #[test]
+    fn only_a_placed_popover_is_moved() {
+        let (a, _tx) = app(UiMode::Popover);
+        assert_eq!(a.position_fix(Some(2.0)), None);
+        let (s, _tx) = app(UiMode::Settings);
+        let s = s.with_placement(&placed(1.0));
+        assert_eq!(s.position_fix(Some(2.0)), None);
     }
 
     #[test]

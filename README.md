@@ -7,11 +7,13 @@ Schlanke Tray-App für macOS und Windows, die ntfy-Server abonniert und jede Nac
 - macOS: `scripts/macos-dev-bundle.sh` baut `target/ntfy-native.app`; per Doppelklick oder `open target/ntfy-native.app` starten. Die App erscheint nur in der Menüleiste (kein Dock-Symbol).
 - Windows: `ntfy-native.exe` starten; die App erscheint im Infobereich der Taskleiste.
 
-Bis zum Einrichtungsassistenten (Teil 2) erfolgt die Einrichtung über eine `config.yaml` (siehe [Konfiguration](#konfiguration)): Datei am angegebenen Ort anlegen und die App (neu) starten. Eine vorhandene `config.yaml` wird beim Start nur importiert, solange noch keine Instanz eingerichtet ist; danach nur noch explizit mit `--import <pfad>`. Ohne Konfiguration zeigt das Tray-Menü „Nicht eingerichtet“ mit dem erwarteten Pfad. Schlägt der Import fehl (z. B. Tippfehler oder fehlendes `url:`), zeigt es stattdessen „Konfiguration fehlerhaft – siehe Logs“, und eine Benachrichtigung „Konfiguration konnte nicht gelesen werden“ nennt Datei und Fehler (etwa ``config.yaml: instance 1: missing field `url` ``); die Datei bleibt dann unverändert liegen und kann korrigiert werden.
+Beim ersten Start (noch kein Server eingerichtet) öffnet sich der [Einrichtungsassistent](#einrichtungsassistent). Alternativ, etwa für eine automatische Installation, lässt sich die App über eine `config.yaml` einrichten (siehe [Konfiguration](#konfiguration)): Datei am angegebenen Ort anlegen und die App (neu) starten. Eine vorhandene `config.yaml` wird beim Start nur importiert, solange noch keine Instanz eingerichtet ist; danach nur noch explizit mit `--import <pfad>`. Ohne Konfiguration zeigt das Tray-Menü „Nicht eingerichtet“ mit dem erwarteten Pfad. Schlägt der Import fehl (z. B. Tippfehler oder fehlendes `url:`), zeigt es stattdessen „Konfiguration fehlerhaft – siehe Logs“, und eine Benachrichtigung „Konfiguration konnte nicht gelesen werden“ nennt Datei und Fehler (etwa ``config.yaml: instance 1: missing field `url` ``); die Datei bleibt dann unverändert liegen und kann korrigiert werden; der Assistent öffnet sich in diesem Fall nicht von selbst.
 
-Das Tray-Menü enthält:
+Ein Linksklick auf das Tray-Icon öffnet das [Popover](#popover), ein zweiter schließt es wieder. Das Menü per Rechtsklick enthält:
 
 - den Verbindungsstatus (nicht anklickbar),
+- „Einrichten …“ (nur solange nichts eingerichtet ist): öffnet den Einrichtungsassistenten,
+- „Einstellungen …“: öffnet das [Einstellungsfenster](#einstellungen),
 - „Konfigurationsordner öffnen“: öffnet den Ordner für die `config.yaml` im Finder bzw. Explorer (legt ihn bei Bedarf an),
 - „Logs öffnen“: öffnet den Log-Ordner,
 - „Beenden“.
@@ -25,9 +27,38 @@ Logs liegen in `log_dir` (Tray-Menü „Logs öffnen“), eine Datei pro Tag, di
 
 Die Ausführlichkeit steuert die Umgebungsvariable `NTFY_NATIVE_LOG` (Standard `info`; Syntax wie `RUST_LOG`, z. B. `debug` oder `info,ntfy_native=debug`). Debug-Builds schreiben zusätzlich auf stderr.
 
-Speicherbedarf (macOS, Intel, Release-Build, zwei Instanzen mit zusammen 10 Topics, nach 1 Minute Ruhe): `phys_footprint` rund 12 MB (gemessen: 12 124 160 Byte, Ziel < 30 MB).
+Speicherbedarf (macOS, Intel, Release-Build, zwei Instanzen mit zusammen 10 Topics, nach 1 Minute Ruhe): `phys_footprint` rund 13,5 MB (gemessen: 14 118 912 Byte nach fünfmaligem Öffnen und Schließen des Popovers, Ziel < 30 MB). Bei geschlossenem Popover, Assistent und Einstellungsfenster läuft nur dieser eine Prozess.
+
+## Popover
+
+Das Popover erscheint direkt am Tray-Icon (macOS unter der Menüleiste, Windows über der Taskleiste, auch auf einem zweiten Monitor) und schließt sich bei Esc, bei einem Klick daneben oder einem erneuten Klick auf das Icon. Es zeigt:
+
+- je Server den Verbindungsstatus und die Topics mit einem Schalter zum Stummschalten; „+ Topic“ fügt ein Topic hinzu,
+- „Pause“ für alle Benachrichtigungen (15 Minuten, 1 Stunde, bis morgen früh, bis zum Fortsetzen) und „Fortsetzen“,
+- die zuletzt eingegangenen Nachrichten; ein Klick öffnet die Click-URL der Nachricht, falls sie eine hat,
+- Hinweise „Nachrichten möglicherweise verpasst“ (siehe [unten](#hinweis-nachrichten-möglicherweise-verpasst)) mit „Ausblenden“,
+- „Einstellungen“ und „Beenden“.
+
+Das Popover läuft als eigener, kurzlebiger Prozess (`ntfy-native --ui popover`), der sich beim Schließen vollständig beendet; im Ruhezustand belegt nur die schlanke Tray-App Speicher. Stürzt das Fenster ab oder hängt es, läuft die Tray-App unbeeinflusst weiter, ein hängendes Fenster wird nach einer Sekunde beendet, und der nächste Klick startet ein frisches.
+
+## Einrichtungsassistent
+
+Der Assistent (beim ersten Start automatisch, sonst über „Einrichten …“ im Tray-Menü) führt in wenigen Schritten durch die Einrichtung eines Servers:
+
+1. **Server-Adresse**, z. B. `https://ntfy.sh` oder ein eigener Server. Mit „Weiter“ prüft die App, ob dort ein ntfy-Server erreichbar ist.
+2. **Anmeldung**: ohne Anmeldung, Access-Token oder Benutzername und Passwort. Falsche Zugangsdaten meldet der Assistent sofort.
+3. **Topics**: ein oder mehrere Topics; Topics ohne Leserecht werden markiert.
+4. **Benachrichtigungen**: ob dringende Nachrichten (Priorität 5) „Nicht stören“ durchbrechen dürfen, und „Test-Benachrichtigung senden“ zum Ausprobieren. Erscheint nichts, die Mitteilungen für ntfy-native in den Systemeinstellungen erlauben.
+
+Erst „Fertig“ speichert; bei einem Fehler oder „Abbrechen“ bleibt alles unverändert. Zugangsdaten landen wie beim Import im Schlüsselbund bzw. in der Anmeldeinformationsverwaltung, nie in `settings.json` oder im Log.
+
+## Einstellungen
+
+Das Einstellungsfenster („Einstellungen …“ im Tray-Menü oder im Popover) verwaltet alle Server: „Server hinzufügen“, „Bearbeiten“ (Adresse, Anmeldung, Topics, Server-Cache-Dauer; ein leer gelassenes Token- bzw. Passwortfeld behält das gespeicherte) und „Entfernen“. Je Topic lassen sich „Stumm“ und „Dringend“ (Standard, An, Aus) einstellen. Unter „Allgemein“ stehen die globale Einstellung für dringende Nachrichten, die Ordner für Konfiguration und Logs sowie die Version. Änderungen gelten sofort, ohne Neustart.
 
 ## Konfiguration
+
+Die Datei `config.yaml` ist eine Alternative zum Einrichtungsassistenten, vor allem für eine automatische Installation (z. B. per Softwareverteilung): Liegt sie beim ersten Start am Standardort, wird sie importiert und der Assistent öffnet sich nicht.
 
 `config.yaml` ist ein einmaliger Import. Danach ist der interne App-Zustand (`settings.json`) die einzige Quelle der Wahrheit.
 
@@ -118,6 +149,15 @@ MACOS_SIGN_IDENTITY="Apple Development: …" scripts/macos-dev-bundle.sh
 ```
 
 Ohne das Entitlement (oder ohne erlaubte zeitkritische Mitteilungen in den Systemeinstellungen) stuft macOS dringende Benachrichtigungen auf „aktiv“ herab; sie durchbrechen dann keinen Fokus („Nicht stören“). Für eine echte Identität ist voraussichtlich ein passendes Provisioning-Profil nötig; die endgültige Signatur und Notarisierung folgen mit dem Packaging (Teil 3).
+
+### Popover-Prozess testen
+
+Nur für die Entwicklung: Mit `NTFY_NATIVE_DEV_POPOVER_CYCLES=<n>` öffnet und schließt die App nach dem Start das Popover `n`-mal (je 1,5 Sekunden, ohne Position, also mittig), etwa um Speicher und das Aufräumen der UI-Prozesse ohne Klicks zu prüfen:
+
+```sh
+NTFY_NATIVE_DEV_POPOVER_CYCLES=5 target/ntfy-native.app/Contents/MacOS/ntfy-native
+pgrep -f "ntfy-native --ui"   # danach leer
+```
 
 ### Windows: Toast-Benachrichtigungen
 

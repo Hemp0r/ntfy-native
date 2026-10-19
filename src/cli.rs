@@ -40,6 +40,51 @@ pub struct UiArgs {
     pub probe_ignore_close: bool,
 }
 
+impl UiMode {
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            UiMode::Popover => "popover",
+            UiMode::Settings => "settings",
+            UiMode::Wizard => "wizard",
+            UiMode::Probe => "probe",
+        }
+    }
+}
+
+impl UiArgs {
+    /// No position: the window is centred.
+    pub fn window(mode: UiMode) -> UiArgs {
+        UiArgs {
+            mode,
+            anchor: None,
+            monitor: None,
+            scale: None,
+            probe_ignore_close: false,
+        }
+    }
+
+    /// The command line that [`parse_args`] turns back into these arguments.
+    pub fn to_args(&self) -> Vec<String> {
+        let mut v = vec!["--ui".to_owned(), self.mode.as_arg().to_owned()];
+        if let Some(a) = self.anchor {
+            v.push("--anchor".into());
+            v.push(format!("{},{},{},{}", a.x, a.y, a.w, a.h));
+        }
+        if let Some((x, y, w, h)) = self.monitor {
+            v.push("--monitor".into());
+            v.push(format!("{x},{y},{w},{h}"));
+        }
+        if let Some(s) = self.scale {
+            v.push("--scale".into());
+            v.push(s.to_string());
+        }
+        if self.probe_ignore_close {
+            v.push("--probe-ignore-close".into());
+        }
+        v
+    }
+}
+
 /// Arguments Windows COM activation passes to the process; not real flags.
 const COM_ACTIVATION_ARGS: [&str; 2] = ["-Embedding", "-ToastActivated"];
 
@@ -114,13 +159,15 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction>
 }
 
 fn parse_mode(s: &str) -> Result<UiMode> {
-    Ok(match s {
-        "popover" => UiMode::Popover,
-        "settings" => UiMode::Settings,
-        "wizard" => UiMode::Wizard,
-        "probe" => UiMode::Probe,
-        _ => bail!("unknown --ui mode {s:?}"),
-    })
+    [
+        UiMode::Popover,
+        UiMode::Settings,
+        UiMode::Wizard,
+        UiMode::Probe,
+    ]
+    .into_iter()
+    .find(|m| m.as_arg() == s)
+    .with_context(|| format!("unknown --ui mode {s:?}"))
 }
 
 #[cfg(test)]
@@ -239,6 +286,38 @@ mod tests {
                 "{bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn ui_args_roundtrip_through_the_command_line() {
+        let full = UiArgs {
+            mode: UiMode::Popover,
+            anchor: Some(AnchorRect {
+                x: 2400.5,
+                y: -3.0,
+                w: 48.0,
+                h: 44.25,
+            }),
+            monitor: Some((-1920.0, 0.0, 1920.0, 1080.0)),
+            scale: Some(1.25),
+            probe_ignore_close: false,
+        };
+        let probe = UiArgs {
+            mode: UiMode::Probe,
+            anchor: None,
+            monitor: None,
+            scale: None,
+            probe_ignore_close: true,
+        };
+        for a in [full, probe] {
+            let argv = a.to_args();
+            assert_eq!(argv[0], "--ui");
+            let Ok(CliAction::Ui(back)) = parse_args(argv.iter().map(OsString::from)) else {
+                panic!("{argv:?}")
+            };
+            assert_eq!(back, a);
+        }
+        assert_eq!(UiArgs::window(UiMode::Wizard).to_args(), ["--ui", "wizard"]);
     }
 
     #[test]
