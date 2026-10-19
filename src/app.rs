@@ -355,7 +355,6 @@ fn show(
     };
     #[cfg(target_os = "macos")]
     {
-        let _ = host;
         crate::activation::activate_core();
         yield_when_ready(pid, focus, proxy.clone());
     }

@@ -176,6 +176,19 @@ ui_strings! {
     cache_custom: "Benutzerdefiniert ({v})", "Custom ({v})";
     general_heading: "Allgemein", "General";
     wizard_done: "Fertig eingerichtet", "All set";
+    login_required: "Der Server verlangt eine Anmeldung.", "The server requires a login.";
+    reenter_secret_hint: "Neue Server-Adresse – Zugangsdaten bitte neu eingeben", "New server address – please enter the credentials again";
+    err_invalid: "Ungültige Eingabe: {reason}", "Invalid input: {reason}";
+    err_url_invalid: "Ungültige Server-Adresse", "Invalid server address";
+    err_url_scheme: "Die Adresse muss mit http:// oder https:// beginnen", "The address must start with http:// or https://";
+    err_url_credentials: "Zugangsdaten gehören nicht in die Adresse – bitte im nächsten Schritt eingeben", "Credentials don't belong in the address – enter them in the next step";
+    err_url_query: "Die Adresse darf keine Parameter (?…) oder Anker (#…) enthalten", "The address must not contain parameters (?…) or anchors (#…)";
+    net_timeout: "Zeitüberschreitung", "timeout";
+    net_dns: "Name nicht auflösbar", "name not resolved";
+    net_tls: "TLS-Fehler", "TLS error";
+    net_refused: "Verbindung abgelehnt", "connection refused";
+    net_failed: "Verbindung fehlgeschlagen", "connection failed";
+    net_rate_limited: "zu viele Anfragen", "too many requests";
 }
 
 pub fn ui_strings_for(locale: &str) -> &'static UiStrings {

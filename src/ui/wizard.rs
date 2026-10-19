@@ -9,7 +9,7 @@ use crate::ipc::{TestOutcome, TopicAccess, UiRequest};
 use crate::settings::{Instance, Topic};
 use crate::snapshot::{InstanceView, draft_from_view};
 use crate::ui::problem::Problem;
-use crate::validate::valid_topic_name;
+use crate::validate::{check_url, same_origin, valid_topic_name};
 
 /// The token/password field; its egui state (with undo history) is dropped after the Auth step.
 pub fn secret_field_id() -> egui::Id {
@@ -59,10 +59,16 @@ pub struct Wizard {
     pub urgent_global: bool,
     /// The user left without saving.
     pub cancelled: bool,
+    /// The server answered the Server step with 401/403: show a hint at the login step.
+    pub login_required: bool,
     /// Token or password as typed; empty keeps the stored one when editing.
     secret: String,
     new_topic: String,
     original_auth: AuthDraft,
+    /// Where the stored secret belongs (editing only).
+    original_url: String,
+    /// The urgent switch as set in this wizard; sent only once saved.
+    urgent_set: Option<bool>,
 }
 
 impl Drop for Wizard {
@@ -98,6 +104,9 @@ impl Wizard {
         Wizard {
             step: WizardStep::Server,
             original_auth: draft.auth.clone(),
+            original_url: draft.url.clone(),
+            urgent_set: None,
+            login_required: false,
             draft,
             editing,
             busy: None,
@@ -123,10 +132,17 @@ impl Wizard {
         if !self.can_continue() {
             return None;
         }
+        if self.step == WizardStep::Server
+            && let Err(e) = check_url(&self.request_url())
+        {
+            self.error = Some(Problem::Url(e));
+            return None;
+        }
         let request_id = *next_id;
         *next_id += 1;
         self.busy = Some(request_id);
         self.error = None;
+        self.login_required = false;
         let draft = self.request_draft();
         Some(match self.step {
             WizardStep::Notifications => UiRequest::SaveInstance { request_id, draft },
@@ -142,6 +158,7 @@ impl Wizard {
         }
         self.busy = None;
         self.error = None;
+        self.login_required = false;
         self.step = match self.step {
             WizardStep::Server | WizardStep::Auth => WizardStep::Server,
             WizardStep::Topics => WizardStep::Auth,
@@ -155,6 +172,16 @@ impl Wizard {
             return;
         }
         self.busy = None;
+        if self.step == WizardStep::Server && *outcome == TestOutcome::AuthFailed {
+            // Reachable, but only with a login (e.g. a Basic-Auth proxy).
+            if self.draft.auth == AuthDraft::None {
+                self.set_auth_choice(AuthChoice::Basic);
+            }
+            self.error = None;
+            self.login_required = true;
+            self.step = WizardStep::Auth;
+            return;
+        }
         if let Some(problem) = Problem::from_outcome(outcome) {
             self.error = Some(problem);
             return;
@@ -181,9 +208,14 @@ impl Wizard {
         };
     }
 
-    pub fn on_save_result(&mut self, request_id: u64, result: &Result<String, String>) {
+    /// Once saved, returns the changed urgent switch to send.
+    pub fn on_save_result(
+        &mut self,
+        request_id: u64,
+        result: &Result<String, String>,
+    ) -> Option<UiRequest> {
         if self.busy != Some(request_id) || self.step != WizardStep::Notifications {
-            return;
+            return None;
         }
         self.busy = None;
         match result {
@@ -191,9 +223,35 @@ impl Wizard {
                 self.error = None;
                 self.step = WizardStep::Done;
                 self.secret.zeroize();
+                self.urgent_set
+                    .take()
+                    .filter(|enabled| *enabled != self.urgent_global)
+                    .map(|enabled| UiRequest::SetUrgentGlobal { enabled })
             }
-            Err(reason) => self.error = Some(Problem::SaveFailed(reason.clone())),
+            Err(reason) => {
+                self.error = Some(Problem::SaveFailed(reason.clone()));
+                None
+            }
         }
+    }
+
+    /// Leaves without saving; ignored while a save runs (it would still complete).
+    pub fn cancel(&mut self) {
+        if self.saving() {
+            return;
+        }
+        self.busy = None;
+        self.cancelled = true;
+    }
+
+    /// Sets the urgent switch; sent only once saved, so Cancel leaves it unchanged.
+    pub fn set_urgent(&mut self, enabled: bool) {
+        self.urgent_set = Some(enabled);
+    }
+
+    /// The urgent switch as shown: the choice made here, else the current setting.
+    pub fn urgent_choice(&self) -> bool {
+        self.urgent_set.unwrap_or(self.urgent_global)
     }
 
     /// Whether "Next" is enabled (ignoring a running request). Topics: an
@@ -215,8 +273,13 @@ impl Wizard {
         }
     }
 
-    /// Editing with the same login kind (and user): an empty field keeps the stored secret.
+    /// Editing with the same login kind (and user) on the same origin: an
+    /// empty field keeps the stored secret.
     fn can_keep_secret(&self) -> bool {
+        self.same_login_kind() && same_origin(&self.original_url, &self.request_url())
+    }
+
+    fn same_login_kind(&self) -> bool {
         self.editing
             && match (&self.original_auth, &self.draft.auth) {
                 (AuthDraft::Token { .. }, AuthDraft::Token { .. }) => true,
@@ -278,19 +341,27 @@ impl Wizard {
         self.error = None;
     }
 
-    /// What goes to the core: the typed secret filled in, topics only from the Topics step on.
-    fn request_draft(&self) -> InstanceDraft {
-        let mut draft = self.draft.clone();
-        let url = draft.url.trim();
-        draft.url = if url.contains("://") {
+    /// The address as sent: `https://` added when no scheme was typed.
+    fn request_url(&self) -> String {
+        let url = self.draft.url.trim();
+        if url.contains("://") {
             url.to_owned()
         } else {
             format!("https://{url}")
-        };
+        }
+    }
+
+    /// What goes to the core: the typed secret filled in, topics only from the Topics step on.
+    fn request_draft(&self) -> InstanceDraft {
+        let mut draft = self.draft.clone();
+        draft.url = self.request_url();
         // Blank keeps the stored secret; a password keeps its own spaces.
         let secret = (!self.secret.trim().is_empty()).then(|| self.secret.clone());
+        let unusable = secret.is_none() && !self.can_keep_secret();
         draft.auth = match &self.draft.auth {
             AuthDraft::None => AuthDraft::None,
+            // Only reachability is checked here; the login step asks for the secret.
+            _ if unusable && self.step == WizardStep::Server => AuthDraft::None,
             AuthDraft::Token { .. } => AuthDraft::Token {
                 token: secret.map(|t| t.trim().to_owned()),
             },
@@ -366,9 +437,11 @@ fn buttons(
 ) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        if ui.button(s.cancel).clicked() {
-            w.busy = None;
-            w.cancelled = true;
+        if ui
+            .add_enabled(!w.saving(), egui::Button::new(s.cancel))
+            .clicked()
+        {
+            w.cancel();
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let label = if w.step == WizardStep::Notifications {
@@ -424,6 +497,10 @@ fn server_step(ui: &mut egui::Ui, w: &mut Wizard, s: &UiStrings) -> bool {
 
 fn auth_step(ui: &mut egui::Ui, w: &mut Wizard, s: &UiStrings) -> bool {
     heading(ui, s.auth_heading);
+    if w.login_required {
+        ui.label(s.login_required);
+        ui.add_space(4.0);
+    }
     let current = auth_choice(&w.draft.auth);
     for (choice, label) in [
         (AuthChoice::None, s.auth_none),
@@ -437,6 +514,8 @@ fn auth_step(ui: &mut egui::Ui, w: &mut Wizard, s: &UiStrings) -> bool {
     ui.add_space(8.0);
     let hint = if w.can_keep_secret() {
         s.keep_secret_hint
+    } else if w.same_login_kind() {
+        s.reenter_secret_hint
     } else {
         ""
     };
@@ -536,10 +615,9 @@ fn notifications_step(ui: &mut egui::Ui, w: &mut Wizard, s: &UiStrings, out: &mu
     };
     ui.add(Label::new(RichText::new(hint).small().weak()).wrap());
     ui.add_space(12.0);
-    if ui.checkbox(&mut w.urgent_global, s.urgent_global).changed() {
-        out.push(UiRequest::SetUrgentGlobal {
-            enabled: w.urgent_global,
-        });
+    let mut urgent = w.urgent_choice();
+    if ui.checkbox(&mut urgent, s.urgent_global).changed() {
+        w.set_urgent(urgent);
     }
 }
 
@@ -551,6 +629,7 @@ mod tests {
     use super::*;
     use crate::i18n::UI_EN;
     use crate::snapshot::{AuthView, InstanceStatus};
+    use crate::validate::UrlError;
 
     fn ok(names: &[(&str, bool)]) -> TestOutcome {
         TestOutcome::Ok {
@@ -985,10 +1064,8 @@ mod tests {
         click(&mut h, UI_EN.urgent_global);
         assert_eq!(
             take(&mut h),
-            [
-                UiRequest::SendTestNotification,
-                UiRequest::SetUrgentGlobal { enabled: true }
-            ]
+            [UiRequest::SendTestNotification],
+            "the switch waits for Finish"
         );
         click(&mut h, "Finish");
         let out = take(&mut h);
@@ -1115,5 +1192,213 @@ mod tests {
         click(&mut h, "Cancel");
         assert!(h.state().w.cancelled);
         assert!(take(&mut h).is_empty());
+    }
+
+    #[test]
+    fn changing_the_host_asks_for_the_secret_again() {
+        let mut id = 1;
+        let mut w = Wizard::edit(&view(AuthView::Token));
+        w.step = WizardStep::Auth;
+        assert!(w.can_keep_secret());
+        for same in [
+            "https://ntfy.example.org/sub",
+            "ntfy.example.org",
+            "https://NTFY.example.org:443/",
+        ] {
+            w.draft.url = same.into();
+            assert!(w.can_keep_secret(), "{same}");
+        }
+        for other in [
+            "https://other.example",
+            "http://ntfy.example.org",
+            "https://ntfy.example.org:8443",
+        ] {
+            w.draft.url = other.into();
+            assert!(!w.can_keep_secret(), "{other}");
+            assert!(!w.can_continue(), "{other}");
+        }
+        w.secret = "tk_new".into();
+        assert!(w.can_continue());
+
+        // The Server step tests the new address without the old secret.
+        let mut w = Wizard::edit(&view(AuthView::Token));
+        w.draft.url = "https://other.example".into();
+        let (_, draft) = test_draft(w.next(&mut id));
+        assert_eq!(draft.auth, AuthDraft::None);
+        let mut w = Wizard::edit(&view(AuthView::Token));
+        w.draft.url = "https://ntfy.example.org/sub".into();
+        let (_, draft) = test_draft(w.next(&mut id));
+        assert_eq!(draft.auth, AuthDraft::Token { token: None });
+
+        let mut w = Wizard::edit(&view(AuthView::Basic {
+            username: "alice".into(),
+        }));
+        w.step = WizardStep::Auth;
+        assert!(w.can_continue());
+        w.draft.url = "https://other.example".into();
+        assert!(!w.can_keep_secret());
+        assert!(
+            !w.can_continue(),
+            "a password is needed for the new address"
+        );
+    }
+
+    #[test]
+    fn ui_hint_asks_again_for_a_new_address() {
+        let mut w = Wizard::edit(&view(AuthView::Token));
+        w.draft.url = "https://other.example".into();
+        w.step = WizardStep::Auth;
+        let mut h = harness(w);
+        h.run_steps(4);
+        h.get_by_label(UI_EN.reenter_secret_hint);
+        assert!(h.query_by_label(UI_EN.keep_secret_hint).is_none());
+    }
+
+    #[test]
+    fn login_required_at_the_server_step_moves_on_to_login() {
+        let mut id = 1;
+        let mut w = Wizard::new();
+        w.draft.url = "https://proxy.example".into();
+        w.next(&mut id).unwrap();
+        answer(&mut w, TestOutcome::AuthFailed);
+        assert_eq!(w.step, WizardStep::Auth);
+        assert_eq!(w.error, None);
+        assert!(w.login_required);
+        assert_eq!(
+            w.draft.auth,
+            AuthDraft::Basic {
+                username: String::new(),
+                password: None
+            }
+        );
+
+        // At the login step a rejection is an error again.
+        w.draft.auth = AuthDraft::Basic {
+            username: "alice".into(),
+            password: None,
+        };
+        w.secret = "pw".into();
+        w.next(&mut id).unwrap();
+        assert!(!w.login_required);
+        answer(&mut w, TestOutcome::AuthFailed);
+        assert_eq!(w.step, WizardStep::Auth);
+        assert_eq!(w.error, Some(Problem::AuthRejected));
+        w.back();
+        assert!(!w.login_required);
+
+        // A chosen login kind is kept.
+        let mut w = Wizard::edit(&view(AuthView::Token));
+        w.next(&mut id).unwrap();
+        answer(&mut w, TestOutcome::AuthFailed);
+        assert_eq!(w.step, WizardStep::Auth);
+        assert_eq!(w.draft.auth, AuthDraft::Token { token: None });
+    }
+
+    #[test]
+    fn ui_shows_the_login_required_hint() {
+        let mut w = Wizard::new();
+        w.draft.url = "https://proxy.example".into();
+        let mut h = harness(w);
+        h.run_steps(4);
+        click(&mut h, "Next");
+        let id = h.state().w.busy.unwrap();
+        h.state_mut().w.on_test_result(id, &TestOutcome::AuthFailed);
+        h.run_steps(4);
+        h.get_by_label(UI_EN.login_required);
+        assert!(h.query_by_label(UI_EN.err_auth).is_none());
+        assert_eq!(h.state().w.step, WizardStep::Auth);
+    }
+
+    #[test]
+    fn urgent_switch_is_sent_only_after_saving() {
+        let mut id = 1;
+        let mut w = at_notifications(&mut id);
+        let mut h = harness(w);
+        h.run_steps(4);
+        click(&mut h, UI_EN.urgent_global);
+        assert!(take(&mut h).is_empty(), "nothing sent before Finish");
+        // A snapshot meanwhile does not undo the choice.
+        h.state_mut().w.urgent_global = false;
+        h.run_steps(4);
+        assert!(h.state().w.urgent_choice());
+        click(&mut h, "Finish");
+        let out = take(&mut h);
+        let [UiRequest::SaveInstance { request_id, .. }] = out.as_slice() else {
+            panic!("{out:?}");
+        };
+        let request_id = *request_id;
+        assert_eq!(
+            h.state_mut()
+                .w
+                .on_save_result(request_id, &Err("disk full".into())),
+            None
+        );
+        click(&mut h, "Finish");
+        let out = take(&mut h);
+        let [UiRequest::SaveInstance { request_id, .. }] = out.as_slice() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            h.state_mut().w.on_save_result(*request_id, &Ok("a".into())),
+            Some(UiRequest::SetUrgentGlobal { enabled: true })
+        );
+
+        // Unchanged switch: nothing extra.
+        w = at_notifications(&mut id);
+        let Some(UiRequest::SaveInstance { request_id, .. }) = w.next(&mut id) else {
+            panic!("save");
+        };
+        assert_eq!(w.on_save_result(request_id, &Ok("a".into())), None);
+
+        // Cancelled: nothing is sent.
+        let mut h = harness(at_notifications(&mut id));
+        h.run_steps(4);
+        click(&mut h, UI_EN.urgent_global);
+        click(&mut h, "Cancel");
+        assert!(h.state().w.cancelled);
+        assert!(take(&mut h).is_empty());
+    }
+
+    #[test]
+    fn cancel_is_blocked_while_saving() {
+        let mut id = 1;
+        let mut w = at_notifications(&mut id);
+        let Some(UiRequest::SaveInstance { request_id, .. }) = w.next(&mut id) else {
+            panic!("save");
+        };
+        w.cancel();
+        assert!(!w.cancelled);
+        assert_eq!(w.busy, Some(request_id));
+        let mut h = harness(w);
+        h.run_steps(4);
+        click(&mut h, "Cancel");
+        assert!(!h.state().w.cancelled);
+        assert_eq!(h.state().w.busy, Some(request_id));
+
+        // While a test runs, Cancel still works.
+        let mut w = Wizard::new();
+        w.draft.url = "https://ntfy.example.org".into();
+        w.next(&mut id).unwrap();
+        w.cancel();
+        assert!(w.cancelled);
+        assert_eq!(w.busy, None);
+    }
+
+    #[test]
+    fn invalid_addresses_are_caught_before_testing() {
+        let mut id = 1;
+        for (url, problem) in [
+            ("ftp://ntfy.example.org", UrlError::Scheme),
+            ("https://u:p@ntfy.example.org", UrlError::Credentials),
+            ("ntfy.example.org/?x=1", UrlError::QueryOrFragment),
+            ("https://", UrlError::Invalid),
+        ] {
+            let mut w = Wizard::new();
+            w.draft.url = url.into();
+            assert!(w.next(&mut id).is_none(), "{url}");
+            assert_eq!(w.busy, None);
+            assert_eq!(w.error, Some(Problem::Url(problem)), "{url}");
+        }
+        assert_eq!(id, 1, "no request sent");
     }
 }

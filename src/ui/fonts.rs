@@ -11,6 +11,8 @@ pub enum FontRole {
     Proportional,
     Monospace,
     Symbols,
+    /// Chinese/Japanese fallback; optional, so missing files are not reported.
+    Cjk,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +46,8 @@ pub fn font_candidates(os: &FontOs) -> Vec<(FontRole, PathBuf)> {
                 (FontRole::Proportional, dir.join("Helvetica.ttc")),
                 (FontRole::Monospace, dir.join("Menlo.ttc")),
                 (FontRole::Symbols, dir.join("Apple Symbols.ttf")),
+                (FontRole::Cjk, dir.join("PingFang.ttc")),
+                (FontRole::Cjk, dir.join("Hiragino Sans GB.ttc")),
             ]
         }
         FontOs::Windows { windir } => {
@@ -52,6 +56,8 @@ pub fn font_candidates(os: &FontOs) -> Vec<(FontRole, PathBuf)> {
                 (FontRole::Proportional, dir.join("segoeui.ttf")),
                 (FontRole::Monospace, dir.join("consola.ttf")),
                 (FontRole::Symbols, dir.join("seguisym.ttf")),
+                (FontRole::Cjk, dir.join("msyh.ttc")),
+                (FontRole::Cjk, dir.join("YuGothM.ttc")),
             ]
         }
         FontOs::Other => Vec::new(),
@@ -70,6 +76,9 @@ pub fn load_fonts(
         }
         match read(path) {
             Ok(bytes) => loaded.push((*role, bytes)),
+            Err(e) if *role == FontRole::Cjk => {
+                tracing::debug!(path = %path.display(), error = %e, "CJK fallback font unavailable");
+            }
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e, "system font unavailable");
             }
@@ -83,10 +92,12 @@ fn font_name(role: FontRole) -> &'static str {
         FontRole::Proportional => "ui",
         FontRole::Monospace => "mono",
         FontRole::Symbols => "symbols",
+        FontRole::Cjk => "cjk",
     }
 }
 
-/// Proportional: UI font, then symbols. Monospace: mono font, then the UI font, then symbols.
+/// Proportional: UI font, then symbols, then CJK. Monospace: mono font, then
+/// the UI font, symbols and CJK.
 pub fn definitions(fonts: Vec<(FontRole, Vec<u8>)>) -> FontDefinitions {
     let mut defs = FontDefinitions::empty();
     let has = |role| fonts.iter().any(|(r, _)| *r == role);
@@ -97,15 +108,16 @@ pub fn definitions(fonts: Vec<(FontRole, Vec<u8>)>) -> FontDefinitions {
             .map(|r| font_name(*r).to_owned())
             .collect()
     };
-    let (ui, mono, symbols) = (
+    let (ui, mono, symbols, cjk) = (
         FontRole::Proportional,
         FontRole::Monospace,
         FontRole::Symbols,
+        FontRole::Cjk,
     );
     defs.families
-        .insert(FontFamily::Proportional, pick(&[ui, symbols]));
+        .insert(FontFamily::Proportional, pick(&[ui, symbols, cjk]));
     defs.families
-        .insert(FontFamily::Monospace, pick(&[mono, ui, symbols]));
+        .insert(FontFamily::Monospace, pick(&[mono, ui, symbols, cjk]));
     for (role, bytes) in fonts {
         defs.font_data.insert(
             font_name(role).to_owned(),
@@ -135,6 +147,48 @@ mod tests {
             .filter(|(r, _)| *r == role)
             .map(|(_, p)| p.to_string_lossy().replace('\\', "/"))
             .collect()
+    }
+
+    #[test]
+    fn cjk_fallbacks() {
+        let mac = font_candidates(&FontOs::MacOs);
+        assert_eq!(
+            paths(&mac, FontRole::Cjk),
+            [
+                "/System/Library/Fonts/PingFang.ttc",
+                "/System/Library/Fonts/Hiragino Sans GB.ttc"
+            ]
+        );
+        let win = font_candidates(&FontOs::Windows {
+            windir: PathBuf::from("D:/Win"),
+        });
+        assert_eq!(
+            paths(&win, FontRole::Cjk),
+            ["D:/Win/Fonts/msyh.ttc", "D:/Win/Fonts/YuGothM.ttc"]
+        );
+        // A missing CJK font is no problem: the next one or none.
+        let loaded = load_fonts(&mac, |p| {
+            let name = p.file_name().unwrap().to_string_lossy().into_owned();
+            match name.as_str() {
+                "PingFang.ttc" => Err(io::ErrorKind::NotFound.into()),
+                _ => Ok(name.into_bytes()),
+            }
+        });
+        assert!(loaded.contains(&(FontRole::Cjk, b"Hiragino Sans GB.ttc".to_vec())));
+        let defs = definitions(vec![
+            (FontRole::Proportional, vec![1]),
+            (FontRole::Monospace, vec![2]),
+            (FontRole::Symbols, vec![3]),
+            (FontRole::Cjk, vec![4]),
+        ]);
+        assert_eq!(
+            defs.families[&FontFamily::Proportional],
+            ["ui", "symbols", "cjk"]
+        );
+        assert_eq!(
+            defs.families[&FontFamily::Monospace],
+            ["mono", "ui", "symbols", "cjk"]
+        );
     }
 
     #[test]
@@ -186,10 +240,11 @@ mod tests {
             vec![
                 (FontRole::Proportional, b"Helvetica.ttc".to_vec()),
                 (FontRole::Symbols, b"Apple Symbols.ttf".to_vec()),
+                (FontRole::Cjk, b"PingFang.ttc".to_vec()),
             ]
         );
         let all = load_fonts(&c, |p| Ok(p.to_string_lossy().into_owned().into_bytes()));
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 4);
         assert_eq!(all[0].1, b"/System/Library/Fonts/SFNS.ttf");
         assert!(load_fonts(&c, |_| Err(io::ErrorKind::NotFound.into())).is_empty());
     }
@@ -201,6 +256,7 @@ mod tests {
         if !loaded.iter().any(|(r, _)| *r == FontRole::Proportional) {
             return;
         }
+        let has_cjk = loaded.iter().any(|(r, _)| *r == FontRole::Cjk);
         let defs = definitions(loaded);
         let mut texts: Vec<&str> = crate::i18n::UI_DE
             .fields()
@@ -209,6 +265,10 @@ mod tests {
             .collect();
         texts.extend(crate::i18n::UI_EN.fields().into_iter().map(|f| f.1));
         texts.extend(["▾", "·", "…"]);
+        if has_cjk {
+            // Message titles and topics may be Chinese or Japanese.
+            texts.extend(["备份完成", "バックアップ完了"]);
+        }
         // The harness panics on any glyph no font can draw.
         let mut h = egui_kittest::Harness::builder()
             .with_context_setup(move |ctx| ctx.set_fonts(defs))

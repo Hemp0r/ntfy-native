@@ -1261,3 +1261,48 @@ async fn engine_reports_test_result_with_stored_secret() {
         .await;
     assert_eq!(test_outcome(&engine, 2), Some(TestOutcome::AuthFailed));
 }
+
+#[tokio::test]
+async fn edited_draft_for_another_host_is_tested_without_the_stored_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let saved = FakeServer::start(|_| Reply::status(500)).await;
+    let other = FakeServer::start(|req| {
+        if req.path == "/v1/health" {
+            return Reply::bytes(HEALTHY);
+        }
+        Reply::lines::<&str>(&[])
+    })
+    .await;
+    let secrets = Arc::new(MemoryStore::new());
+    secrets.set(&account_for(INSTANCE), "stored").unwrap();
+    let engine = TestEngine::start_with(
+        &paths,
+        token_instance_settings(&saved.url()),
+        State::default(),
+        secrets,
+    );
+    let mut moved = draft(Some(INSTANCE), &other.url(), &["alerts"]);
+    moved.auth = AuthDraft::Token { token: None };
+    engine.send(ui(UiRequest::TestConnection {
+        request_id: 1,
+        draft: moved.clone(),
+    }));
+    engine
+        .wait_for("test result", |e| test_outcome(e, 1).is_some())
+        .await;
+    assert!(
+        matches!(test_outcome(&engine, 1), Some(TestOutcome::Ok { .. })),
+        "{:?}",
+        test_outcome(&engine, 1)
+    );
+    let reqs = other.requests();
+    assert!(!reqs.is_empty());
+    assert!(
+        reqs.iter().all(|r| r.header("authorization").is_none()),
+        "no credential for another host"
+    );
+
+    let err = engine.save(2, moved).await.unwrap_err();
+    assert_eq!(err, "credentials required for a new server address");
+}

@@ -42,6 +42,20 @@ pub enum NetworkKind {
 }
 
 impl NetworkKind {
+    pub const ALL: [NetworkKind; 5] = [
+        NetworkKind::Timeout,
+        NetworkKind::Dns,
+        NetworkKind::Tls,
+        NetworkKind::Refused,
+        NetworkKind::Other,
+    ];
+
+    /// The kind whose [`NetworkKind::label`] this is.
+    pub fn from_label(label: &str) -> Option<NetworkKind> {
+        NetworkKind::ALL.into_iter().find(|k| k.label() == label)
+    }
+
+    /// Stable, machine-readable; the UI translates it.
     pub fn label(self) -> &'static str {
         match self {
             NetworkKind::Timeout => "timeout",

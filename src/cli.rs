@@ -39,7 +39,8 @@ pub struct UiArgs {
     pub scale: Option<f32>,
     pub probe_ignore_close: bool,
     /// Tests only: run the windowless probe loop in any mode, so the core's
-    /// window policy can be tested with real modes. Hidden flag.
+    /// window policy can be tested with real modes. Hidden flag, accepted
+    /// only by debug builds.
     pub headless: bool,
 }
 
@@ -145,7 +146,8 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction>
                 probe_ignore_close = true;
                 ui_only = Some("--probe-ignore-close");
             }
-            Long("headless") => {
+            // Test-only; release builds reject it like any unknown flag.
+            Long("headless") if cfg!(debug_assertions) => {
                 headless = true;
                 ui_only = Some("--headless");
             }
@@ -277,11 +279,22 @@ mod tests {
             panic!("probe-ignore-close")
         };
         assert!(ui.probe_ignore_close);
-        let Ok(CliAction::Ui(ui)) = parse_args(args(["--ui", "settings", "--headless"])) else {
-            panic!("headless")
-        };
-        assert!(ui.headless && !ui.probe_ignore_close);
         assert!(!UiArgs::window(UiMode::Settings).headless);
+    }
+
+    /// The hidden test flag exists only in debug builds (which `cargo test` uses).
+    #[test]
+    fn headless_only_in_debug_builds() {
+        let parsed = parse_args(args(["--ui", "settings", "--headless"]));
+        if cfg!(debug_assertions) {
+            let Ok(CliAction::Ui(ui)) = parsed else {
+                panic!("headless")
+            };
+            assert!(ui.headless && !ui.probe_ignore_close);
+        } else {
+            let e = parsed.unwrap_err().to_string();
+            assert!(e.contains("--headless"), "{e}");
+        }
     }
 
     #[test]
@@ -335,7 +348,11 @@ mod tests {
             headless: true,
             ..UiArgs::window(UiMode::Settings)
         };
-        for a in [full, probe, headless] {
+        let mut cases = vec![full, probe];
+        if cfg!(debug_assertions) {
+            cases.push(headless);
+        }
+        for a in cases {
             let argv = a.to_args();
             assert_eq!(argv[0], "--ui");
             let Ok(CliAction::Ui(back)) = parse_args(argv.iter().map(OsString::from)) else {

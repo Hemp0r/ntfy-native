@@ -40,27 +40,31 @@ impl SettingsState {
     }
 
     /// The result arrives just before the snapshot with the change, so the
-    /// changed server stays disabled until `on_snapshot`.
-    pub fn on_save_result(&mut self, request_id: u64, result: &Result<String, String>) {
+    /// changed server stays disabled until `on_snapshot`. Returns what the
+    /// editor sends once saved.
+    pub fn on_save_result(
+        &mut self,
+        request_id: u64,
+        result: &Result<String, String>,
+    ) -> Option<UiRequest> {
         if let Some(w) = &mut self.editor {
-            w.on_save_result(request_id, result);
+            let follow_up = w.on_save_result(request_id, result);
             if w.step == WizardStep::Done {
                 if let Ok(id) = result {
                     self.locked.insert(id.clone());
                 }
                 self.editor = None;
-                return;
+                return follow_up;
             }
         }
-        let Some(instance_id) = self.pending.remove(&request_id) else {
-            return;
-        };
+        let instance_id = self.pending.remove(&request_id)?;
         match result {
             Ok(_) => {
                 self.locked.insert(instance_id);
             }
             Err(reason) => self.error = Some(Problem::SaveFailed(reason.clone())),
         }
+        None
     }
 
     pub fn on_snapshot(&mut self, snap: &UiSnapshot) {
@@ -602,14 +606,19 @@ mod tests {
         // Jump to the end and finish.
         h.state_mut().state.editor.as_mut().unwrap().step = WizardStep::Notifications;
         h.run_steps(4);
+        click(&mut h, UI_EN.urgent_global);
+        assert!(take(&mut h).is_empty(), "the switch waits for Finish");
         click(&mut h, "Finish");
         let out = take(&mut h);
         let [UiRequest::SaveInstance { request_id, .. }] = out.as_slice() else {
             panic!("{out:?}");
         };
-        h.state_mut()
-            .state
-            .on_save_result(*request_id, &Ok("a".into()));
+        assert_eq!(
+            h.state_mut()
+                .state
+                .on_save_result(*request_id, &Ok("a".into())),
+            Some(UiRequest::SetUrgentGlobal { enabled: true })
+        );
         h.run_steps(4);
         assert!(h.state().state.editor.is_none());
         h.get_by_label("Servers");

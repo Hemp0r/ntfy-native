@@ -30,7 +30,7 @@ use crate::state::{InstanceState, State};
 use crate::status::{TrayState, aggregate};
 use crate::store::save_json;
 use crate::triggers::{spawn_network_watcher, spawn_wake_detector};
-use crate::validate::same_url;
+use crate::validate::{same_origin, same_url};
 
 const TICK: Duration = Duration::from_secs(5);
 const MEDIA_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -659,9 +659,13 @@ impl Engine {
     }
 
     /// Runs off the event loop: a hanging server must not delay anything.
-    fn spawn_connection_test(&mut self, request_id: u64, draft: InstanceDraft) {
+    fn spawn_connection_test(&mut self, request_id: u64, mut draft: InstanceDraft) {
         if let Some(previous) = self.test_task.take() {
             previous.abort();
+        }
+        if keeps_secret(&draft.auth) && self.moved_instance(&draft) {
+            // The stored secret belongs to the old address; test without one.
+            draft.auth = AuthDraft::None;
         }
         let stored = self.stored_auth_for_test(&draft);
         let http = self.http.clone();
@@ -678,14 +682,24 @@ impl Engine {
         self.test_task = Some(task.abort_handle());
     }
 
-    /// The saved credential of the edited instance, for drafts that keep it.
+    /// The draft edits an instance whose stored URL has another origin.
+    fn moved_instance(&self, draft: &InstanceDraft) -> bool {
+        draft
+            .id
+            .as_deref()
+            .and_then(|id| self.dispatcher.settings.instance(id))
+            .is_some_and(|inst| !same_origin(&inst.url, &draft.url))
+    }
+
+    /// The saved credential of the edited instance, for drafts that keep it
+    /// on the same origin (scheme, host, port).
     fn stored_auth_for_test(&self, draft: &InstanceDraft) -> Option<Auth> {
-        let keeps_secret = matches!(
-            draft.auth,
-            AuthDraft::Token { token: None } | AuthDraft::Basic { password: None, .. }
-        );
-        let inst = self.dispatcher.settings.instance(draft.id.as_deref()?);
-        match resolve_auth(self.secrets.as_ref(), inst.filter(|_| keeps_secret)?) {
+        let inst = self
+            .dispatcher
+            .settings
+            .instance(draft.id.as_deref()?)
+            .filter(|i| keeps_secret(&draft.auth) && same_origin(&i.url, &draft.url))?;
+        match resolve_auth(self.secrets.as_ref(), inst) {
             Ok(auth) => auth,
             Err(e) => {
                 tracing::warn!(error = %format!("{e:#}"), "stored credential unavailable for connection test");
@@ -936,6 +950,14 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// The draft keeps the stored token or password (its secret is `None`).
+fn keeps_secret(auth: &AuthDraft) -> bool {
+    matches!(
+        auth,
+        AuthDraft::Token { token: None } | AuthDraft::Basic { password: None, .. }
+    )
 }
 
 #[cfg(test)]

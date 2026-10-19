@@ -179,8 +179,11 @@ impl UiApp {
                 }
                 Ok(CoreMsg::SaveResult { request_id, result }) => {
                     self.popover.on_save_result(request_id, &result);
-                    self.wizard.on_save_result(request_id, &result);
-                    self.settings.on_save_result(request_id, &result);
+                    let follow_ups = [
+                        self.wizard.on_save_result(request_id, &result),
+                        self.settings.on_save_result(request_id, &result),
+                    ];
+                    self.forward(follow_ups.into_iter().flatten().collect());
                 }
                 Ok(CoreMsg::Focus) => self.focus_requested = true,
                 Ok(CoreMsg::Close) => {
@@ -476,6 +479,34 @@ mod tests {
         .unwrap();
         assert_eq!(a.drain_inbox(), Flow::Close);
         assert_eq!(a.wizard.step, WizardStep::Done);
+    }
+
+    #[test]
+    fn wizard_sends_the_urgent_switch_once_saved() {
+        let (tx, inbox) = channel();
+        let (outbox, sent) = channel();
+        let mut a = UiApp::new(UiMode::Wizard, &UI_EN, inbox, outbox);
+        a.wizard.draft.url = "https://ntfy.example.org".into();
+        a.wizard.draft.topics = vec![crate::settings::Topic {
+            name: "alerts".into(),
+            ..Default::default()
+        }];
+        a.wizard.step = WizardStep::Notifications;
+        a.wizard.set_urgent(true);
+        let mut id = 8;
+        assert!(a.wizard.urgent_choice());
+        a.wizard.next(&mut id).unwrap();
+        assert!(sent.try_recv().is_err(), "nothing before the save");
+        tx.send(CoreMsg::SaveResult {
+            request_id: 8,
+            result: Ok("a".into()),
+        })
+        .unwrap();
+        assert_eq!(a.drain_inbox(), Flow::Close);
+        assert_eq!(
+            sent.try_recv().unwrap(),
+            UiMsg::Request(UiRequest::SetUrgentGlobal { enabled: true })
+        );
     }
 
     #[test]

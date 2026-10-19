@@ -45,16 +45,16 @@ Das Popover läuft als eigener, kurzlebiger Prozess (`ntfy-native --ui popover`)
 
 Der Assistent (beim ersten Start automatisch, sonst über „Einrichten …“ im Tray-Menü) führt in wenigen Schritten durch die Einrichtung eines Servers:
 
-1. **Server-Adresse**, z. B. `https://ntfy.sh` oder ein eigener Server. Mit „Weiter“ prüft die App, ob dort ein ntfy-Server erreichbar ist.
-2. **Anmeldung**: ohne Anmeldung, Access-Token oder Benutzername und Passwort. Falsche Zugangsdaten meldet der Assistent sofort.
+1. **Server-Adresse**, z. B. `https://ntfy.sh` oder ein eigener Server. Mit „Weiter“ prüft die App, ob dort ein ntfy-Server erreichbar ist. Verlangt der Server schon dafür eine Anmeldung (etwa hinter einem Proxy mit Basic-Auth), geht es mit dem Hinweis „Der Server verlangt eine Anmeldung.“ direkt zur Anmeldung.
+2. **Anmeldung**: ohne Anmeldung, Access-Token oder Benutzername und Passwort. Falsche Zugangsdaten meldet der Assistent sofort. Beim Bearbeiten behält ein leeres Feld das gespeicherte Token bzw. Passwort – aber nur, solange Schema, Host und Port der Adresse gleich bleiben; für eine neue Server-Adresse müssen die Zugangsdaten neu eingegeben werden, damit sie nie an einen anderen Server gehen.
 3. **Topics**: ein oder mehrere Topics; Topics ohne Leserecht werden markiert.
-4. **Benachrichtigungen**: ob dringende Nachrichten (Priorität 5) „Nicht stören“ durchbrechen dürfen, und „Test-Benachrichtigung senden“ zum Ausprobieren. Erscheint nichts, die Mitteilungen für ntfy-native in den Systemeinstellungen erlauben.
+4. **Benachrichtigungen**: ob dringende Nachrichten (Priorität 5) „Nicht stören“ durchbrechen dürfen, und „Test-Benachrichtigung senden“ zum Ausprobieren (die Test-Benachrichtigung wird sofort gesendet). Erscheint nichts, die Mitteilungen für ntfy-native in den Systemeinstellungen erlauben.
 
-Erst „Fertig“ speichert; bei einem Fehler oder „Abbrechen“ bleibt alles unverändert. Zugangsdaten landen wie beim Import im Schlüsselbund bzw. in der Anmeldeinformationsverwaltung, nie in `settings.json` oder im Log.
+Erst „Fertig“ speichert den Server und übernimmt die Einstellung für dringende Nachrichten; bei einem Fehler oder „Abbrechen“ bleiben Server und Einstellungen unverändert. Während des Speicherns sind „Zurück“ und „Abbrechen“ gesperrt. Zugangsdaten landen wie beim Import im Schlüsselbund bzw. in der Anmeldeinformationsverwaltung, nie in `settings.json` oder im Log.
 
 ## Einstellungen
 
-Das Einstellungsfenster („Einstellungen …“ im Tray-Menü oder im Popover) verwaltet alle Server: „Server hinzufügen“, „Bearbeiten“ (Adresse, Anmeldung, Topics, Server-Cache-Dauer; ein leer gelassenes Token- bzw. Passwortfeld behält das gespeicherte) und „Entfernen“. Je Topic lassen sich „Stumm“ und „Dringend“ (Standard, An, Aus) einstellen. Unter „Allgemein“ stehen die globale Einstellung für dringende Nachrichten, die Ordner für Konfiguration und Logs sowie die Version. Änderungen gelten sofort, ohne Neustart.
+Das Einstellungsfenster („Einstellungen …“ im Tray-Menü oder im Popover) verwaltet alle Server: „Server hinzufügen“, „Bearbeiten“ (Adresse, Anmeldung und Topics im Assistenten; ein leer gelassenes Token- bzw. Passwortfeld behält das gespeicherte, solange die Adresse auf denselben Server zeigt) und „Entfernen“. Die Server-Cache-Dauer wählt man je Server direkt in der Liste (12 Std., 24 Std., 72 Std., 7 Tage). Je Topic lassen sich „Stumm“ und „Dringend“ (Standard, An, Aus) einstellen. Unter „Allgemein“ stehen die globale Einstellung für dringende Nachrichten, die Ordner für Konfiguration und Logs sowie die Version. Änderungen gelten sofort, ohne Neustart.
 
 Ist das Einstellungsfenster oder der Assistent schon offen, holt jeder weitere Aufruf (Tray-Klick, „Einstellungen …“, „Einrichten …“) dieses Fenster nach vorn, statt es zu ersetzen; nicht gespeicherte Eingaben bleiben erhalten. Nur das Popover wird durch ein anderes Fenster ersetzt.
 

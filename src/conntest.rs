@@ -10,6 +10,9 @@ use crate::ntfy::client::{NtfyError, health, topic_readable};
 use crate::secrets::Auth;
 use crate::validate::{normalize_url, validate_topics};
 
+/// `Unreachable` reason for HTTP 429; the UI translates it.
+pub const RATE_LIMITED: &str = "rate limited";
+
 /// Probed when the draft has no topics, only to check the credentials.
 const AUTH_CHECK_TOPIC: &str = "ntfy-native-auth-check";
 
@@ -105,7 +108,7 @@ fn failure(e: NtfyError) -> TestOutcome {
     let message = match e {
         NtfyError::Auth(_) => return TestOutcome::AuthFailed,
         NtfyError::Network { kind, .. } => kind.label().to_owned(),
-        NtfyError::RateLimited { .. } => "rate limited".to_owned(),
+        NtfyError::RateLimited { .. } => RATE_LIMITED.to_owned(),
         NtfyError::Status(code) => format!("HTTP {code}"),
     };
     TestOutcome::Unreachable { message }

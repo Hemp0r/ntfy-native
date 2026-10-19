@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::secrets::{SecretStore, account_for};
 use crate::settings::{AuthKind, Instance, Settings, Topic};
-use crate::validate::{normalize_url, same_url, unique_id, validate_topics};
+use crate::validate::{normalize_url, same_origin, same_url, unique_id, validate_topics};
 
 const MIN_CACHE_SECS: i64 = 3600;
 const MAX_CACHE_SECS: i64 = 2_592_000;
@@ -119,11 +119,20 @@ fn validate_fields(draft: &InstanceDraft) -> Result<String> {
     Ok(url)
 }
 
+/// `moved`: an edit to another origin, where a stored secret must not be kept.
 fn plan_auth(
     draft: &AuthDraft,
     existing: Option<&AuthKind>,
     stored: bool,
+    moved: bool,
 ) -> Result<(AuthKind, SecretPlan)> {
+    let keeps = matches!(
+        draft,
+        AuthDraft::Token { token: None } | AuthDraft::Basic { password: None, .. }
+    );
+    if keeps && moved {
+        bail!("credentials required for a new server address");
+    }
     Ok(match draft {
         AuthDraft::None => (AuthKind::None, SecretPlan::Delete),
         AuthDraft::Token { token: Some(t) } => {
@@ -209,7 +218,8 @@ pub fn apply_draft(
         _ => false,
     };
     let existing = pos.map(|_| inst.auth.clone());
-    let (kind, plan) = plan_auth(&draft.auth, existing.as_ref(), stored)?;
+    let moved = pos.is_some() && !same_origin(&inst.url, &url);
+    let (kind, plan) = plan_auth(&draft.auth, existing.as_ref(), stored, moved)?;
 
     let change = match plan {
         SecretPlan::Set(secret) => {
@@ -390,6 +400,58 @@ mod tests {
             }
         );
         assert_eq!(store.get(&account_for(&id)).unwrap().unwrap(), "new");
+    }
+
+    #[test]
+    fn keeping_a_secret_requires_the_same_origin() {
+        let store = MemoryStore::new();
+        let mut d = draft("https://h/one");
+        d.auth = AuthDraft::Token {
+            token: Some("tk_1".into()),
+        };
+        let (s, id) = add(&Settings::default(), &d, &store);
+        let account = account_for(&id);
+        d.id = Some(id.clone());
+        d.auth = AuthDraft::Token { token: None };
+
+        for other in ["https://evil.example", "http://h/one", "https://h:8443/one"] {
+            d.url = other.into();
+            let e = format!("{:#}", apply_draft(&s, &d, &store).unwrap_err());
+            assert_eq!(e, "credentials required for a new server address");
+            assert_eq!(store.get(&account).unwrap().as_deref(), Some("tk_1"));
+        }
+
+        d.url = "https://H:443/two".into();
+        let (s2, _) = add(&s, &d, &store);
+        assert_eq!(s2.instances[0].url, "https://h/two");
+        assert_eq!(s2.instances[0].auth, AuthKind::Token);
+        assert_eq!(store.get(&account).unwrap().as_deref(), Some("tk_1"));
+
+        // A newly entered secret may go anywhere.
+        d.url = "https://g".into();
+        d.auth = AuthDraft::Token {
+            token: Some("tk_2".into()),
+        };
+        let (s3, _) = add(&s, &d, &store);
+        assert_eq!(s3.instances[0].url, "https://g");
+        assert_eq!(store.get(&account).unwrap().as_deref(), Some("tk_2"));
+
+        // Basic: same user, other host, no password.
+        let store = MemoryStore::new();
+        let mut d = draft("https://h");
+        d.auth = AuthDraft::Basic {
+            username: "u".into(),
+            password: Some("pw".into()),
+        };
+        let (s, id) = add(&Settings::default(), &d, &store);
+        d.id = Some(id.clone());
+        d.url = "https://g".into();
+        d.auth = AuthDraft::Basic {
+            username: "u".into(),
+            password: None,
+        };
+        assert!(apply_draft(&s, &d, &store).is_err());
+        assert_eq!(store.get(&account_for(&id)).unwrap().as_deref(), Some("pw"));
     }
 
     #[test]
