@@ -52,6 +52,9 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNError", "UNNotification", "UNNotificationAction", "UNNotificationAttachment", "UNNotificationCategory", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows = { version = "0.62.2", features = ["Data_Xml_Dom", "UI_Notifications", "Win32_Foundation", "Win32_Security", "Win32_System_Com", "Win32_System_Registry", "Win32_System_WinRT", "Win32_UI_Notifications", "Win32_UI_Shell"] }
+windows = { version = "0.62.2", features = ["Data_Xml_Dom", "UI_Notifications", "Win32_Foundation", "Win32_Security", "Win32_Storage_EnhancedStorage", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Registry", "Win32_System_Variant", "Win32_System_WinRT", "Win32_UI_Notifications", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem"] }
 windows-core = "0.62.2"
 windows-native-keyring-store = { version = "1.1.0", default-features = false }
+
+[build-dependencies]
+winresource = { version = "0.1.34", default-features = false }

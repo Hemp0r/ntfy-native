@@ -459,7 +459,7 @@ mod tests {
 
     #[test]
     fn platform_notifier_falls_back_outside_bundle() {
-        let n = super::super::platform_notifier(Arc::new(|_| {}));
+        let n = super::super::platform_notifier(Arc::new(|_| {}), Path::new("/nonexistent"));
         let shown = n.show(&Notification {
             id: "i".into(),
             thread: "t".into(),

@@ -10,6 +10,10 @@ pub struct Strings {
     pub tray_paused: &'static str,
     pub tray_not_configured: &'static str,
     pub menu_quit: &'static str,
+    pub menu_open_config: &'static str,
+    pub menu_open_logs: &'static str,
+    pub tray_config_invalid: &'static str,
+    pub import_failed_title: &'static str,
     pub import_while_running: &'static str,
 }
 
@@ -25,6 +29,10 @@ pub static DE: Strings = Strings {
     tray_paused: "Pausiert",
     tray_not_configured: "Nicht eingerichtet – {path} anlegen",
     menu_quit: "Beenden",
+    menu_open_config: "Konfigurationsordner öffnen",
+    menu_open_logs: "Logs öffnen",
+    tray_config_invalid: "Konfiguration fehlerhaft – siehe Logs",
+    import_failed_title: "Konfiguration konnte nicht gelesen werden",
     import_while_running: "ntfy-native läuft bereits – bitte beenden und --import {path} erneut ausführen",
 };
 
@@ -40,6 +48,10 @@ pub static EN: Strings = Strings {
     tray_paused: "Paused",
     tray_not_configured: "Not set up – create {path}",
     menu_quit: "Quit",
+    menu_open_config: "Open config folder",
+    menu_open_logs: "Open logs",
+    tray_config_invalid: "Configuration invalid – see logs",
+    import_failed_title: "Could not read the configuration",
     import_while_running: "ntfy-native is already running – quit it and run --import {path} again",
 };
 
@@ -72,6 +84,24 @@ mod tests {
         assert_eq!(strings_for("de").menu_quit, "Beenden");
         assert_eq!(strings_for("en-US").menu_quit, "Quit");
         assert_eq!(strings_for("fr").menu_quit, "Quit");
+    }
+
+    #[test]
+    fn folder_and_import_error_strings() {
+        assert_eq!(DE.menu_open_config, "Konfigurationsordner öffnen");
+        assert_eq!(EN.menu_open_config, "Open config folder");
+        assert_eq!(DE.menu_open_logs, "Logs öffnen");
+        assert_eq!(EN.menu_open_logs, "Open logs");
+        assert_eq!(
+            DE.tray_config_invalid,
+            "Konfiguration fehlerhaft – siehe Logs"
+        );
+        assert_eq!(EN.tray_config_invalid, "Configuration invalid – see logs");
+        assert_eq!(
+            DE.import_failed_title,
+            "Konfiguration konnte nicht gelesen werden"
+        );
+        assert_eq!(EN.import_failed_title, "Could not read the configuration");
     }
 
     #[test]

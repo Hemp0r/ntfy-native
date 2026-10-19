@@ -1,9 +1,13 @@
 //! Platform notifier selection and platform-neutral helpers.
 
+use std::path::Path;
 use std::sync::Arc;
+use std::{fs, io};
 
 use crate::notification::{ActivationSink, LogNotifier, Notifier};
 
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) mod shortcut;
 pub mod toast_xml;
 
 #[cfg(target_os = "macos")]
@@ -16,8 +20,9 @@ mod windows;
 pub use self::windows::{TOAST_ACTIVATOR_CLSID, WinNotifier};
 
 /// The native notifier for this platform, or a [`LogNotifier`] if there is
-/// none or it fails to initialise.
-pub fn platform_notifier(on_activate: ActivationSink) -> Arc<dyn Notifier> {
+/// none or it fails to initialise. On Windows the app icon for toasts is
+/// written to `data_dir`.
+pub fn platform_notifier(on_activate: ActivationSink, data_dir: &Path) -> Arc<dyn Notifier> {
     #[cfg(target_os = "macos")]
     match MacNotifier::new(on_activate) {
         Ok(n) => return Arc::new(n),
@@ -28,7 +33,13 @@ pub fn platform_notifier(on_activate: ActivationSink) -> Arc<dyn Notifier> {
     }
     #[cfg(windows)]
     match WinNotifier::new(on_activate) {
-        Ok(n) => return Arc::new(n),
+        Ok(n) => {
+            // Without it toasts show a generic icon.
+            if let Err(e) = self::windows::register_icon(data_dir) {
+                tracing::warn!(error = %format!("{e:#}"), "registering the toast icon failed");
+            }
+            return Arc::new(n);
+        }
         Err(e) => tracing::warn!(
             error = %format!("{e:#}"),
             "native notifications unavailable, logging notifications instead"
@@ -36,7 +47,29 @@ pub fn platform_notifier(on_activate: ActivationSink) -> Arc<dyn Notifier> {
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     drop(on_activate);
+    #[cfg(not(windows))]
+    let _ = data_dir;
     Arc::new(LogNotifier)
+}
+
+/// Writes `bytes` to `path` unless it already holds exactly them; returns
+/// whether it wrote. Goes through a temporary sibling, so readers never see
+/// a partial file.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn write_if_changed(path: &Path, bytes: &[u8]) -> io::Result<bool> {
+    if fs::read(path).is_ok_and(|old| old == bytes) {
+        return Ok(false);
+    }
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let written = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    written.map(|()| true)
 }
 
 /// Stable identifier for a notification category with the given button
@@ -71,6 +104,37 @@ mod tests {
         assert_ne!(a, category_id(&["Ack", "Open"]));
         assert!(a.starts_with("btn-"), "{a}");
         assert_eq!(a, "btn-76040e93b051ace0");
+    }
+
+    #[test]
+    fn write_if_changed_writes_only_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub").join("icon.png");
+        assert!(write_if_changed(&path, b"one").unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"one");
+        assert!(!write_if_changed(&path, b"one").unwrap());
+        assert!(write_if_changed(&path, b"two").unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"two");
+        let names: Vec<_> = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["icon.png"], "no temporary file left behind");
+    }
+
+    #[test]
+    fn write_if_changed_cleans_up_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory in the way makes the final rename fail.
+        let path = dir.path().join("icon.png");
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("keep"), "").unwrap();
+        assert!(write_if_changed(&path, b"one").is_err());
+        let names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["icon.png"], "temporary file removed");
     }
 
     #[test]

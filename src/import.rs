@@ -123,42 +123,44 @@ fn same_url(stored: &str, normalized: &str) -> bool {
     }
 }
 
+/// Errors name positions, never values (they may be secrets in the wrong
+/// field); the caller adds the instance number.
 fn convert_instance(raw: RawInstance) -> Result<ImportInstance> {
     let url = normalize_url(&raw.url)?;
     if raw.token.is_some() && (raw.username.is_some() || raw.password.is_some()) {
-        bail!("{url}: token and username/password are mutually exclusive");
+        bail!("token and username/password are mutually exclusive");
     }
     if raw.auth.is_some()
         && (raw.token.is_some() || raw.username.is_some() || raw.password.is_some())
     {
-        bail!("{url}: auth: none excludes token, username and password");
+        bail!("auth: none excludes token, username and password");
     }
     if raw.password.is_some() && raw.username.is_none() {
-        bail!("{url}: password requires a username");
+        bail!("password requires a username");
     }
     for (field, value) in [("token", &raw.token), ("password", &raw.password)] {
         if value.as_deref() == Some("") {
-            bail!("{url}: {field} must not be empty");
+            bail!("{field} must not be empty");
         }
     }
     if raw.username.as_deref() == Some("") {
-        bail!("{url}: username must not be empty");
+        bail!("username must not be empty");
     }
     let cache_duration_secs = match raw.cache_duration {
         None => None,
         Some(text) => {
             let d: Duration = humantime::parse_duration(&text)
-                .map_err(|e| anyhow!("{url}: invalid cache_duration {text:?}: {e}"))?;
-            let secs = i64::try_from(d.as_secs())
-                .map_err(|_| anyhow!("{url}: cache_duration {text:?} too large"))?;
+                .map_err(|_| anyhow!("invalid cache_duration (e.g. 12h, 72h)"))?;
+            let secs =
+                i64::try_from(d.as_secs()).map_err(|_| anyhow!("cache_duration too large"))?;
             if secs == 0 {
-                bail!("{url}: cache_duration must be positive");
+                bail!("cache_duration must be positive");
             }
             Some(secs)
         }
     };
     let mut topics: Vec<Topic> = Vec::new();
-    for t in raw.topics {
+    for (n, t) in (1..).zip(raw.topics) {
         let (name, urgent) = match t {
             RawTopic::Short(name) => (name, None),
             RawTopic::Long {
@@ -167,10 +169,10 @@ fn convert_instance(raw: RawInstance) -> Result<ImportInstance> {
             } => (name, urgent_breaks_dnd),
         };
         if !valid_topic_name(&name) {
-            bail!("{url}: invalid topic name {name:?} (allowed: -_A-Za-z0-9, 1-64 chars)");
+            bail!("topic {n}: invalid topic name (allowed: A-Z a-z 0-9 _ -, 1–64 chars)");
         }
         if topics.iter().any(|t| t.name == name) {
-            bail!("{url}: duplicate topic {name:?}");
+            bail!("topic {n}: duplicate topic name");
         }
         topics.push(Topic {
             name,
@@ -193,12 +195,72 @@ fn convert_instance(raw: RawInstance) -> Result<ImportInstance> {
     })
 }
 
+/// Makes a serde_yaml_ng error fit for users and notifications: counts
+/// instances from 1 (serde prints a 0-based path like `instances[1]: `) and
+/// drops quoted values, which may be secrets pasted into the wrong field.
+fn humanize_yaml_error(msg: &str) -> String {
+    let index = msg
+        .strip_prefix("instances[")
+        .and_then(|rest| rest.split_once(']'))
+        .and_then(|(n, rest)| Some((n.parse::<usize>().ok()?, rest)));
+    let msg = match index {
+        Some((n, rest)) => {
+            let rest = rest.strip_prefix('.').unwrap_or(rest);
+            format!(
+                "instance {}{}{rest}",
+                n + 1,
+                if rest.starts_with(':') { "" } else { ": " }
+            )
+        }
+        None => msg.to_owned(),
+    };
+    redact_values(&msg)
+}
+
+/// Removes the quoted value (`` `value` `` or `"value"`) from a serde
+/// message, keeping key names after "field " (missing/unknown/duplicate
+/// field). serde puts at most one value before the schema part
+/// (", expected …"), which starts at the *last* ", expected" because a value
+/// may contain that text; the value runs from the first quote to the last
+/// matching one before it, as backticks inside values are not escaped.
+fn redact_values(msg: &str) -> String {
+    let (head, tail) = msg.split_at(msg.rfind(", expected").unwrap_or(msg.len()));
+    let Some(start) = head.find(['`', '"']) else {
+        return msg.to_owned();
+    };
+    let delim = head[start..].chars().next().expect("found above");
+    let before = &head[..start];
+    let mut out = before.to_owned();
+    match head.rfind(delim).filter(|&end| end > start) {
+        Some(end) => {
+            if delim == '`' && before.ends_with("field ") {
+                out.push_str(&head[start..=end]);
+            } else {
+                out.truncate(out.trim_end().len());
+            }
+            let after = &head[end + 1..];
+            // Only a location like " at line 3 column 5" may follow.
+            if !after.contains(['`', '"']) {
+                out.push_str(after);
+            }
+        }
+        // Unterminated: drop the rest of the head.
+        None => out.truncate(out.trim_end().len()),
+    }
+    out.push_str(tail);
+    out
+}
+
+/// Errors are self-contained in their outermost message (shown in a
+/// notification) and never echo secrets.
 pub fn parse_import(yaml: &str) -> Result<ImportFile> {
-    let raw: RawFile = serde_yaml_ng::from_str(yaml).context("parsing config.yaml")?;
+    let raw: RawFile =
+        serde_yaml_ng::from_str(yaml).map_err(|e| anyhow!(humanize_yaml_error(&e.to_string())))?;
     let instances = raw
         .instances
         .into_iter()
-        .map(convert_instance)
+        .zip(1..)
+        .map(|(raw, n)| convert_instance(raw).map_err(|e| anyhow!("instance {n}: {e}")))
         .collect::<Result<Vec<_>>>()?;
     for (i, inst) in instances.iter().enumerate() {
         if instances[..i].iter().any(|o| o.url == inst.url) {
@@ -388,6 +450,17 @@ pub fn sanitized_yaml(file: &ImportFile) -> String {
     format!("{SANITIZED_HEADER}{yaml}")
 }
 
+/// Notepad and PowerShell may save UTF-16; YAML must be UTF-8 here.
+fn decode_utf8(bytes: Vec<u8>) -> std::result::Result<String, &'static str> {
+    // ASCII text in UTF-16 without a byte order mark is valid UTF-8 with NULs.
+    let utf16 =
+        bytes.starts_with(&[0xFF, 0xFE]) || bytes.starts_with(&[0xFE, 0xFF]) || bytes.contains(&0);
+    if utf16 {
+        return Err("must be saved as UTF-8 (UTF-16 detected?)");
+    }
+    String::from_utf8(bytes).map_err(|_| "must be saved as UTF-8")
+}
+
 const SANITIZED_NAME: &str = "config.imported.yaml";
 
 pub fn import_file(
@@ -396,7 +469,8 @@ pub fn import_file(
     secrets: &dyn SecretStore,
     settings_path: &Path,
 ) -> Result<Settings> {
-    let yaml = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let bytes = fs::read(path).map_err(|e| anyhow!("cannot read {}: {e}", path.display()))?;
+    let yaml = decode_utf8(bytes).map_err(|e| anyhow!("{} {e}", path.display()))?;
     let file = parse_import(&yaml)?;
     let settings = apply_import(existing, &file, secrets)?;
     save_json(settings_path, &settings)?;
@@ -465,8 +539,32 @@ instances:
 
     #[test]
     fn rejects_invalid_topic_name() {
-        let err = parse_import(&one("https://x.org", &["\"bad topic\""])).unwrap_err();
-        assert!(err.to_string().contains("bad topic"), "{err}");
+        let y = one("https://x.org", &["ok", "\"bad topic\""]);
+        let err = parse_import(&y).unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "instance 1: topic 2: invalid topic name (allowed: A-Z a-z 0-9 _ -, 1–64 chars)"
+        );
+    }
+
+    #[test]
+    fn value_errors_name_the_position() {
+        let y = "instances:\n  - url: https://a.org\n  - url: https://b.org\n    cache_duration: soon\n";
+        assert_eq!(
+            parse_import(y).unwrap_err().to_string(),
+            "instance 2: invalid cache_duration (e.g. 12h, 72h)"
+        );
+        let y = one("https://x.org", &["a", "b", "a"]);
+        assert_eq!(
+            parse_import(&y).unwrap_err().to_string(),
+            "instance 1: topic 3: duplicate topic name"
+        );
+        let y =
+            "instances:\n  - url: https://x.org\n    token: a\n    username: u\n    password: p\n";
+        assert_eq!(
+            parse_import(y).unwrap_err().to_string(),
+            "instance 1: token and username/password are mutually exclusive"
+        );
     }
 
     #[test]
@@ -788,6 +886,181 @@ instances:
     fn rejects_empty_token() {
         let y = "instances:\n  - url: https://x.org\n    token: \"\"\n";
         assert!(parse_import(y).is_err());
+    }
+
+    #[test]
+    fn missing_url_names_field_and_instance() {
+        let y = "instances:\n  - url: https://a.org\n  - topics: [a]\n";
+        // The outermost message is shown in a notification, so it must
+        // name the problem on its own.
+        let err = parse_import(y).unwrap_err().to_string();
+        assert!(err.contains("instance 2"), "{err}");
+        assert!(err.contains("missing field `url`"), "{err}");
+    }
+
+    #[test]
+    fn yaml_error_paths_count_from_one() {
+        assert_eq!(
+            humanize_yaml_error("instances[0].password: invalid type: sequence"),
+            "instance 1: password: invalid type: sequence"
+        );
+        assert_eq!(
+            humanize_yaml_error("instances[9]: missing field `url` at line 4"),
+            "instance 10: missing field `url` at line 4"
+        );
+        assert_eq!(
+            humanize_yaml_error("urgent_breaks_dnd: invalid type"),
+            "urgent_breaks_dnd: invalid type"
+        );
+    }
+
+    #[test]
+    fn parse_errors_never_echo_secrets() {
+        let cases = [
+            // Errors elsewhere in a file holding a token or password.
+            "instances:\n  - url: https://a.org\n    token: tk_s3cret\n    topcs: [a]\n",
+            "instances:\n  - url: https://a.org\n    token: tk_s3cret\n  - topics: [a]\n",
+            "urgent_breaks_dnd: maybe\ninstances:\n  - url: https://a.org\n    token: tk_s3cret\n",
+            "instances:\n  - url: https://a.org\n    token: tk_s3cret\n    topics: [\"bad topic\"]\n",
+            "instances:\n  - url: https://a.org\n    username: u\n    password: tk_s3cret\n    cache_duration: soon\n",
+            "instances:\n  - url: https://a.org\n    token: tk_s3cret\n    topics: [a\n",
+            // A secret of the wrong type.
+            "instances:\n  - url: https://a.org\n    username: u\n    password: [tk_s3cret]\n",
+            // A secret pasted into the wrong field: serde quotes the value.
+            "instances:\n  - url: https://a.org\n    auth: tk_s3cret\n",
+            "instances:\n  - url: https://a.org\n    auth: Bearer tk_s3cret\n",
+            "instances:\n  - url: https://a.org\n    topics: tk_s3cret\n",
+            "urgent_breaks_dnd: tk_s3cret\n",
+            "urgent_breaks_dnd: 4711s3cret0815\n",
+            "instances: tk_s3cret\n",
+            "instances:\n  - tk_s3cret\n",
+            "instances:\n  - url: https://a.org\n    topics:\n      - name: a\n        urgent_breaks_dnd: tk_s3cret\n",
+            // Backticks and quotes inside values are not escaped by serde.
+            "instances:\n  - url: https://a.org\n    auth: \"tk_`s3cret\"\n",
+            "instances:\n  - url: https://a.org\n    auth: \"a`, b s3cret\"\n",
+            "instances:\n  - url: https://a.org\n    auth: \"x`, expected `none` s3cret\"\n",
+            "instances:\n  - url: https://a.org\n    auth: \"s3cret`\"\n",
+            "instances:\n  - url: https://a.org\n    auth: \"`s3cret`\"\n",
+            "urgent_breaks_dnd: \"a\\\"`s3cret\"\n",
+            "urgent_breaks_dnd: \"x\\\", expected s3cret\"\n",
+            // Values our own validation rejects.
+            "instances:\n  - url: https://a.org\n    cache_duration: s3cret\n",
+            "instances:\n  - url: https://a.org\n    cache_duration: 12 s3cret\n",
+            "instances:\n  - url: https://a.org\n    topics: [\"bad s3cret\"]\n",
+            "instances:\n  - url: https://a.org\n    topics: [s3cret, s3cret]\n",
+        ];
+        for y in cases {
+            let err = format!("{:#}", parse_import(y).unwrap_err());
+            assert!(!err.contains("s3cret"), "{y}\n=> {err}");
+        }
+    }
+
+    #[test]
+    fn yaml_errors_drop_quoted_values_but_keep_keys() {
+        let cases = [
+            (
+                "instances[0].auth: unknown variant `tk_x`, expected `none` at line 3 column 11",
+                "instance 1: auth: unknown variant, expected `none` at line 3 column 11",
+            ),
+            (
+                "instances[0].topics: invalid type: string \"tk \\\"x\\\" y\", expected a sequence",
+                "instance 1: topics: invalid type: string, expected a sequence",
+            ),
+            (
+                "urgent_breaks_dnd: invalid value: integer `4711`, expected a boolean",
+                "urgent_breaks_dnd: invalid value: integer, expected a boolean",
+            ),
+            (
+                "instances[1]: unknown field `topcs`, expected one of `url`, `topics`",
+                "instance 2: unknown field `topcs`, expected one of `url`, `topics`",
+            ),
+            (
+                "instances[0]: missing field `url` at line 2 column 5",
+                "instance 1: missing field `url` at line 2 column 5",
+            ),
+            (
+                "duplicate field `url` at line 3",
+                "duplicate field `url` at line 3",
+            ),
+            // "expected" inside a value does not end the redaction.
+            (
+                "unknown variant `expected tk_x`, expected `none`",
+                "unknown variant, expected `none`",
+            ),
+            // Backticks inside a value are not escaped by serde.
+            (
+                "unknown variant `tk_`x`, expected `none` at line 3 column 11",
+                "unknown variant, expected `none` at line 3 column 11",
+            ),
+            (
+                "unknown variant `a`, b tk_x`, expected `none`",
+                "unknown variant, expected `none`",
+            ),
+            (
+                "unknown variant `x`, expected `none` tk_x`, expected `none`",
+                "unknown variant, expected `none`",
+            ),
+            // An unterminated quote drops the rest.
+            ("invalid type: string \"tk_x", "invalid type: string"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(humanize_yaml_error(raw), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn utf16_file_asks_for_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        let settings_path = dir.path().join("settings.json");
+        for bom in [[0xFF, 0xFE], [0xFE, 0xFF]] {
+            let mut bytes = bom.to_vec();
+            for u in one("https://x.org", &["a"]).encode_utf16() {
+                bytes.extend(if bom[0] == 0xFF {
+                    u.to_le_bytes()
+                } else {
+                    u.to_be_bytes()
+                });
+            }
+            fs::write(&cfg, bytes).unwrap();
+            let err = import_file(&cfg, None, &MemoryStore::new(), &settings_path)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("must be saved as UTF-8"), "{err}");
+            assert!(err.contains("UTF-16"), "{err}");
+            assert!(cfg.exists());
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_asks_for_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        fs::write(&cfg, b"instances: [\xE4]\n").unwrap();
+        let err = import_file(&cfg, None, &MemoryStore::new(), &dir.path().join("s.json"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be saved as UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn utf8_bom_is_accepted() {
+        let y = format!("\u{feff}{}", one("https://x.org", &["a"]));
+        assert_eq!(parse_import(&y).unwrap().instances.len(), 1);
+    }
+
+    #[test]
+    fn unreadable_file_error_names_path_and_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.yaml");
+        let err = import_file(&cfg, None, &MemoryStore::new(), &dir.path().join("s.json"))
+            .unwrap_err()
+            .to_string();
+        let prefix = format!("cannot read {}: ", cfg.display());
+        assert!(
+            err.len() > prefix.len() && err.starts_with(&prefix),
+            "{err}"
+        );
     }
 
     #[test]

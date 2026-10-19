@@ -1,5 +1,6 @@
 //! Executes notification actions: opening URLs and sending HTTP requests.
 
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -22,6 +23,14 @@ impl UrlOpener for SystemOpener {
         let parsed = openable_url(url)?;
         open::that_detached(parsed.as_str()).context("failed to open URL")
     }
+}
+
+/// Opens a directory chosen by the app itself (never a path or URL from a
+/// message, so [`is_openable`] does not apply) in the system file manager,
+/// creating it first.
+pub fn open_local_dir(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    open::that_detached(dir).with_context(|| format!("opening {}", dir.display()))
 }
 
 #[derive(Default)]
