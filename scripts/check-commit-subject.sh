@@ -10,8 +10,15 @@ here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 source "$here/commits-lib.sh"
 
 types=" feat fix docs ci test refactor perf build style chore revert "
-parse_subject "${1-}"
-if [[ -n "$CC_TYPE" && "$types" == *" $CC_TYPE "* ]]; then
+title=${1-}
+# GitHub's default title for reverting a PR: Revert "<subject>".
+revert_re='^Revert "(.+)"$'
+if [[ "$title" =~ $revert_re ]]; then
+  title=${BASH_REMATCH[1]}
+fi
+parse_subject "$title"
+desc_blank_re='^[[:space:]]*$'
+if [[ -n "$CC_TYPE" && "$types" == *" $CC_TYPE "* && ! "$CC_DESC" =~ $desc_blank_re ]]; then
   exit 0
 fi
 

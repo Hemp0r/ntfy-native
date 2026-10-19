@@ -83,5 +83,9 @@ report subject_check_untyped "$(subject 'added stuff')" fail
 report subject_check_no_space "$(subject 'feat:x')" fail
 report subject_check_unknown_type "$(subject 'wip: x')" fail
 report subject_check_empty "$(subject '')" fail
+report subject_check_revert_title "$(subject 'Revert "feat(ui): x"')" ok
+report subject_check_revert_nonconforming "$(subject 'Revert "added stuff"')" fail
+report subject_check_blank_description "$(subject 'feat:   ')" fail
+report subject_check_blank_description_scoped "$(subject 'fix(ui):  ')" fail
 
 exit "$fail"
