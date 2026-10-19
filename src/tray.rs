@@ -1,16 +1,63 @@
-//! Tray icon with a status line, folder shortcuts and a quit entry.
+//! Tray icon: left click toggles the popover, the right-click menu has a
+//! status line, setup/settings, folder shortcuts and a quit entry.
+
+use std::cell::Cell;
 
 use anyhow::Context;
 use tray_icon::menu::{Menu, MenuId, MenuItem, PredefinedMenuItem};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
+use crate::cli::{UiArgs, UiMode};
 use crate::i18n::{Strings, fill};
 use crate::icons::{IconKind, rgba};
 use crate::status::TrayState;
+use crate::ui::layout::AnchorRect;
 
 pub const QUIT_ID: &str = "quit";
 pub const OPEN_CONFIG_ID: &str = "open-config";
 pub const OPEN_LOGS_ID: &str = "open-logs";
+pub const SETTINGS_ID: &str = "settings";
+pub const SETUP_ID: &str = "setup";
+
+/// Menu position of the setup entry (below the status line).
+const SETUP_POSITION: usize = 1;
+
+/// A monitor in physical pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MonitorRect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+    pub scale: f64,
+}
+
+impl MonitorRect {
+    fn contains(&self, x: f64, y: f64) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+}
+
+/// Popover at the tray icon (physical pixels) on the monitor under its
+/// centre, else on the first (primary) monitor.
+pub fn popover_args(icon: AnchorRect, monitors: &[MonitorRect]) -> UiArgs {
+    let (cx, cy) = (icon.x + icon.w / 2.0, icon.y + icon.h / 2.0);
+    let monitor = monitors
+        .iter()
+        .find(|m| m.contains(cx, cy))
+        .or(monitors.first());
+    UiArgs {
+        anchor: Some(icon),
+        monitor: monitor.map(|m| (m.x, m.y, m.w, m.h)),
+        scale: monitor.map(|m| m.scale as f32),
+        ..UiArgs::window(UiMode::Popover)
+    }
+}
+
+/// "Set up …" is offered until something is set up.
+pub fn shows_setup(state: &TrayState) -> bool {
+    *state == TrayState::NotConfigured
+}
 
 /// macOS tints template images for light and dark menu bars.
 const TEMPLATE: bool = cfg!(target_os = "macos");
@@ -52,7 +99,10 @@ fn icon(kind: IconKind) -> anyhow::Result<Icon> {
 
 pub struct Tray {
     tray_icon: TrayIcon,
+    menu: Menu,
     status: MenuItem,
+    setup: MenuItem,
+    setup_shown: Cell<bool>,
     strings: &'static Strings,
     config_path: String,
     import_failed: bool,
@@ -69,12 +119,16 @@ impl Tray {
         let text = status_text(state, strings, &config_path, import_failed);
         let status = MenuItem::new(&text, false, None);
         let item = |id: &str, label: &str| MenuItem::with_id(MenuId::new(id), label, true, None);
+        let setup = item(SETUP_ID, strings.menu_setup);
+        let settings = item(SETTINGS_ID, strings.menu_settings);
         let open_config = item(OPEN_CONFIG_ID, strings.menu_open_config);
         let open_logs = item(OPEN_LOGS_ID, strings.menu_open_logs);
         let quit = item(QUIT_ID, strings.menu_quit);
         let menu = Menu::new();
         menu.append_items(&[
             &status,
+            &settings,
+            &PredefinedMenuItem::separator(),
             &open_config,
             &open_logs,
             &PredefinedMenuItem::separator(),
@@ -82,24 +136,46 @@ impl Tray {
         ])
         .context("building tray menu")?;
         let tray_icon = TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
+            .with_menu(Box::new(menu.clone()))
+            .with_menu_on_left_click(false)
             .with_icon(icon(icon_kind(state))?)
             .with_icon_as_template(TEMPLATE)
             .with_tooltip(&text)
             .build()
             .context("creating tray icon")?;
-        Ok(Tray {
+        let tray = Tray {
             tray_icon,
+            menu,
             status,
+            setup,
+            setup_shown: Cell::new(false),
             strings,
             config_path,
             import_failed,
-        })
+        };
+        tray.show_setup(shows_setup(state));
+        Ok(tray)
+    }
+
+    fn show_setup(&self, show: bool) {
+        if show == self.setup_shown.get() {
+            return;
+        }
+        let result = if show {
+            self.menu.insert(&self.setup, SETUP_POSITION)
+        } else {
+            self.menu.remove(&self.setup)
+        };
+        match result {
+            Ok(()) => self.setup_shown.set(show),
+            Err(e) => tracing::warn!(error = %e, "updating the setup menu entry failed"),
+        }
     }
 
     pub fn update(&self, state: &TrayState) {
         let text = status_text(state, self.strings, &self.config_path, self.import_failed);
         self.status.set_text(&text);
+        self.show_setup(shows_setup(state));
         if let Err(e) = self.tray_icon.set_tooltip(Some(&text)) {
             tracing::warn!(error = %e, "updating tray tooltip failed");
         }
@@ -160,6 +236,62 @@ mod tests {
             status_text(&TrayState::NotConfigured, &EN, path, false),
             "Not set up – create /cfg/config.yaml"
         );
+    }
+
+    fn icon_at(x: f64, y: f64) -> AnchorRect {
+        AnchorRect {
+            x,
+            y,
+            w: 44.0,
+            h: 44.0,
+        }
+    }
+
+    const LEFT: MonitorRect = MonitorRect {
+        x: -1920.0,
+        y: 0.0,
+        w: 1920.0,
+        h: 1080.0,
+        scale: 1.0,
+    };
+    const MAIN: MonitorRect = MonitorRect {
+        x: 0.0,
+        y: 0.0,
+        w: 2880.0,
+        h: 1800.0,
+        scale: 2.0,
+    };
+
+    #[test]
+    fn popover_args_use_the_monitor_under_the_icon() {
+        let a = popover_args(icon_at(2400.0, 0.0), &[LEFT, MAIN]);
+        assert_eq!(a.mode, UiMode::Popover);
+        assert_eq!(a.anchor, Some(icon_at(2400.0, 0.0)));
+        assert_eq!(a.monitor, Some((0.0, 0.0, 2880.0, 1800.0)));
+        assert_eq!(a.scale, Some(2.0));
+        assert!(!a.probe_ignore_close);
+
+        let a = popover_args(icon_at(-100.0, 1036.0), &[MAIN, LEFT]);
+        assert_eq!(a.monitor, Some((-1920.0, 0.0, 1920.0, 1080.0)));
+        assert_eq!(a.scale, Some(1.0));
+    }
+
+    #[test]
+    fn popover_args_fall_back_to_the_first_monitor() {
+        let a = popover_args(icon_at(9000.0, 9000.0), &[MAIN, LEFT]);
+        assert_eq!(a.monitor, Some((0.0, 0.0, 2880.0, 1800.0)));
+        // Without monitors the popover is centred.
+        let a = popover_args(icon_at(0.0, 0.0), &[]);
+        assert_eq!((a.monitor, a.scale), (None, None));
+        assert!(a.anchor.is_some());
+    }
+
+    #[test]
+    fn setup_entry_only_while_not_configured() {
+        assert!(shows_setup(&TrayState::NotConfigured));
+        for s in [TrayState::Ok, TrayState::Paused, problem(), auth_failed()] {
+            assert!(!shows_setup(&s), "{s:?}");
+        }
     }
 
     #[test]

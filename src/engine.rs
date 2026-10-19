@@ -1,7 +1,7 @@
 //! The engine: runs all connections, dispatches their messages to the
 //! notifier, executes actions and persists settings and state.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
@@ -14,23 +14,30 @@ use tokio_util::sync::CancellationToken;
 
 use crate::actions::{self, UrlOpener};
 use crate::connection::{ConnControl, ConnEvent, ConnStatus, ConnectionConfig, spawn_connection};
+use crate::conntest::test_connection;
 use crate::dispatcher::Dispatcher;
 use crate::i18n::{Strings, fill};
+use crate::instance_edit::{AuthDraft, InstanceDraft, apply_draft, remove_instance};
+use crate::ipc::{CoreMsg, TestOutcome, UiRequest};
 use crate::media::MediaFetcher;
 use crate::notification::{ActivationPayload, Level, MediaRef, Notification, Notifier};
-use crate::ntfy::client::http_client;
+use crate::ntfy::client::{NetworkKind, http_client};
 use crate::paths::AppPaths;
 use crate::secrets::{Auth, SecretStore, resolve_auth};
-use crate::settings::Settings;
+use crate::settings::{Instance, Settings};
+use crate::snapshot::{UiSnapshot, build_snapshot};
 use crate::state::{InstanceState, State};
 use crate::status::{TrayState, aggregate};
 use crate::store::save_json;
 use crate::triggers::{spawn_network_watcher, spawn_wake_detector};
+use crate::validate::{same_origin, same_url};
 
 const TICK: Duration = Duration::from_secs(5);
 const MEDIA_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 const MEDIA_CLEANUP_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const STATE_VERSION: u32 = 1;
+/// Upper bound for a whole connection test.
+const TEST_DEADLINE: Duration = Duration::from_secs(15);
 /// On quit, pending notifications are shown without media within this time.
 const FLUSH_DEADLINE: Duration = Duration::from_secs(2);
 
@@ -44,6 +51,10 @@ pub enum Command {
         topic: String,
         muted: bool,
     },
+    /// Request from the UI process.
+    Ui(UiRequest),
+    /// Sends the current snapshot even if unchanged (a UI just connected).
+    ResendSnapshot,
     Quit,
 }
 
@@ -55,8 +66,12 @@ pub struct EngineDeps {
     pub notifier: Arc<dyn Notifier>,
     pub opener: Arc<dyn UrlOpener>,
     pub strings: &'static Strings,
+    /// Called on the engine thread; must not block (enqueue onto a channel).
     pub on_tray: Box<dyn Fn(TrayState) + Send>,
     pub on_exit: Box<dyn FnOnce() + Send>,
+    /// Snapshots and test/save results for the UI process. Called on the
+    /// engine thread; must not block (enqueue onto a channel).
+    pub on_ui: Box<dyn Fn(CoreMsg) + Send>,
     /// Adjusts each connection's config; production: `|_| {}`.
     pub tune: fn(&mut ConnectionConfig),
     /// Wake/network reconnect triggers and Ctrl-C/SIGTERM handling.
@@ -101,6 +116,11 @@ pub async fn run_engine(
     tx: mpsc::UnboundedSender<Command>,
     mut rx: mpsc::UnboundedReceiver<Command>,
 ) -> anyhow::Result<()> {
+    // `stop_connection` relies on a single-threaded runtime.
+    debug_assert_eq!(
+        tokio::runtime::Handle::current().runtime_flavor(),
+        tokio::runtime::RuntimeFlavor::CurrentThread
+    );
     let EngineDeps {
         paths,
         settings,
@@ -111,6 +131,7 @@ pub async fn run_engine(
         strings,
         on_tray,
         on_exit,
+        on_ui,
         tune,
         enable_triggers,
     } = deps;
@@ -118,7 +139,8 @@ pub async fn run_engine(
     let http = http_client();
     let media = Arc::new(MediaFetcher::new(http.clone(), paths.media_dir()));
 
-    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+    let (ev_tx, ev_rx) = mpsc::unbounded_channel();
+    let (test_tx, test_results) = mpsc::unbounded_channel();
     let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
     let stop_media = CancellationToken::new();
     let mut worker = tokio::spawn(delivery_worker(
@@ -146,8 +168,17 @@ pub async fn run_engine(
         opener,
         strings,
         on_tray,
+        on_ui,
+        snapshot: None,
+        secrets,
+        tune,
+        events_tx: ev_tx,
+        events: ev_rx,
+        test_tx,
+        test_results,
+        test_task: None,
     };
-    engine.start_connections(secrets.as_ref(), tune, &ev_tx);
+    engine.start_connections();
 
     let mut triggers = Vec::new();
     if enable_triggers {
@@ -176,7 +207,10 @@ pub async fn run_engine(
         // worker), so a command waits at most for the events already queued.
         tokio::select! {
             biased;
-            Some((id, ev)) = ev_rx.recv() => engine.on_conn_event(&id, ev),
+            Some((id, ev)) = engine.events.recv() => engine.on_conn_event(&id, ev),
+            Some((request_id, outcome)) = engine.test_results.recv() => {
+                (engine.on_ui)(CoreMsg::TestResult { request_id, outcome });
+            }
             cmd = rx.recv() => {
                 if engine.on_command(cmd).is_break() {
                     break;
@@ -300,6 +334,9 @@ struct Engine {
     opener: Arc<dyn UrlOpener>,
     strings: &'static Strings,
     on_tray: Box<dyn Fn(TrayState) + Send>,
+    on_ui: Box<dyn Fn(CoreMsg) + Send>,
+    /// Last snapshot sent to the UI.
+    snapshot: Option<UiSnapshot>,
     dispatcher: Dispatcher,
     /// Last successfully written `settings.json` content.
     saved_settings: Settings,
@@ -312,49 +349,193 @@ struct Engine {
     state_save: SaveHealth,
     media: Arc<MediaFetcher>,
     media_cleanup: Periodic,
+    secrets: Arc<dyn SecretStore>,
+    tune: fn(&mut ConnectionConfig),
+    events_tx: mpsc::UnboundedSender<(String, ConnEvent)>,
+    events: mpsc::UnboundedReceiver<(String, ConnEvent)>,
+    /// Outcomes of connection tests running in their own tasks.
+    test_tx: mpsc::UnboundedSender<(u64, TestOutcome)>,
+    test_results: mpsc::UnboundedReceiver<(u64, TestOutcome)>,
+    /// The running connection test; a new request replaces it.
+    test_task: Option<tokio::task::AbortHandle>,
 }
 
 impl Engine {
-    fn start_connections(
-        &mut self,
-        secrets: &dyn SecretStore,
-        tune: fn(&mut ConnectionConfig),
-        tx: &mpsc::UnboundedSender<(String, ConnEvent)>,
-    ) {
-        let now = unix_now();
-        for inst in &self.dispatcher.settings.instances {
-            if inst.topics.is_empty() {
-                continue;
-            }
-            let auth = match resolve_auth(secrets, inst) {
-                Ok(auth) => auth,
-                Err(e) => {
-                    tracing::error!(instance = %inst.id, error = %format!("{e:#}"), "cannot load credentials");
-                    self.statuses
-                        .insert(inst.id.clone(), (ConnStatus::AuthFailed, now));
-                    continue;
-                }
-            };
-            let mut cfg = ConnectionConfig::production(inst, auth.clone());
-            tune(&mut cfg);
-            let ctl = ConnControl::default();
-            let state = self.instances.get(&inst.id).cloned().unwrap_or_default();
-            let task = spawn_connection(cfg, state, self.http.clone(), tx.clone(), ctl.clone());
-            self.connections.insert(
-                inst.id.clone(),
-                Running {
-                    ctl,
-                    base_url: inst.url.clone(),
-                    auth,
-                    task: Some(task),
-                },
-            );
+    fn start_connections(&mut self) {
+        let instances = self.dispatcher.settings.instances.clone();
+        for inst in &instances {
+            self.start_connection(inst);
         }
     }
 
+    /// Starts the connection with the stored `InstanceState` (default if none).
+    fn start_connection(&mut self, inst: &Instance) {
+        if inst.topics.is_empty() {
+            return;
+        }
+        let auth = match resolve_auth(self.secrets.as_ref(), inst) {
+            Ok(auth) => auth,
+            Err(e) => {
+                tracing::error!(instance = %inst.id, error = %format!("{e:#}"), "cannot load credentials");
+                self.statuses
+                    .insert(inst.id.clone(), (ConnStatus::AuthFailed, unix_now()));
+                return;
+            }
+        };
+        let mut cfg = ConnectionConfig::production(inst, auth.clone());
+        (self.tune)(&mut cfg);
+        let ctl = ConnControl::default();
+        let state = self.instances.get(&inst.id).cloned().unwrap_or_default();
+        let task = spawn_connection(
+            cfg,
+            state,
+            self.http.clone(),
+            self.events_tx.clone(),
+            ctl.clone(),
+        );
+        self.connections.insert(
+            inst.id.clone(),
+            Running {
+                ctl,
+                base_url: inst.url.clone(),
+                auth,
+                task: Some(task),
+            },
+        );
+    }
+
+    /// Cancels the instance's connection and applies the events it already
+    /// queued (all instances'), so its `InstanceState` is current and no
+    /// stale event follows.
+    /// Relies on the current-thread runtime: a cancelled connection task
+    /// cannot run before it is next polled, and then stops at its first
+    /// await without emitting anything.
+    fn stop_connection(&mut self, id: &str) {
+        if let Some(r) = self.connections.get(id) {
+            r.ctl.cancel.cancel();
+        }
+        while let Ok((ev_id, ev)) = self.events.try_recv() {
+            self.on_conn_event(&ev_id, ev);
+        }
+        self.connections.remove(id);
+        self.statuses.remove(id);
+    }
+
+    fn save_instance(&mut self, draft: &InstanceDraft) -> Result<String, String> {
+        let (settings, id, secret_change) =
+            match apply_draft(&self.dispatcher.settings, draft, self.secrets.as_ref()) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %format!("{e:#}"), "instance not saved");
+                    return Err(e.to_string());
+                }
+            };
+        let old = self.dispatcher.settings.instance(&id).cloned();
+        let previous = std::mem::replace(&mut self.dispatcher.settings, settings);
+        if self.write_settings().is_err() {
+            // The secret store may already hold a newly entered secret for an
+            // instance that is not saved: accepted, the next successful save
+            // or entering it again fixes it.
+            tracing::error!(instance = %id, "instance not saved: settings.json could not be written");
+            self.dispatcher.settings = previous;
+            return Err("settings could not be saved".into());
+        }
+        if let Err(e) = secret_change.commit(self.secrets.as_ref()) {
+            tracing::warn!(instance = %id, error = %format!("{e:#}"), "stale secret not deleted");
+        }
+        let new = self
+            .dispatcher
+            .settings
+            .instance(&id)
+            .cloned()
+            .expect("apply_draft returns the id of an instance it contains");
+        let secret_entered = matches!(
+            draft.auth,
+            AuthDraft::Token { token: Some(_) }
+                | AuthDraft::Basic {
+                    password: Some(_),
+                    ..
+                }
+        );
+        self.reconcile(old.as_ref(), &new, secret_entered);
+        tracing::info!(instance = %id, "instance saved");
+        Ok(id)
+    }
+
+    /// Restarts the connection if anything it uses changed (or none runs).
+    /// The `InstanceState` survives unless the server changed.
+    fn reconcile(&mut self, old: Option<&Instance>, new: &Instance, secret_entered: bool) {
+        let same_server = old.is_some_and(|o| same_url(&o.url, &new.url));
+        let unchanged = same_server
+            && old.is_some_and(|o| {
+                o.auth == new.auth
+                    && o.cache_duration_secs == new.cache_duration_secs
+                    && topic_names(o) == topic_names(new)
+            })
+            && !secret_entered;
+        let running = self
+            .connections
+            .get(&new.id)
+            .is_some_and(|r| r.task.is_some());
+        let gaps = self.dispatcher.gaps.len();
+        self.dispatcher
+            .gaps
+            .retain(|g| g.instance_id != new.id || new.topics.iter().any(|t| t.name == g.topic));
+        self.state_dirty |= self.dispatcher.gaps.len() != gaps;
+        if unchanged && running {
+            return;
+        }
+        self.stop_connection(&new.id);
+        if !same_server {
+            self.instances.remove(&new.id);
+            self.dispatcher.gaps.retain(|g| g.instance_id != new.id);
+        }
+        self.state_dirty = true;
+        self.start_connection(new);
+    }
+
+    fn remove_instance(&mut self, id: &str) {
+        let (settings, secret_change) = match remove_instance(&self.dispatcher.settings, id) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(instance = %id, error = %format!("{e:#}"), "instance not removed");
+                return;
+            }
+        };
+        let previous = std::mem::replace(&mut self.dispatcher.settings, settings);
+        if self.write_settings().is_err() {
+            tracing::error!(instance = %id, "instance not removed: settings.json could not be written");
+            self.dispatcher.settings = previous;
+            return;
+        }
+        if let Err(e) = secret_change.commit(self.secrets.as_ref()) {
+            tracing::warn!(instance = %id, error = %format!("{e:#}"), "stale secret not deleted");
+        }
+        self.stop_connection(id);
+        self.instances.remove(id);
+        self.dispatcher.gaps.retain(|g| g.instance_id != id);
+        self.dispatcher.recent.retain(|m| m.instance_id != id);
+        self.state_dirty = true;
+        tracing::info!(instance = %id, "instance removed");
+    }
+
+    /// Writes `settings.json` from the current settings.
+    fn write_settings(&mut self) -> anyhow::Result<()> {
+        let result = save_json(&self.paths.settings_file(), &self.dispatcher.settings);
+        if result.is_ok() {
+            self.saved_settings = self.dispatcher.settings.clone();
+        }
+        self.settings_save.record("settings", &result);
+        result
+    }
+
     /// Notifications are queued before the connection's following `State`
-    /// event is applied.
+    /// event is applied. Events still queued from a removed instance are
+    /// dropped.
     fn on_conn_event(&mut self, id: &str, ev: ConnEvent) {
+        if self.dispatcher.settings.instance(id).is_none() {
+            return;
+        }
         let now = unix_now();
         match ev {
             ConnEvent::Status(status) => track_status(&mut self.statuses, id, status, now),
@@ -411,8 +592,151 @@ impl Engine {
             }) => {
                 self.dispatcher.set_topic_muted(&instance_id, &topic, muted);
             }
+            Some(Command::Ui(req)) => self.on_ui_request(req),
+            Some(Command::ResendSnapshot) => {
+                let snap = self.build_snapshot(unix_now());
+                (self.on_ui)(CoreMsg::Snapshot(snap.clone()));
+                self.snapshot = Some(snap);
+            }
         }
         ControlFlow::Continue(())
+    }
+
+    fn on_ui_request(&mut self, req: UiRequest) {
+        match req {
+            UiRequest::PauseAll { until } => self.dispatcher.pause_all(until),
+            UiRequest::SetTopicMuted {
+                instance_id,
+                topic,
+                muted,
+            } => {
+                self.dispatcher.set_topic_muted(&instance_id, &topic, muted);
+            }
+            UiRequest::SetTopicUrgent {
+                instance_id,
+                topic,
+                urgent,
+            } => {
+                self.dispatcher
+                    .set_topic_urgent(&instance_id, &topic, urgent);
+            }
+            UiRequest::SetUrgentGlobal { enabled } => {
+                self.dispatcher.set_urgent_global(enabled);
+            }
+            UiRequest::DismissGap { instance_id, topic } => {
+                if self.dispatcher.dismiss_gap(&instance_id, &topic) {
+                    self.state_dirty = true;
+                }
+            }
+            UiRequest::OpenRecent {
+                instance_id,
+                message_id,
+            } => {
+                let click = self
+                    .dispatcher
+                    .recent
+                    .iter()
+                    .find(|m| m.instance_id == instance_id && m.id == message_id)
+                    .and_then(|m| m.click.clone());
+                match click {
+                    Some(url) if actions::is_openable(&url) => {
+                        self.spawn_action(ActivationPayload::Open { url });
+                    }
+                    _ => tracing::debug!("recent message has no openable click URL"),
+                }
+            }
+            UiRequest::SendTestNotification => self.enqueue_test_notification(),
+            UiRequest::SaveInstance { request_id, draft } => {
+                let result = self.save_instance(&draft);
+                (self.on_ui)(CoreMsg::SaveResult { request_id, result });
+            }
+            UiRequest::RemoveInstance { instance_id } => self.remove_instance(&instance_id),
+            UiRequest::TestConnection { request_id, draft } => {
+                self.spawn_connection_test(request_id, draft);
+            }
+            other => tracing::debug!(request = ?other, "UI request not handled by the engine"),
+        }
+    }
+
+    /// Runs off the event loop: a hanging server must not delay anything.
+    fn spawn_connection_test(&mut self, request_id: u64, mut draft: InstanceDraft) {
+        if let Some(previous) = self.test_task.take() {
+            previous.abort();
+        }
+        if keeps_secret(&draft.auth) && self.moved_instance(&draft) {
+            // The stored secret belongs to the old address; test without one.
+            draft.auth = AuthDraft::None;
+        }
+        let stored = self.stored_auth_for_test(&draft);
+        let http = self.http.clone();
+        let results = self.test_tx.clone();
+        let task = tokio::spawn(async move {
+            let outcome =
+                tokio::time::timeout(TEST_DEADLINE, test_connection(&http, &draft, stored))
+                    .await
+                    .unwrap_or_else(|_| TestOutcome::Unreachable {
+                        message: NetworkKind::Timeout.label().into(),
+                    });
+            let _ = results.send((request_id, outcome));
+        });
+        self.test_task = Some(task.abort_handle());
+    }
+
+    /// The draft edits an instance whose stored URL has another origin.
+    fn moved_instance(&self, draft: &InstanceDraft) -> bool {
+        draft
+            .id
+            .as_deref()
+            .and_then(|id| self.dispatcher.settings.instance(id))
+            .is_some_and(|inst| !same_origin(&inst.url, &draft.url))
+    }
+
+    /// The saved credential of the edited instance, for drafts that keep it
+    /// on the same origin (scheme, host, port).
+    fn stored_auth_for_test(&self, draft: &InstanceDraft) -> Option<Auth> {
+        let inst = self
+            .dispatcher
+            .settings
+            .instance(draft.id.as_deref()?)
+            .filter(|i| keeps_secret(&draft.auth) && same_origin(&i.url, &draft.url))?;
+        match resolve_auth(self.secrets.as_ref(), inst) {
+            Ok(auth) => auth,
+            Err(e) => {
+                tracing::warn!(error = %format!("{e:#}"), "stored credential unavailable for connection test");
+                None
+            }
+        }
+    }
+
+    fn enqueue_test_notification(&self) {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        self.enqueue(
+            "",
+            Notification {
+                id: format!("test:{stamp}"),
+                thread: "test".into(),
+                title: self.strings.test_title.to_owned(),
+                body: self.strings.test_body.to_owned(),
+                level: Level::Active,
+                default_action: None,
+                buttons: Vec::new(),
+                image: None,
+                icon: None,
+            },
+        );
+    }
+
+    fn build_snapshot(&self, now: i64) -> UiSnapshot {
+        build_snapshot(
+            &self.dispatcher.settings,
+            &self.statuses,
+            &self.dispatcher.recent,
+            &self.dispatcher.gaps,
+            now,
+        )
     }
 
     /// Runs the action off the event loop so a slow HTTP action cannot delay
@@ -454,16 +778,17 @@ impl Engine {
     fn settle(&mut self, now: i64) {
         let paused = self.dispatcher.is_paused(now);
         if self.dispatcher.settings != self.saved_settings {
-            let result = save_json(&self.paths.settings_file(), &self.dispatcher.settings);
-            if result.is_ok() {
-                self.saved_settings = self.dispatcher.settings.clone();
-            }
-            self.settings_save.record("settings", &result);
+            let _ = self.write_settings();
         }
         let tray = aggregate(&self.dispatcher.settings, &self.statuses, paused, now);
         if self.tray.as_ref() != Some(&tray) {
             (self.on_tray)(tray.clone());
             self.tray = Some(tray);
+        }
+        let snap = self.build_snapshot(now);
+        if self.snapshot.as_ref() != Some(&snap) {
+            (self.on_ui)(CoreMsg::Snapshot(snap.clone()));
+            self.snapshot = Some(snap);
         }
     }
 
@@ -515,6 +840,10 @@ impl SaveHealth {
         self.failing = result.is_err();
         true
     }
+}
+
+fn topic_names(inst: &Instance) -> BTreeSet<&str> {
+    inst.topics.iter().map(|t| t.name.as_str()).collect()
 }
 
 /// Records a connection status. `since` marks when the instance entered its
@@ -621,6 +950,14 @@ fn unix_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// The draft keeps the stored token or password (its secret is `None`).
+fn keeps_secret(auth: &AuthDraft) -> bool {
+    matches!(
+        auth,
+        AuthDraft::Token { token: None } | AuthDraft::Basic { password: None, .. }
+    )
 }
 
 #[cfg(test)]
@@ -801,6 +1138,116 @@ mod tests {
         st.insert("crashed".into(), (ConnStatus::Connected, 20));
         reap_crashed_connections(&mut conns, &mut st, 30);
         assert_eq!(st["crashed"], (ConnStatus::Connected, 20), "reported once");
+    }
+
+    #[tokio::test]
+    async fn reconcile_applies_queued_events_before_restart() {
+        use crate::ntfy::model::parse_event;
+        use crate::state::SeenMessage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let topic = |n: &str| Topic {
+            name: n.into(),
+            ..Topic::default()
+        };
+        let inst = Instance {
+            id: "a".into(),
+            url: "https://ntfy.example.org".into(),
+            topics: vec![topic("t")],
+            ..Instance::default()
+        };
+        let settings = Settings {
+            instances: vec![inst.clone()],
+            ..Settings::default()
+        };
+        let notifier = Arc::new(crate::notification::RecordingNotifier::default());
+        let media = Arc::new(MediaFetcher::new(http_client(), dir.path().into()));
+        let (delivery_tx, delivery_rx) = mpsc::unbounded_channel();
+        let worker = tokio::spawn(delivery_worker(
+            delivery_rx,
+            media.clone(),
+            notifier.clone(),
+            CancellationToken::new(),
+        ));
+        let (events_tx, events) = mpsc::unbounded_channel();
+        let (test_tx, test_results) = mpsc::unbounded_channel();
+        let mut engine = Engine {
+            paths: AppPaths::under(dir.path()),
+            http: http_client(),
+            deliveries: Some(delivery_tx),
+            notifier: notifier.clone(),
+            opener: Arc::new(crate::actions::RecordingOpener::default()),
+            strings: &EN,
+            on_tray: Box::new(|_| {}),
+            on_ui: Box::new(|_| {}),
+            snapshot: None,
+            dispatcher: Dispatcher::new(settings.clone(), Default::default(), Vec::new(), &EN),
+            saved_settings: settings,
+            instances: BTreeMap::new(),
+            connections: HashMap::from([(
+                "a".to_owned(),
+                Running {
+                    ctl: ConnControl::default(),
+                    base_url: inst.url.clone(),
+                    auth: None,
+                    task: Some(tokio::spawn(std::future::pending::<()>())),
+                },
+            )]),
+            statuses: BTreeMap::new(),
+            state_dirty: false,
+            tray: None,
+            settings_save: SaveHealth::default(),
+            state_save: SaveHealth::default(),
+            media,
+            media_cleanup: Periodic::starting_now(MEDIA_CLEANUP_INTERVAL),
+            secrets: Arc::new(crate::secrets::MemoryStore::new()),
+            tune: |_| {},
+            events_tx,
+            events,
+            test_tx,
+            test_results,
+            test_task: None,
+        };
+
+        let message = match parse_event(
+            r#"{"id":"m1","time":100,"event":"message","topic":"t","message":"hi"}"#,
+        )
+        .unwrap()
+        {
+            crate::ntfy::model::Event::Message(m) => m,
+            other => panic!("{other:?}"),
+        };
+        let new_state = InstanceState {
+            watermark: Some(100),
+            last_message: Some(SeenMessage {
+                id: "m1".into(),
+                time: 100,
+                expires: None,
+            }),
+            seen_ids: ["m1".to_owned()].into(),
+        };
+        let send = |ev| engine.events_tx.send(("a".to_owned(), ev)).unwrap();
+        send(ConnEvent::Messages {
+            messages: vec![message],
+            catch_up: false,
+        });
+        send(ConnEvent::State(new_state.clone()));
+
+        // A topic change restarts the connection (no topics: nothing starts).
+        let edited = Instance {
+            topics: Vec::new(),
+            ..inst.clone()
+        };
+        engine.reconcile(Some(&inst), &edited, false);
+
+        assert_eq!(engine.instances["a"], new_state);
+        assert!(engine.events.try_recv().is_err(), "queue drained");
+        assert!(engine.connections.is_empty());
+        engine.deliveries = None;
+        worker.await.unwrap();
+        let shown = notifier.shown.lock().unwrap();
+        assert_eq!(shown.len(), 1, "{shown:?}");
+        assert_eq!(shown[0].id, "a:m1");
     }
 
     #[test]

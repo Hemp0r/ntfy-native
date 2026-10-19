@@ -7,11 +7,13 @@ Schlanke Tray-App für macOS und Windows, die ntfy-Server abonniert und jede Nac
 - macOS: `scripts/macos-dev-bundle.sh` baut `target/ntfy-native.app`; per Doppelklick oder `open target/ntfy-native.app` starten. Die App erscheint nur in der Menüleiste (kein Dock-Symbol).
 - Windows: `ntfy-native.exe` starten; die App erscheint im Infobereich der Taskleiste.
 
-Bis zum Einrichtungsassistenten (Teil 2) erfolgt die Einrichtung über eine `config.yaml` (siehe [Konfiguration](#konfiguration)): Datei am angegebenen Ort anlegen und die App (neu) starten. Eine vorhandene `config.yaml` wird beim Start nur importiert, solange noch keine Instanz eingerichtet ist; danach nur noch explizit mit `--import <pfad>`. Ohne Konfiguration zeigt das Tray-Menü „Nicht eingerichtet“ mit dem erwarteten Pfad. Schlägt der Import fehl (z. B. Tippfehler oder fehlendes `url:`), zeigt es stattdessen „Konfiguration fehlerhaft – siehe Logs“, und eine Benachrichtigung „Konfiguration konnte nicht gelesen werden“ nennt Datei und Fehler (etwa ``config.yaml: instance 1: missing field `url` ``); die Datei bleibt dann unverändert liegen und kann korrigiert werden.
+Beim ersten Start (noch kein Server eingerichtet) öffnet sich der [Einrichtungsassistent](#einrichtungsassistent). Alternativ, etwa für eine automatische Installation, lässt sich die App über eine `config.yaml` einrichten (siehe [Konfiguration](#konfiguration)): Datei am angegebenen Ort anlegen und die App (neu) starten. Eine vorhandene `config.yaml` wird beim Start nur importiert, solange noch keine Instanz eingerichtet ist; danach nur noch explizit mit `--import <pfad>`. Ohne Konfiguration zeigt das Tray-Menü „Nicht eingerichtet“ mit dem erwarteten Pfad. Schlägt der Import fehl (z. B. Tippfehler oder fehlendes `url:`), zeigt es stattdessen „Konfiguration fehlerhaft – siehe Logs“, und eine Benachrichtigung „Konfiguration konnte nicht gelesen werden“ nennt Datei und Fehler (etwa ``config.yaml: instance 1: missing field `url` ``); die Datei bleibt dann unverändert liegen und kann korrigiert werden; der Assistent öffnet sich in diesem Fall nicht von selbst.
 
-Das Tray-Menü enthält:
+Ein Linksklick auf das Tray-Icon öffnet das [Popover](#popover), ein zweiter schließt es wieder. Das Menü per Rechtsklick enthält:
 
 - den Verbindungsstatus (nicht anklickbar),
+- „Einrichten …“ (nur solange nichts eingerichtet ist): öffnet den Einrichtungsassistenten,
+- „Einstellungen …“: öffnet das [Einstellungsfenster](#einstellungen),
 - „Konfigurationsordner öffnen“: öffnet den Ordner für die `config.yaml` im Finder bzw. Explorer (legt ihn bei Bedarf an),
 - „Logs öffnen“: öffnet den Log-Ordner,
 - „Beenden“.
@@ -25,9 +27,40 @@ Logs liegen in `log_dir` (Tray-Menü „Logs öffnen“), eine Datei pro Tag, di
 
 Die Ausführlichkeit steuert die Umgebungsvariable `NTFY_NATIVE_LOG` (Standard `info`; Syntax wie `RUST_LOG`, z. B. `debug` oder `info,ntfy_native=debug`). Debug-Builds schreiben zusätzlich auf stderr.
 
-Speicherbedarf (macOS, Intel, Release-Build, zwei Instanzen mit zusammen 10 Topics, nach 1 Minute Ruhe): `phys_footprint` rund 12 MB (gemessen: 12 124 160 Byte, Ziel < 30 MB).
+Speicherbedarf (macOS, Intel, Release-Build, zwei Instanzen mit zusammen 10 Topics, nach 1 Minute Ruhe): `phys_footprint` rund 13,5 MB (gemessen: 14 118 912 Byte nach fünfmaligem Öffnen und Schließen des Popovers, Ziel < 30 MB). Bei geschlossenem Popover, Assistent und Einstellungsfenster läuft nur dieser eine Prozess.
+
+## Popover
+
+Das Popover erscheint direkt am Tray-Icon (macOS unter der Menüleiste, Windows über der Taskleiste, auch auf einem zweiten Monitor) und schließt sich bei Esc, bei einem Klick daneben oder einem erneuten Klick auf das Icon. Es zeigt:
+
+- je Server den Verbindungsstatus und die Topics mit einem Schalter zum Stummschalten; „+ Topic“ fügt ein Topic hinzu,
+- „Pause“ für alle Benachrichtigungen (15 Minuten, 1 Stunde, bis morgen früh, bis zum Fortsetzen) und „Fortsetzen“,
+- die zuletzt eingegangenen Nachrichten; ein Klick öffnet die Click-URL der Nachricht, falls sie eine hat,
+- Hinweise „Nachrichten möglicherweise verpasst“ (siehe [unten](#hinweis-nachrichten-möglicherweise-verpasst)) mit „Ausblenden“,
+- „Einstellungen“ und „Beenden“.
+
+Das Popover läuft als eigener, kurzlebiger Prozess (`ntfy-native --ui popover`), der sich beim Schließen vollständig beendet; im Ruhezustand belegt nur die schlanke Tray-App Speicher. Stürzt das Fenster ab oder hängt es, läuft die Tray-App unbeeinflusst weiter, ein hängendes Fenster wird nach einer Sekunde beendet, und der nächste Klick startet ein frisches.
+
+## Einrichtungsassistent
+
+Der Assistent (beim ersten Start automatisch, sonst über „Einrichten …“ im Tray-Menü) führt in wenigen Schritten durch die Einrichtung eines Servers:
+
+1. **Server-Adresse**, z. B. `https://ntfy.sh` oder ein eigener Server. Mit „Weiter“ prüft die App, ob dort ein ntfy-Server erreichbar ist. Verlangt der Server schon dafür eine Anmeldung (etwa hinter einem Proxy mit Basic-Auth), geht es mit dem Hinweis „Der Server verlangt eine Anmeldung.“ direkt zur Anmeldung.
+2. **Anmeldung**: ohne Anmeldung, Access-Token oder Benutzername und Passwort. Falsche Zugangsdaten meldet der Assistent sofort. Beim Bearbeiten behält ein leeres Feld das gespeicherte Token bzw. Passwort – aber nur, solange Schema, Host und Port der Adresse gleich bleiben; für eine neue Server-Adresse müssen die Zugangsdaten neu eingegeben werden, damit sie nie an einen anderen Server gehen.
+3. **Topics**: ein oder mehrere Topics; Topics ohne Leserecht werden markiert.
+4. **Benachrichtigungen**: ob dringende Nachrichten (Priorität 5) „Nicht stören“ durchbrechen dürfen, und „Test-Benachrichtigung senden“ zum Ausprobieren (die Test-Benachrichtigung wird sofort gesendet). Erscheint nichts, die Mitteilungen für ntfy-native in den Systemeinstellungen erlauben.
+
+Erst „Fertig“ speichert den Server und übernimmt die Einstellung für dringende Nachrichten; bei einem Fehler oder „Abbrechen“ bleiben Server und Einstellungen unverändert. Während des Speicherns sind „Zurück“ und „Abbrechen“ gesperrt. Zugangsdaten landen wie beim Import im Schlüsselbund bzw. in der Anmeldeinformationsverwaltung, nie in `settings.json` oder im Log.
+
+## Einstellungen
+
+Das Einstellungsfenster („Einstellungen …“ im Tray-Menü oder im Popover) verwaltet alle Server: „Server hinzufügen“, „Bearbeiten“ (Adresse, Anmeldung und Topics im Assistenten; ein leer gelassenes Token- bzw. Passwortfeld behält das gespeicherte, solange die Adresse auf denselben Server zeigt) und „Entfernen“. Die Server-Cache-Dauer wählt man je Server direkt in der Liste (12 Std., 24 Std., 72 Std., 7 Tage). Je Topic lassen sich „Stumm“ und „Dringend“ (Standard, An, Aus) einstellen. Unter „Allgemein“ stehen die globale Einstellung für dringende Nachrichten, die Ordner für Konfiguration und Logs sowie die Version. Änderungen gelten sofort, ohne Neustart.
+
+Ist das Einstellungsfenster oder der Assistent schon offen, holt jeder weitere Aufruf (Tray-Klick, „Einstellungen …“, „Einrichten …“) dieses Fenster nach vorn, statt es zu ersetzen; nicht gespeicherte Eingaben bleiben erhalten. Nur das Popover wird durch ein anderes Fenster ersetzt.
 
 ## Konfiguration
+
+Die Datei `config.yaml` ist eine Alternative zum Einrichtungsassistenten, vor allem für eine automatische Installation (z. B. per Softwareverteilung): Liegt sie beim ersten Start am Standardort, wird sie importiert und der Assistent öffnet sich nicht.
 
 `config.yaml` ist ein einmaliger Import. Danach ist der interne App-Zustand (`settings.json`) die einzige Quelle der Wahrheit.
 
@@ -119,6 +152,15 @@ MACOS_SIGN_IDENTITY="Apple Development: …" scripts/macos-dev-bundle.sh
 
 Ohne das Entitlement (oder ohne erlaubte zeitkritische Mitteilungen in den Systemeinstellungen) stuft macOS dringende Benachrichtigungen auf „aktiv“ herab; sie durchbrechen dann keinen Fokus („Nicht stören“). Für eine echte Identität ist voraussichtlich ein passendes Provisioning-Profil nötig; die endgültige Signatur und Notarisierung folgen mit dem Packaging (Teil 3).
 
+### Popover-Prozess testen
+
+Nur für die Entwicklung: Mit `NTFY_NATIVE_DEV_POPOVER_CYCLES=<n>` öffnet und schließt die App nach dem Start das Popover `n`-mal (je 1,5 Sekunden, ohne Position, also mittig), etwa um Speicher und das Aufräumen der UI-Prozesse ohne Klicks zu prüfen:
+
+```sh
+NTFY_NATIVE_DEV_POPOVER_CYCLES=5 target/ntfy-native.app/Contents/MacOS/ntfy-native
+pgrep -f "ntfy-native --ui"   # danach leer
+```
+
 ### Windows: Toast-Benachrichtigungen
 
 Benachrichtigungen laufen über WinRT-Toasts mit der AppUserModelID `dev.hemp0r.ntfy-native`. Beim Start registriert sich die App (bzw. das gestartete Beispiel) selbst, nur unter `HKEY_CURRENT_USER` und bei jedem Start neu (der Pfad der `.exe` kann sich ändern):
@@ -162,6 +204,55 @@ Die Demo legt ihr Bild dann in diesem Ordner ab. Fehlen Bild und App-Logo im akt
 ### App-Icon
 
 Quelle ist `assets/icon.svg` (weiße Glocke auf grünem, abgerundetem Quadrat). `scripts/gen-icons.sh` (nur macOS: `sips`, `iconutil`, `python3`) erzeugt daraus die eingecheckten Dateien `assets/AppIcon.icns` (macOS-Bundle, `CFBundleIconFile`), `assets/icon.ico` (16, 32, 48 und 256 px; per `build.rs` und `winresource` in die `.exe` eingebettet, nur bei einem Build auf Windows für Windows) und `assets/icon-256.png` (Toast- und Einstellungs-Icon unter Windows). Nach einer Änderung am SVG das Skript ausführen und die erzeugten Dateien mit committen. Die Tray-Icons sind davon unabhängig.
+
+## Manuelle Prüfung Windows
+
+Diese Schritte lassen sich nicht automatisieren und werden einmal pro Release auf einem Windows-11-Rechner durchgeführt (Release-Build, `ntfy-native.exe` aus dem ZIP). Vorbereitung: App über „Beenden“ schließen und den Zustand zurücksetzen (siehe die PowerShell-Befehle im Abschnitt [Windows: Toast-Benachrichtigungen](#windows-toast-benachrichtigungen)), sodass weder `config.yaml` noch `settings.json` existieren. Logs: `%APPDATA%\hemp0r\ntfy-native\data\logs\`.
+
+**Erststart und Assistent**
+
+1. `ntfy-native.exe` ohne Konfiguration starten. Erwartet: Der Einrichtungsassistent öffnet sich von selbst, das Tray-Icon erscheint im Infobereich.
+2. Assistent mit `https://ntfy.sh`, ohne Anmeldung und einem frei gewählten, öffentlichen Topic durchlaufen, „Test-Benachrichtigung senden“ drücken, „Fertig“. Erwartet: Der Test-Toast erscheint; nach „Fertig“ schließt sich das Fenster und das Tray-Menü zeigt „Verbunden“.
+3. Per `curl -d hallo ntfy.sh/<topic>` eine Nachricht senden. Erwartet: Toast mit „hallo“.
+
+**Popover**
+
+4. Linksklick auf das Tray-Icon (Taskleiste unten). Erwartet: Das Popover erscheint direkt am Icon, vollständig sichtbar über der Taskleiste, und hat sofort den Fokus (Tastatureingabe geht hinein).
+5. Optional: Dasselbe mit der Taskleiste oben bzw. links (unter Windows 11 ist unten die einzige native Position; oben/links nur mit Drittwerkzeugen oder unter Windows 10 über Einstellungen › Personalisierung › Taskleiste) sowie, falls vorhanden, auf einem zweiten Monitor. Erwartet: Das Popover liegt am Icon, nie unter der Taskleiste und nie außerhalb des Bildschirms.
+6. Popover öffnen, daneben klicken. Erwartet: Es schließt sich. Erneut öffnen, Esc drücken. Erwartet: Es schließt sich. Erneut öffnen, nochmals auf das Tray-Icon klicken. Erwartet: Es schließt sich und öffnet sich nicht sofort wieder.
+7. Topic-Schalter (Stumm) umlegen, dann eine Nachricht senden. Erwartet: Bei stummem Topic kein Toast, nach erneutem Umlegen wieder Toast.
+8. „Pause“ › „15 Minuten“. Erwartet: Das Tray-Icon bzw. -Menü zeigt „Pausiert“, gesendete Nachrichten erzeugen keinen Toast; „Fortsetzen“ stellt „Verbunden“ wieder her.
+9. Nachricht mit Click-URL senden (`curl -H "Click: https://example.org" -d Klick ntfy.sh/<topic>`) und im Popover anklicken. Erwartet: Der Standardbrowser öffnet `https://example.org`.
+10. „+ Topic“, einen Namen eingeben. Erwartet: Das Topic erscheint in der Liste und empfängt Nachrichten.
+
+**Einstellungen**
+
+11. „Einstellungen …“ › Server „Bearbeiten“: Adresse oder Topics ändern, Token- bzw. Passwortfeld leer lassen, speichern. Erwartet: Die Verbindung bleibt authentifiziert (bei einem geschützten Server weiterhin „Verbunden“, keine Anmeldefehler im Log).
+12. Zweiten Server hinzufügen, dann „Entfernen“. Erwartet: Eine Bestätigung erscheint; nach Bestätigung ist der Server samt Topics weg, nach „Abbrechen“ bleibt er.
+13. Je Topic „Dringend“ auf Standard, An und Aus stellen und je eine Nachricht mit Priorität 5 senden (`-H "Priority: 5"`). Erwartet: Die Auswahl wird gespeichert (Fenster schließen und neu öffnen), „An“ durchbricht „Nicht stören“ bzw. Fokus-Assistent, „Aus“ nicht, „Standard“ folgt der globalen Einstellung.
+
+**Fenster und Fokus**
+
+14. Einstellungen öffnen, ein Eingabefeld ausfüllen (ohne zu speichern), ein anderes Fenster in den Vordergrund holen, dann auf das Tray-Icon klicken und „Einstellungen …“ wählen. Erwartet: Dasselbe Fenster kommt nach vorn, die Eingaben sind erhalten, es öffnet sich kein zweites.
+15. Dasselbe mit minimiertem Fenster. Erwartet: Es wird wiederhergestellt und in den Vordergrund geholt.
+16. Wiederholen mit dem Assistenten (Zustand zurücksetzen, nicht abschließen, „Einrichten …“ im Tray-Menü). Erwartet: gleiches Verhalten wie bei den Einstellungen.
+
+**Speicher**
+
+17. Alle Fenster schließen (Popover, Einstellungen, Assistent), im Task-Manager (Registerkarte „Details“, Spalte „Arbeitsset (privat)“ einblenden) 1 Minute warten. Erwartet: Genau ein Prozess `ntfy-native.exe`, privater Arbeitssatz unter 30 MB. Danach Popover bzw. Einstellungen öffnen: Solange das Fenster offen ist, läuft ein zweiter `ntfy-native.exe` (der UI-Prozess, gestartet mit `--ui …`; es wird kein WebView verwendet). Nach dem Schließen bleibt innerhalb weniger Sekunden genau ein `ntfy-native.exe` übrig, dessen privater Arbeitssatz unter 30 MB liegt. Mehrmals wiederholen.
+
+**Startmenü und Info-Center**
+
+18. Nach dem Erststart im Log nach `start menu shortcut written` suchen, App beenden und erneut starten. Erwartet: `%APPDATA%\Microsoft\Windows\Start Menu\Programs\ntfy-native.lnk` existiert, die Logzeile steht nur im Log des ersten Starts, beim zweiten Start nicht erneut.
+19. Einstellungen › System › Benachrichtigungen öffnen. Erwartet: „ntfy-native“ steht in der Liste (mit Icon) und lässt sich ein- und ausschalten.
+20. Mehrere Toasts erzeugen, das Info-Center (Win+N) öffnen. Erwartet: Die Toasts bleiben dort stehen, ein Klick öffnet die Click-URL; nach „Beenden“ der App startet ein Klick auf einen älteren Toast die App neu; erwartet: kein zweites Tray-Icon, es läuft nur eine Instanz, und die Click-URL öffnet sich.
+
+**macOS-Entsprechungen** (Bundle über `scripts/macos-dev-bundle.sh`)
+
+21. Erststart ohne Konfiguration. Erwartet: Der Assistent öffnet sich von selbst und hat den Fokus; nach „Fertig“ zeigt das Menü „Verbunden“, der Test-Toast erscheint (Mitteilungen beim ersten Start erlauben).
+22. Linksklick auf das Menüleisten-Icon. Erwartet: Das Popover erscheint direkt unter dem Icon (auch auf einem zweiten Monitor), hat den Fokus, schließt sich bei Esc, bei einem Klick daneben und bei einem zweiten Klick auf das Icon.
+23. Schritte 7 bis 16 sinngemäß wiederholen (Stumm, Pause, Click-URL, „+ Topic“, Einstellungen, Fenster nach vorn, auch wenn das Einstellungsfenster minimiert ist). Erwartet: gleiches Verhalten wie unter Windows.
+24. Aktivitätsanzeige bei geschlossenen Fenstern. Erwartet: Genau ein Prozess `ntfy-native`, Speicher (Spalte „Speicher“ bzw. `phys_footprint`) unter 30 MB.
 
 ## Release
 

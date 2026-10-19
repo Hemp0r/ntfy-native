@@ -7,6 +7,13 @@ fn main() -> anyhow::Result<()> {
     match parse_args(std::env::args_os().skip(1))? {
         CliAction::Version => println!("ntfy-native {}", env!("CARGO_PKG_VERSION")),
         CliAction::Run(cli) => ntfy_native::app::run(cli)?,
+        CliAction::Ui(args) => {
+            let result = ntfy_native::ui::process::run_ui(args);
+            if let Err(e) = &result {
+                eprintln!("ntfy-native ui: {e:#}");
+            }
+            std::process::exit(ntfy_native::ui::process::exit_code(&result));
+        }
     }
     Ok(())
 }

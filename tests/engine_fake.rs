@@ -8,10 +8,13 @@ use ntfy_native::actions::RecordingOpener;
 use ntfy_native::connection::ConnectionConfig;
 use ntfy_native::engine::{Command, EngineDeps, EngineHandle, spawn_engine_thread};
 use ntfy_native::i18n::EN;
+use ntfy_native::instance_edit::{AuthDraft, InstanceDraft};
+use ntfy_native::ipc::{CoreMsg, TestOutcome, TopicAccess, UiRequest};
 use ntfy_native::notification::{ActivationPayload, Level, Notification, RecordingNotifier};
 use ntfy_native::paths::AppPaths;
-use ntfy_native::secrets::{MemoryStore, SecretStore};
+use ntfy_native::secrets::{MemoryStore, SecretStore, account_for};
 use ntfy_native::settings::{AuthKind, Instance, Settings, Topic};
+use ntfy_native::snapshot::{InstanceStatus, UiSnapshot};
 use ntfy_native::state::State;
 use ntfy_native::status::TrayState;
 use ntfy_native::store::{Loaded, load_json};
@@ -82,6 +85,9 @@ fn load<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Option<T> {
     }
 }
 
+type SaveResults = Arc<Mutex<Vec<(u64, Result<String, String>)>>>;
+type TestResults = Arc<Mutex<Vec<(u64, TestOutcome)>>>;
+
 /// An engine on its own thread (as in production) with recording fakes.
 struct TestEngine {
     handle: EngineHandle,
@@ -89,6 +95,9 @@ struct TestEngine {
     notifier: Arc<RecordingNotifier>,
     opener: Arc<RecordingOpener>,
     trays: Arc<Mutex<Vec<TrayState>>>,
+    snapshots: Arc<Mutex<Vec<UiSnapshot>>>,
+    save_results: SaveResults,
+    test_results: TestResults,
     exited: Arc<AtomicBool>,
     paths: AppPaths,
 }
@@ -107,6 +116,9 @@ impl TestEngine {
         let notifier = Arc::new(RecordingNotifier::default());
         let opener = Arc::new(RecordingOpener::default());
         let trays = Arc::new(Mutex::new(Vec::new()));
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let save_results = SaveResults::default();
+        let test_results = TestResults::default();
         let exited = Arc::new(AtomicBool::new(false));
         let deps = EngineDeps {
             paths: paths.clone(),
@@ -124,6 +136,22 @@ impl TestEngine {
                 let exited = exited.clone();
                 Box::new(move || exited.store(true, Ordering::SeqCst))
             },
+            on_ui: {
+                let snapshots = snapshots.clone();
+                let save_results = save_results.clone();
+                let test_results = test_results.clone();
+                Box::new(move |m| match m {
+                    CoreMsg::TestResult {
+                        request_id,
+                        outcome,
+                    } => test_results.lock().unwrap().push((request_id, outcome)),
+                    CoreMsg::Snapshot(s) => snapshots.lock().unwrap().push(s),
+                    CoreMsg::SaveResult { request_id, result } => {
+                        save_results.lock().unwrap().push((request_id, result))
+                    }
+                    _ => {}
+                })
+            },
             tune: fast,
             enable_triggers: false,
         };
@@ -134,6 +162,9 @@ impl TestEngine {
             notifier,
             opener,
             trays,
+            snapshots,
+            save_results,
+            test_results,
             exited,
             paths: paths.clone(),
         }
@@ -153,6 +184,29 @@ impl TestEngine {
 
     fn trays(&self) -> Vec<TrayState> {
         self.trays.lock().unwrap().clone()
+    }
+
+    fn snapshots(&self) -> Vec<UiSnapshot> {
+        self.snapshots.lock().unwrap().clone()
+    }
+
+    fn last_snapshot(&self) -> Option<UiSnapshot> {
+        self.snapshots().pop()
+    }
+
+    /// Sends `SaveInstance` and waits for its result.
+    async fn save(&self, request_id: u64, draft: InstanceDraft) -> Result<String, String> {
+        self.send(ui(UiRequest::SaveInstance { request_id, draft }));
+        let find = |e: &Self| {
+            e.save_results
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(id, _)| *id == request_id)
+                .map(|(_, r)| r.clone())
+        };
+        self.wait_for("save result", |e| find(e).is_some()).await;
+        find(self).unwrap()
     }
 
     fn saved_settings(&self) -> Option<Settings> {
@@ -523,4 +577,732 @@ async fn commands_processed_while_media_stalls() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(engine.shown().is_empty(), "image still downloading");
+}
+
+fn ui(req: UiRequest) -> Command {
+    Command::Ui(req)
+}
+
+#[tokio::test]
+async fn snapshot_sent_on_start_and_on_change_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let t = now();
+    let script = ntfy_script();
+    let (reply, stream) = Reply::stream();
+    script.push(reply);
+    let server = FakeServer::scripted(&script).await;
+    let engine = TestEngine::start(&paths, settings_for(&server.url()), State::default());
+
+    engine
+        .wait_for("first snapshot", |e| !e.snapshots().is_empty())
+        .await;
+    let first = engine.snapshots().remove(0);
+    assert!(first.configured);
+    assert!(first.recent.is_empty());
+
+    stream.line(&open(t));
+    engine
+        .wait_for("connected", |e| {
+            e.last_snapshot()
+                .is_some_and(|s| s.instances[0].status == InstanceStatus::Connected)
+        })
+        .await;
+    stream.line(&msg("m1", t));
+    engine
+        .wait_for("recent message", |e| {
+            e.last_snapshot().is_some_and(|s| !s.recent.is_empty())
+        })
+        .await;
+    assert_eq!(engine.last_snapshot().unwrap().recent[0].message_id, "m1");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let all = engine.snapshots();
+    assert!(
+        all.windows(2).all(|w| w[0] != w[1]),
+        "unchanged snapshots are not resent"
+    );
+    let n = all.len();
+    // A request that changes nothing still runs a settle: no snapshot.
+    engine.send(ui(UiRequest::DismissGap {
+        instance_id: INSTANCE.into(),
+        topic: "none".into(),
+    }));
+    engine.send(Command::ResendSnapshot);
+    engine.wait_for("resend", |e| e.snapshots().len() > n).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let all = engine.snapshots();
+    assert_eq!(all.len(), n + 1, "only the resend was sent");
+    assert_eq!(all[n], all[n - 1], "resend repeats the current snapshot");
+}
+
+#[tokio::test]
+async fn ui_mute_and_urgent_are_persisted() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let engine = TestEngine::start(&paths, settings_for(&unused_url()), State::default());
+    engine.send(ui(UiRequest::SetTopicMuted {
+        instance_id: INSTANCE.into(),
+        topic: "alerts".into(),
+        muted: true,
+    }));
+    engine.send(ui(UiRequest::SetTopicUrgent {
+        instance_id: INSTANCE.into(),
+        topic: "backup".into(),
+        urgent: Some(true),
+    }));
+    engine.send(ui(UiRequest::SetUrgentGlobal { enabled: true }));
+    engine
+        .wait_for("settings.json", |e| {
+            e.saved_settings().is_some_and(|s| {
+                s.instances[0].topics[0].muted
+                    && s.instances[0].topics[1].urgent_breaks_dnd == Some(true)
+                    && s.urgent_breaks_dnd
+            })
+        })
+        .await;
+    engine
+        .wait_for("snapshot", |e| {
+            e.last_snapshot().is_some_and(|s| {
+                let topics = &s.instances[0].topics;
+                topics[0].muted && topics[1].urgent_breaks_dnd == Some(true) && s.urgent_breaks_dnd
+            })
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn dismiss_gap_removes_flag() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let gap = |topic: &str| ntfy_native::state::GapFlag {
+        instance_id: INSTANCE.into(),
+        topic: topic.into(),
+        detected_at: 1,
+    };
+    let state = State {
+        gaps: vec![gap("alerts"), gap("backup")],
+        ..State::default()
+    };
+    let engine = TestEngine::start(&paths, settings_for(&unused_url()), state);
+    engine
+        .wait_for("two gaps", |e| {
+            e.last_snapshot().is_some_and(|s| s.gaps.len() == 2)
+        })
+        .await;
+    engine.send(ui(UiRequest::DismissGap {
+        instance_id: INSTANCE.into(),
+        topic: "alerts".into(),
+    }));
+    engine
+        .wait_for("one gap", |e| {
+            e.last_snapshot()
+                .is_some_and(|s| s.gaps.len() == 1 && s.gaps[0].topic == "backup")
+        })
+        .await;
+    let engine = engine.quit().await;
+    let state: State = load(&engine.paths.state_file()).unwrap();
+    assert_eq!(state.gaps.len(), 1);
+}
+
+#[tokio::test]
+async fn open_recent_uses_stored_click_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let recent = |id: &str, click: Option<&str>| ntfy_native::state::RecentMessage {
+        instance_id: INSTANCE.into(),
+        topic: "alerts".into(),
+        id: id.into(),
+        time: 1,
+        title: String::new(),
+        body: String::new(),
+        click: click.map(str::to_owned),
+    };
+    let state = State {
+        recent: [
+            recent("a", Some("https://example.org/a")),
+            recent("b", None),
+            recent("c", Some("file:///etc/passwd")),
+        ]
+        .into(),
+        ..State::default()
+    };
+    let engine = TestEngine::start(&paths, settings_for(&unused_url()), state);
+    for id in ["unknown", "b", "c", "a"] {
+        engine.send(ui(UiRequest::OpenRecent {
+            instance_id: INSTANCE.into(),
+            message_id: id.into(),
+        }));
+    }
+    engine
+        .wait_for("opener", |e| !e.opener.opened.lock().unwrap().is_empty())
+        .await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        *engine.opener.opened.lock().unwrap(),
+        ["https://example.org/a"]
+    );
+}
+
+#[tokio::test]
+async fn test_notification_is_shown() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TestEngine::start(
+        &AppPaths::under(dir.path()),
+        Settings::default(),
+        State::default(),
+    );
+    engine.send(ui(UiRequest::SendTestNotification));
+    engine
+        .wait_for("test notification", |e| !e.shown().is_empty())
+        .await;
+    let n = &engine.shown()[0];
+    assert_eq!(n.title, "ntfy-native");
+    assert_eq!(n.body, "Notifications work.");
+    assert_eq!(n.level, Level::Active);
+}
+
+fn draft(id: Option<&str>, url: &str, topics: &[&str]) -> InstanceDraft {
+    InstanceDraft {
+        id: id.map(str::to_owned),
+        url: url.into(),
+        auth: AuthDraft::None,
+        cache_duration_secs: 43200,
+        topics: topics
+            .iter()
+            .map(|name| Topic {
+                name: (*name).into(),
+                ..Topic::default()
+            })
+            .collect(),
+    }
+}
+
+fn streams(server: &FakeServer) -> usize {
+    server.requests().iter().filter(|r| !r.is_poll()).count()
+}
+
+#[tokio::test]
+async fn save_new_instance_connects_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let t = now();
+    let script = ntfy_script();
+    script.push(Reply::lines(&[open(t), msg("m1", t)]).keep_open());
+    let server = FakeServer::scripted(&script).await;
+    let engine = TestEngine::start(&paths, Settings::default(), State::default());
+
+    let id = engine
+        .save(1, draft(None, &server.url(), &["alerts"]))
+        .await
+        .expect("saved");
+    assert_eq!(id, "127.0.0.1");
+    let saved = engine
+        .saved_settings()
+        .expect("settings.json written at once");
+    assert_eq!(saved.instances.len(), 1);
+    assert_eq!(saved.instances[0].id, id);
+
+    let reqs = server.wait_requests(1).await;
+    assert!(!reqs[0].is_poll(), "no history: straight to the stream");
+    assert!(reqs[0].path.contains("alerts"));
+    engine.wait_for("m1", |e| !e.shown().is_empty()).await;
+    assert_eq!(engine.shown_ids(), ["127.0.0.1:m1"]);
+    engine
+        .wait_for("snapshot with the instance", |e| {
+            e.last_snapshot()
+                .is_some_and(|s| s.configured && s.instances[0].id == id)
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn edit_topics_keeps_state_no_duplicates() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let t = now();
+    // After the restart the catch-up poll replays x.
+    let script = Script::with_fallback(|req: &Recorded| {
+        if req.is_poll() {
+            Reply::lines(&[msg("x", now())])
+        } else {
+            Reply::lines(&[open(now())]).keep_open()
+        }
+    });
+    script.push(Reply::lines(&[open(t), msg("x", t)]).keep_open());
+    let server = FakeServer::scripted(&script).await;
+    let engine = TestEngine::start(&paths, settings_for(&server.url()), State::default());
+    engine.wait_for("x", |e| !e.shown().is_empty()).await;
+
+    let edited = draft(
+        Some(INSTANCE),
+        &server.url(),
+        &["alerts", "backup", "extra"],
+    );
+    assert_eq!(engine.save(1, edited).await, Ok(INSTANCE.to_owned()));
+
+    let reqs = server.wait_requests(3).await;
+    let poll = &reqs[1];
+    assert!(poll.is_poll(), "restart begins with a catch-up poll");
+    assert!(poll.path.contains("extra"), "new topic list: {}", poll.path);
+    assert_eq!(
+        poll.query_param("since"),
+        Some((t - 30).to_string().as_str()),
+        "catch-up state kept"
+    );
+    assert!(!reqs[2].is_poll() && reqs[2].path.contains("extra"));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(engine.shown_ids(), ["inst:x"]);
+    assert_eq!(streams(&server), 2);
+    let saved = engine.saved_settings().unwrap();
+    assert_eq!(saved.instances[0].topics.len(), 3);
+}
+
+#[tokio::test]
+async fn mute_only_change_does_not_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let server = FakeServer::scripted(&ntfy_script()).await;
+    let engine = TestEngine::start(&paths, settings_for(&server.url()), State::default());
+    server.wait_requests(1).await;
+
+    let mut edited = draft(Some(INSTANCE), &server.url(), &["alerts", "backup"]);
+    edited.topics[0].muted = true;
+    edited.topics[1].urgent_breaks_dnd = Some(true);
+    assert_eq!(engine.save(1, edited).await, Ok(INSTANCE.to_owned()));
+    let saved = engine.saved_settings().expect("settings.json written");
+    assert!(saved.instances[0].topics[0].muted);
+    assert_eq!(saved.instances[0].topics[1].urgent_breaks_dnd, Some(true));
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(server.requests().len(), 1, "no reconnect");
+}
+
+#[tokio::test]
+async fn remove_instance_stops_connection_and_cleans_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let t = now();
+    let script = ntfy_script();
+    let (reply, stream) = Reply::stream();
+    script.push(reply);
+    let server = FakeServer::scripted(&script).await;
+    let mut settings = settings_for(&server.url());
+    settings.instances[0].auth = AuthKind::Token;
+    let secrets = Arc::new(MemoryStore::new());
+    secrets.set(&account_for(INSTANCE), "tok").unwrap();
+    let state = State {
+        gaps: vec![ntfy_native::state::GapFlag {
+            instance_id: INSTANCE.into(),
+            topic: "alerts".into(),
+            detected_at: 1,
+        }],
+        ..State::default()
+    };
+    let engine = TestEngine::start_with(&paths, settings, state, secrets.clone());
+
+    stream.line(&open(t));
+    stream.line(&msg("m1", t));
+    engine.wait_for("m1", |e| !e.shown().is_empty()).await;
+    engine
+        .wait_for("connected", |e| {
+            e.last_snapshot().is_some_and(|s| {
+                s.instances[0].status == InstanceStatus::Connected
+                    && !s.recent.is_empty()
+                    && !s.gaps.is_empty()
+            })
+        })
+        .await;
+
+    engine.send(ui(UiRequest::RemoveInstance {
+        instance_id: INSTANCE.into(),
+    }));
+    engine
+        .wait_for("empty snapshot", |e| {
+            e.last_snapshot().is_some_and(|s| {
+                !s.configured && s.instances.is_empty() && s.recent.is_empty() && s.gaps.is_empty()
+            })
+        })
+        .await;
+    let saved = engine.saved_settings().expect("settings.json written");
+    assert!(saved.instances.is_empty());
+    assert_eq!(secrets.get(&account_for(INSTANCE)).unwrap(), None);
+
+    // The stopped connection no longer delivers.
+    stream.line(&msg("late", t));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(engine.shown_ids(), ["inst:m1"]);
+    assert_eq!(server.requests().len(), 1, "not restarted");
+
+    let engine = engine.quit().await;
+    let state: State = load(&engine.paths.state_file()).unwrap();
+    assert!(state.instances.is_empty());
+    assert!(state.recent.is_empty());
+    assert!(state.gaps.is_empty());
+}
+
+#[tokio::test]
+async fn invalid_save_returns_error_and_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let server = FakeServer::scripted(&ntfy_script()).await;
+    let secrets = Arc::new(MemoryStore::new());
+    let engine = TestEngine::start_with(
+        &paths,
+        settings_for(&server.url()),
+        State::default(),
+        secrets.clone(),
+    );
+    engine
+        .wait_for("connected", |e| {
+            e.last_snapshot()
+                .is_some_and(|s| s.instances[0].status == InstanceStatus::Connected)
+        })
+        .await;
+    let before = engine.last_snapshot().unwrap();
+
+    let mut bad = draft(Some(INSTANCE), &server.url(), &["alerts", "s3cret x"]);
+    bad.auth = AuthDraft::Token {
+        token: Some("s3cret".into()),
+    };
+    let err = engine.save(1, bad).await.unwrap_err();
+    assert_eq!(
+        err,
+        "topic 2: invalid topic name (allowed: letters, digits, '-' and '_', 1-64 characters)"
+    );
+    assert!(!err.contains("s3cret"));
+
+    let unknown = draft(Some("nope"), &server.url(), &["alerts"]);
+    assert_eq!(
+        engine.save(2, unknown).await,
+        Err("instance not found".into())
+    );
+    let duplicate = draft(None, &server.url(), &["other"]);
+    assert_eq!(
+        engine.save(3, duplicate).await,
+        Err("an instance with this url already exists".into())
+    );
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(server.requests().len(), 1, "no reconnect");
+    assert_eq!(secrets.get(&account_for(INSTANCE)).unwrap(), None);
+    assert_eq!(engine.saved_settings(), None, "settings.json untouched");
+    assert_eq!(engine.last_snapshot(), Some(before));
+}
+
+#[tokio::test]
+async fn unwritable_settings_reject_save_and_keep_old_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    // A directory in place of settings.json makes every write fail.
+    std::fs::create_dir_all(paths.settings_file()).unwrap();
+    let server = FakeServer::scripted(&ntfy_script()).await;
+    let engine = TestEngine::start(&paths, Settings::default(), State::default());
+
+    assert_eq!(
+        engine
+            .save(1, draft(None, &server.url(), &["alerts"]))
+            .await,
+        Err("settings could not be saved".into())
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(server.requests().is_empty(), "not connected");
+    let snap = engine.last_snapshot().unwrap();
+    assert!(!snap.configured && snap.instances.is_empty());
+}
+
+#[tokio::test]
+async fn token_change_reconnects_with_new_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let server = FakeServer::scripted(&ntfy_script()).await;
+    let mut settings = settings_for(&server.url());
+    settings.instances[0].auth = AuthKind::Token;
+    let secrets = Arc::new(MemoryStore::new());
+    secrets.set(&account_for(INSTANCE), "old").unwrap();
+    let engine = TestEngine::start_with(&paths, settings, State::default(), secrets.clone());
+    let reqs = server.wait_requests(1).await;
+    assert_eq!(reqs[0].header("authorization"), Some("Bearer old"));
+
+    let mut edited = draft(Some(INSTANCE), &server.url(), &["alerts", "backup"]);
+    edited.auth = AuthDraft::Token {
+        token: Some("new".into()),
+    };
+    assert_eq!(engine.save(1, edited).await, Ok(INSTANCE.to_owned()));
+    let reqs = server.wait_requests(2).await;
+    assert_eq!(reqs[1].header("authorization"), Some("Bearer new"));
+    assert_eq!(
+        secrets.get(&account_for(INSTANCE)).unwrap().as_deref(),
+        Some("new")
+    );
+}
+
+#[tokio::test]
+async fn url_change_starts_with_fresh_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let t = now();
+    let old_script = ntfy_script();
+    old_script.push(Reply::lines(&[open(t), msg("x", t)]).keep_open());
+    let old = FakeServer::scripted(&old_script).await;
+    let new = FakeServer::scripted(&ntfy_script()).await;
+    let engine = TestEngine::start(&paths, settings_for(&old.url()), State::default());
+    engine.wait_for("x", |e| !e.shown().is_empty()).await;
+
+    let moved = draft(Some(INSTANCE), &new.url(), &["alerts", "backup"]);
+    assert_eq!(engine.save(1, moved).await, Ok(INSTANCE.to_owned()));
+    let reqs = new.wait_requests(1).await;
+    assert!(!reqs[0].is_poll(), "no catch-up against the new server");
+    assert_eq!(reqs[0].query_param("since"), None);
+}
+
+fn token_instance_settings(url: &str) -> Settings {
+    let mut settings = settings_for(url);
+    settings.instances[0].auth = AuthKind::Token;
+    settings
+}
+
+#[tokio::test]
+async fn secret_survives_failed_removal_and_failed_auth_removal() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    std::fs::create_dir_all(paths.settings_file()).unwrap();
+    let server = FakeServer::scripted(&ntfy_script()).await;
+    let secrets = Arc::new(MemoryStore::new());
+    secrets.set(&account_for(INSTANCE), "tok").unwrap();
+    let engine = TestEngine::start_with(
+        &paths,
+        token_instance_settings(&server.url()),
+        State::default(),
+        secrets.clone(),
+    );
+    engine
+        .wait_for("connected", |e| {
+            e.last_snapshot()
+                .is_some_and(|s| s.instances[0].status == InstanceStatus::Connected)
+        })
+        .await;
+
+    let mut no_auth = draft(Some(INSTANCE), &server.url(), &["alerts", "backup"]);
+    no_auth.auth = AuthDraft::None;
+    assert_eq!(
+        engine.save(1, no_auth).await,
+        Err("settings could not be saved".into())
+    );
+    assert_eq!(
+        secrets.get(&account_for(INSTANCE)).unwrap().as_deref(),
+        Some("tok")
+    );
+
+    engine.send(ui(UiRequest::RemoveInstance {
+        instance_id: INSTANCE.into(),
+    }));
+    // Commands are handled in order: the snapshot request follows the removal.
+    engine.send(Command::ResendSnapshot);
+    let count = engine.snapshots().len();
+    engine
+        .wait_for("snapshot after removal", |e| e.snapshots().len() > count)
+        .await;
+    let snap = engine.last_snapshot().unwrap();
+    assert_eq!(snap.instances.len(), 1, "instance kept");
+    assert_eq!(
+        secrets.get(&account_for(INSTANCE)).unwrap().as_deref(),
+        Some("tok")
+    );
+}
+
+#[tokio::test]
+async fn switching_to_no_auth_deletes_secret_after_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let server = FakeServer::scripted(&ntfy_script()).await;
+    let secrets = Arc::new(MemoryStore::new());
+    secrets.set(&account_for(INSTANCE), "tok").unwrap();
+    let engine = TestEngine::start_with(
+        &paths,
+        token_instance_settings(&server.url()),
+        State::default(),
+        secrets.clone(),
+    );
+    let mut no_auth = draft(Some(INSTANCE), &server.url(), &["alerts", "backup"]);
+    no_auth.auth = AuthDraft::None;
+    assert_eq!(engine.save(1, no_auth).await, Ok(INSTANCE.to_owned()));
+    assert_eq!(secrets.get(&account_for(INSTANCE)).unwrap(), None);
+    let saved = engine.saved_settings().unwrap();
+    assert_eq!(saved.instances[0].auth, AuthKind::None);
+}
+
+#[tokio::test]
+async fn url_change_clears_gap_flags_of_the_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let old = FakeServer::scripted(&ntfy_script()).await;
+    let new = FakeServer::scripted(&ntfy_script()).await;
+    let gap = |topic: &str| ntfy_native::state::GapFlag {
+        instance_id: INSTANCE.into(),
+        topic: topic.into(),
+        detected_at: 1,
+    };
+    let state = State {
+        gaps: vec![gap("alerts")],
+        ..State::default()
+    };
+    let engine = TestEngine::start(&paths, settings_for(&old.url()), state);
+    engine
+        .wait_for("gap shown", |e| {
+            e.last_snapshot().is_some_and(|s| !s.gaps.is_empty())
+        })
+        .await;
+
+    let same = draft(Some(INSTANCE), &old.url(), &["alerts", "backup"]);
+    assert_eq!(engine.save(1, same).await, Ok(INSTANCE.to_owned()));
+    assert!(!engine.last_snapshot().unwrap().gaps.is_empty(), "kept");
+
+    let moved = draft(Some(INSTANCE), &new.url(), &["alerts", "backup"]);
+    assert_eq!(engine.save(2, moved).await, Ok(INSTANCE.to_owned()));
+    engine
+        .wait_for("gap cleared", |e| {
+            e.last_snapshot().is_some_and(|s| s.gaps.is_empty())
+        })
+        .await;
+}
+
+const HEALTHY: &str = r#"{"healthy":true}"#;
+
+fn test_outcome(e: &TestEngine, request_id: u64) -> Option<TestOutcome> {
+    let results = e.test_results.lock().unwrap();
+    results
+        .iter()
+        .find(|(id, _)| *id == request_id)
+        .map(|(_, o)| o.clone())
+}
+
+#[tokio::test]
+async fn engine_answers_test_request_without_blocking() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    // Every request hangs: the test sits in its 10 s timeout.
+    let hanging = FakeServer::start(|_| Reply::stall()).await;
+    let engine = TestEngine::start(&paths, Settings::default(), State::default());
+    engine.send(ui(UiRequest::TestConnection {
+        request_id: 7,
+        draft: draft(None, &hanging.url(), &["alerts"]),
+    }));
+    hanging.wait_requests(1).await;
+
+    engine.send(ui(UiRequest::PauseAll {
+        until: Some(i64::MAX),
+    }));
+    engine
+        .wait_for("pause applied while the test hangs", |e| {
+            e.last_snapshot().is_some_and(|s| s.paused_until.is_some())
+        })
+        .await;
+    assert_eq!(test_outcome(&engine, 7), None, "test still running");
+    // Still responsive: another request is answered meanwhile.
+    assert_eq!(
+        engine
+            .save(8, draft(None, &hanging.url(), &["alerts"]))
+            .await,
+        Ok("127.0.0.1".to_owned())
+    );
+}
+
+#[tokio::test]
+async fn engine_reports_test_result_with_stored_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let server = FakeServer::start(|req| {
+        if req.path == "/v1/health" {
+            return Reply::bytes(HEALTHY);
+        }
+        match req.header("authorization") {
+            Some("Bearer stored") => Reply::lines::<&str>(&[]),
+            _ => Reply::status(401),
+        }
+    })
+    .await;
+    let secrets = Arc::new(MemoryStore::new());
+    secrets.set(&account_for(INSTANCE), "stored").unwrap();
+    let engine = TestEngine::start_with(
+        &paths,
+        token_instance_settings(&server.url()),
+        State::default(),
+        secrets,
+    );
+    let mut keep = draft(Some(INSTANCE), &server.url(), &["alerts"]);
+    keep.auth = AuthDraft::Token { token: None };
+    engine.send(ui(UiRequest::TestConnection {
+        request_id: 1,
+        draft: keep.clone(),
+    }));
+    engine
+        .wait_for("test result", |e| test_outcome(e, 1).is_some())
+        .await;
+    assert_eq!(
+        test_outcome(&engine, 1),
+        Some(TestOutcome::Ok {
+            topics: vec![TopicAccess {
+                name: "alerts".into(),
+                readable: true
+            }]
+        })
+    );
+
+    keep.auth = AuthDraft::Token {
+        token: Some("wrong".into()),
+    };
+    engine.send(ui(UiRequest::TestConnection {
+        request_id: 2,
+        draft: keep,
+    }));
+    engine
+        .wait_for("second result", |e| test_outcome(e, 2).is_some())
+        .await;
+    assert_eq!(test_outcome(&engine, 2), Some(TestOutcome::AuthFailed));
+}
+
+#[tokio::test]
+async fn edited_draft_for_another_host_is_tested_without_the_stored_secret() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let saved = FakeServer::start(|_| Reply::status(500)).await;
+    let other = FakeServer::start(|req| {
+        if req.path == "/v1/health" {
+            return Reply::bytes(HEALTHY);
+        }
+        Reply::lines::<&str>(&[])
+    })
+    .await;
+    let secrets = Arc::new(MemoryStore::new());
+    secrets.set(&account_for(INSTANCE), "stored").unwrap();
+    let engine = TestEngine::start_with(
+        &paths,
+        token_instance_settings(&saved.url()),
+        State::default(),
+        secrets,
+    );
+    let mut moved = draft(Some(INSTANCE), &other.url(), &["alerts"]);
+    moved.auth = AuthDraft::Token { token: None };
+    engine.send(ui(UiRequest::TestConnection {
+        request_id: 1,
+        draft: moved.clone(),
+    }));
+    engine
+        .wait_for("test result", |e| test_outcome(e, 1).is_some())
+        .await;
+    assert!(
+        matches!(test_outcome(&engine, 1), Some(TestOutcome::Ok { .. })),
+        "{:?}",
+        test_outcome(&engine, 1)
+    );
+    let reqs = other.requests();
+    assert!(!reqs.is_empty());
+    assert!(
+        reqs.iter().all(|r| r.header("authorization").is_none()),
+        "no credential for another host"
+    );
+
+    let err = engine.save(2, moved).await.unwrap_err();
+    assert_eq!(err, "credentials required for a new server address");
 }

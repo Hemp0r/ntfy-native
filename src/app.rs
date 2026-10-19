@@ -2,19 +2,19 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use tao::event::{Event, StartCause};
-use tao::event_loop::{ControlFlow, EventLoopBuilder};
+use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy, EventLoopWindowTarget};
 use tao::platform::run_return::EventLoopExtRunReturn;
-use tray_icon::TrayIconEvent;
 use tray_icon::menu::MenuEvent;
+use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
 use crate::actions::{SystemOpener, open_local_dir};
-use crate::cli::Cli;
+use crate::cli::{Cli, UiArgs, UiMode};
 use crate::engine::{Command, EngineDeps, EngineHandle, spawn_engine_thread};
 use crate::i18n::{Strings, fill, strings};
 use crate::import::import_file;
@@ -28,7 +28,11 @@ use crate::settings::Settings;
 use crate::state::State;
 use crate::status::TrayState;
 use crate::store::{Loaded, load_json};
-use crate::tray::{OPEN_CONFIG_ID, OPEN_LOGS_ID, QUIT_ID, Tray};
+use crate::tray::{
+    MonitorRect, OPEN_CONFIG_ID, OPEN_LOGS_ID, QUIT_ID, SETTINGS_ID, SETUP_ID, Tray, popover_args,
+};
+use crate::ui::layout::AnchorRect;
+use crate::ui_host::{HostEvent, Outcome, UiHost, UiSink};
 
 /// Accepted in the default location when `config.yaml` is missing.
 const FALLBACK_CONFIG_NAME: &str = "config.yml";
@@ -46,10 +50,30 @@ const NEAR_MISS_NAMES: [&str; 5] = [
 /// Upper bound for waiting on the engine thread at shutdown.
 const ENGINE_JOIN_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Development only: opens and closes the popover this many times after
+/// startup (memory and process checks without clicking).
+const DEV_POPOVER_CYCLES_ENV: &str = "NTFY_NATIVE_DEV_POPOVER_CYCLES";
+const DEV_CYCLE_START: Duration = Duration::from_secs(3);
+const DEV_CYCLE_STEP: Duration = Duration::from_millis(1500);
+
 #[derive(Debug)]
 enum UserEvent {
     Tray(TrayState),
     Activated(ActivationPayload),
+    /// Left click on the tray icon (icon rectangle, physical pixels).
+    TrayClick(AnchorRect),
+    OpenUi(UiMode),
+    Host(HostEvent),
+    /// The core is active and the UI child registered: yield activation to
+    /// it, then (`focus`) ask the already open window to come forward.
+    #[cfg(target_os = "macos")]
+    YieldTo {
+        pid: u32,
+        focus: bool,
+    },
+    DevCycle {
+        open: bool,
+    },
     Exit,
 }
 
@@ -80,6 +104,9 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
         import_error,
     } = initial_settings(paths, cli, secrets.as_ref())?;
     let state = initial_state(paths);
+    // First start: nothing set up and no failed import to look at first.
+    let first_start = settings.instances.is_empty() && import_error.is_none();
+    let exe = std::env::current_exe().context("locating the executable")?;
 
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     #[cfg(target_os = "macos")]
@@ -100,6 +127,9 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
     let notifier = platform_notifier(on_activate, &paths.data_dir);
 
     let strings = strings();
+    // Set once the UI host exists; the engine's first snapshot may come
+    // earlier, and a connecting UI then asks for it again.
+    let ui_sink: Arc<OnceLock<UiSink>> = Arc::default();
     if let Some(error) = &import_error {
         let n = import_failed_notification(error, strings);
         let notifier = notifier.clone();
@@ -129,33 +159,73 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
                 let _ = proxy.send_event(UserEvent::Exit);
             }
         }),
+        on_ui: Box::new({
+            let ui_sink = ui_sink.clone();
+            move |m| {
+                if let Some(sink) = ui_sink.get() {
+                    sink.deliver(m);
+                }
+            }
+        }),
         tune: |_| {},
         enable_triggers: true,
     });
 
+    let mut host = UiHost::new(
+        exe,
+        engine.clone(),
+        Arc::new({
+            let proxy = proxy.clone();
+            move |e| {
+                let _ = proxy.send_event(UserEvent::Host(e));
+            }
+        }),
+    )
+    .with_folders(paths.config_dir.clone(), paths.log_dir.clone());
+    let _ = ui_sink.set(host.sink());
+
     let quit_tx = engine.tx.clone();
     let (config_dir, log_dir) = (paths.config_dir.clone(), paths.log_dir.clone());
+    let menu_proxy = proxy.clone();
     MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
         if e.id == QUIT_ID {
-            // If the engine is gone (it panicked), quit without it.
-            if quit_tx.send(Command::Quit).is_err() {
-                let _ = proxy.send_event(UserEvent::Exit);
-            }
+            request_quit(&quit_tx, &menu_proxy);
+        } else if e.id == SETTINGS_ID {
+            let _ = menu_proxy.send_event(UserEvent::OpenUi(UiMode::Settings));
+        } else if e.id == SETUP_ID {
+            let _ = menu_proxy.send_event(UserEvent::OpenUi(UiMode::Wizard));
         } else if e.id == OPEN_CONFIG_ID {
             open_dir_in_background(config_dir.clone());
         } else if e.id == OPEN_LOGS_ID {
             open_dir_in_background(log_dir.clone());
         }
     }));
-    // Unhandled tray events would pile up in tray-icon's global channel.
-    TrayIconEvent::set_event_handler(Some(|_: TrayIconEvent| {}));
+    let click_proxy = proxy.clone();
+    TrayIconEvent::set_event_handler(Some(move |e: TrayIconEvent| {
+        if let TrayIconEvent::Click {
+            rect,
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } = e
+        {
+            let icon = AnchorRect {
+                x: rect.position.x,
+                y: rect.position.y,
+                w: f64::from(rect.size.width),
+                h: f64::from(rect.size.height),
+            };
+            let _ = click_proxy.send_event(UserEvent::TrayClick(icon));
+        }
+    }));
+    start_dev_cycles(&proxy);
 
     let config_hint = config_path(paths, cli).display().to_string();
     let mut current = TrayState::NotConfigured;
     let mut tray: Option<Tray> = None;
     let mut engine_thread = Some(engine_thread);
 
-    event_loop.run_return(|event, _, control_flow| {
+    event_loop.run_return(|event, target, control_flow| {
         *control_flow = ControlFlow::Wait;
         match event {
             Event::NewEvents(StartCause::Init) => {
@@ -170,6 +240,45 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
                         tray = Some(t);
                     }
                     Err(e) => tracing::error!(error = %format!("{e:#}"), "tray icon unavailable"),
+                }
+                if first_start {
+                    tracing::info!("nothing set up, opening the setup wizard");
+                    show(&mut host, &proxy, |h| {
+                        h.open(UiArgs::window(UiMode::Wizard))
+                    });
+                }
+            }
+            Event::UserEvent(UserEvent::TrayClick(icon)) => {
+                let args = popover_args(icon, &monitors(target));
+                show(&mut host, &proxy, |h| h.toggle_popover(args));
+            }
+            Event::UserEvent(UserEvent::OpenUi(mode) | UserEvent::Host(HostEvent::Open(mode))) => {
+                show(&mut host, &proxy, |h| h.open(UiArgs::window(mode)));
+            }
+            Event::UserEvent(UserEvent::Host(HostEvent::Quit)) => request_quit(&engine.tx, &proxy),
+            Event::UserEvent(UserEvent::Host(HostEvent::ChildExited)) => {}
+            #[cfg(target_os = "macos")]
+            Event::UserEvent(UserEvent::YieldTo { pid, focus }) => {
+                if host.pid() != Some(pid) {
+                    tracing::debug!(pid, "UI process replaced before activation was yielded");
+                } else {
+                    if crate::activation::yield_to_child(pid) {
+                        tracing::debug!(pid, "activation yielded to the UI process");
+                    } else {
+                        tracing::debug!(pid, "UI process gone before activation could be yielded");
+                    }
+                    if focus {
+                        host.focus_window();
+                    }
+                }
+            }
+            Event::UserEvent(UserEvent::DevCycle { open }) => {
+                if open {
+                    show(&mut host, &proxy, |h| {
+                        h.open(UiArgs::window(UiMode::Popover))
+                    });
+                } else {
+                    host.close();
                 }
             }
             Event::UserEvent(UserEvent::Tray(s)) => {
@@ -187,6 +296,7 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
             Event::UserEvent(UserEvent::Exit) => *control_flow = ControlFlow::Exit,
             // Also reached when the OS terminates the app (logout, shutdown).
             Event::LoopDestroyed => {
+                host.close_and_wait();
                 tray = None;
                 if let Some(thread) = engine_thread.take() {
                     stop_engine(&engine, thread);
@@ -197,6 +307,114 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
     });
     tracing::info!("stopped");
     Ok(())
+}
+
+/// If the engine is gone (it panicked), quit without it.
+fn request_quit(
+    engine: &tokio::sync::mpsc::UnboundedSender<Command>,
+    proxy: &EventLoopProxy<UserEvent>,
+) {
+    if engine.send(Command::Quit).is_err() {
+        let _ = proxy.send_event(UserEvent::Exit);
+    }
+}
+
+/// Monitors in physical pixels, the primary one first (the fallback).
+fn monitors(target: &EventLoopWindowTarget<UserEvent>) -> Vec<MonitorRect> {
+    target
+        .primary_monitor()
+        .into_iter()
+        .chain(target.available_monitors())
+        .map(|m| {
+            let (pos, size) = (m.position(), m.size());
+            MonitorRect {
+                x: f64::from(pos.x),
+                y: f64::from(pos.y),
+                w: f64::from(size.width),
+                h: f64::from(size.height),
+                scale: m.scale_factor(),
+            }
+        })
+        .collect()
+}
+
+/// Hands the foreground to a new child or to the already open window.
+/// macOS: activation is cooperative, so the core activates itself (it just
+/// got the click) and yields to the child once both took effect; an open
+/// window is asked to come forward only after that. Windows: the window
+/// may take the foreground right away. Nothing happens when nothing opened.
+fn show(
+    host: &mut UiHost,
+    proxy: &EventLoopProxy<UserEvent>,
+    action: impl FnOnce(&mut UiHost) -> Outcome,
+) {
+    let (pid, focus) = match action(host) {
+        Outcome::Started(pid) => (pid, false),
+        Outcome::Focused(pid) => (pid, true),
+        Outcome::Closed | Outcome::Nothing => return,
+    };
+    #[cfg(target_os = "macos")]
+    {
+        crate::activation::activate_core();
+        yield_when_ready(pid, focus, proxy.clone());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (pid, proxy);
+        if focus {
+            crate::activation::allow_child_foreground();
+            host.focus_window();
+        }
+    }
+}
+
+/// Upper bound for the UI process to register as an application.
+#[cfg(target_os = "macos")]
+const REGISTER_WAIT: Duration = Duration::from_secs(3);
+/// Yield anyway if the core has not become active by then.
+#[cfg(target_os = "macos")]
+const CORE_ACTIVE_WAIT: Duration = Duration::from_millis(300);
+
+#[cfg(target_os = "macos")]
+fn yield_when_ready(pid: u32, focus: bool, proxy: EventLoopProxy<UserEvent>) {
+    spawn_detached("ui-activation", move || {
+        let start = Instant::now();
+        while start.elapsed() < REGISTER_WAIT {
+            let core_ready =
+                crate::activation::core_active() || start.elapsed() >= CORE_ACTIVE_WAIT;
+            if core_ready && crate::activation::child_registered(pid) {
+                let _ = proxy.send_event(UserEvent::YieldTo { pid, focus });
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        tracing::debug!(pid, "UI process did not register as an application in time");
+    });
+}
+
+/// Development only, see [`DEV_POPOVER_CYCLES_ENV`].
+fn start_dev_cycles(proxy: &EventLoopProxy<UserEvent>) {
+    let Some(cycles) = std::env::var(DEV_POPOVER_CYCLES_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+        .filter(|n| *n > 0)
+    else {
+        return;
+    };
+    tracing::warn!(cycles, "{DEV_POPOVER_CYCLES_ENV} set, cycling the popover");
+    let proxy = proxy.clone();
+    spawn_detached("dev-popover-cycles", move || {
+        std::thread::sleep(DEV_CYCLE_START);
+        for _ in 0..cycles {
+            for open in [true, false] {
+                if proxy.send_event(UserEvent::DevCycle { open }).is_err() {
+                    return;
+                }
+                std::thread::sleep(DEV_CYCLE_STEP);
+            }
+        }
+        tracing::info!(cycles, "popover cycles done");
+    });
 }
 
 /// A second start exits quietly; a second start with `--import` fails (stderr,

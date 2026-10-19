@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::secrets::{SecretStore, account_for};
 use crate::settings::{AuthKind, Instance, Settings, Topic};
 use crate::store::save_json;
+use crate::validate::{normalize_url, same_url, unique_id, valid_topic_name};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImportFile {
@@ -82,45 +83,6 @@ struct RawFile {
     urgent_breaks_dnd: Option<bool>,
     #[serde(default)]
     instances: Vec<RawInstance>,
-}
-
-fn valid_topic_name(name: &str) -> bool {
-    (1..=64).contains(&name.len())
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-}
-
-/// The parsed URL's serialization (lowercase host, no default port) without
-/// trailing `/`, so equivalent spellings map to the same instance.
-fn normalize_url(raw: &str) -> Result<String> {
-    // Never echo the raw value: it may carry credentials.
-    let parsed = url::Url::parse(raw.trim()).map_err(|e| anyhow!("invalid instance url: {e}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        bail!("instance url must start with http:// or https://");
-    }
-    if !parsed.username().is_empty() || parsed.password().is_some() {
-        bail!(
-            "instance url for host {} must not contain credentials; use token or username/password",
-            parsed.host_str().unwrap_or_default()
-        );
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        bail!(
-            "instance url for host {} must not contain a query or fragment",
-            parsed.host_str().unwrap_or_default()
-        );
-    }
-    Ok(parsed.as_str().trim_end_matches('/').to_owned())
-}
-
-/// Whether a stored instance URL (possibly saved in an older, unnormalized
-/// form) denotes the normalized import URL.
-fn same_url(stored: &str, normalized: &str) -> bool {
-    match normalize_url(stored) {
-        Ok(n) => n == normalized,
-        Err(_) => stored.trim_end_matches('/') == normalized,
-    }
 }
 
 /// Errors name positions, never values (they may be secrets in the wrong
@@ -271,17 +233,6 @@ pub fn parse_import(yaml: &str) -> Result<ImportFile> {
         urgent_breaks_dnd: raw.urgent_breaks_dnd,
         instances,
     })
-}
-
-fn unique_id(settings: &Settings, base: &str) -> String {
-    let taken = |id: &str| settings.instances.iter().any(|i| i.id == id);
-    if !taken(base) {
-        return base.to_string();
-    }
-    (2..)
-        .map(|n| format!("{base}-{n}"))
-        .find(|id| !taken(id))
-        .expect("unbounded range")
 }
 
 /// How an import changes an instance's credentials.
