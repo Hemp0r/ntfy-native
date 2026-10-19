@@ -21,4 +21,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - run: scripts/test-bump-kind.sh
       - run: scripts/test-next-version.sh

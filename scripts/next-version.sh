@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
 # Decide the next release version.
 #
-# Usage: git tag --list 'v*.*.*' | scripts/next-version.sh <cargo-version>
+# Usage: git tag --list 'v*.*.*' | scripts/next-version.sh <cargo-version> <kind>
+# <kind> is major|minor|patch (see scripts/bump-kind.sh).
 #
 # Reads existing tags from stdin and prints "<version> <bump|keep>":
 #   keep  - release <version> (the Cargo.toml version) unchanged
-#   bump  - Cargo.toml must be rewritten to <version> (latest tag, patch + 1)
+#   bump  - Cargo.toml must be rewritten to <version> (latest tag, jumped by <kind>)
 #
 # Rules:
 #   - no vMAJOR.MINOR.PATCH tag yet           -> keep the Cargo.toml version
 #   - Cargo.toml version > latest tag         -> keep the Cargo.toml version
-#   - otherwise                               -> latest tag with patch + 1
+#   - otherwise                               -> latest tag jumped by <kind>
+#     (patch: X.Y.Z+1, minor: X.Y+1.0, major: X+1.0.0)
 # Versions are compared numerically. Tags that are not plain
 # vMAJOR.MINOR.PATCH (pre-releases, other names) are ignored.
 set -euo pipefail
 
 semver_re='^([0-9]+)\.([0-9]+)\.([0-9]+)$'
 
-if [[ $# -ne 1 || ! "$1" =~ $semver_re ]]; then
-  echo "usage: next-version.sh <MAJOR.MINOR.PATCH> (tags on stdin)" >&2
+if [[ $# -ne 2 || ! "$1" =~ $semver_re || ! "$2" =~ ^(major|minor|patch)$ ]]; then
+  echo "usage: next-version.sh <MAJOR.MINOR.PATCH> <major|minor|patch> (tags on stdin)" >&2
   exit 2
 fi
 cargo=$1
+kind=$2
 
 # Print 1 if version a > version b, else 0 (both MAJOR.MINOR.PATCH).
 greater() {
@@ -52,4 +55,11 @@ if [[ -z "$latest" || $(greater "$cargo" "$latest") == 1 ]]; then
 fi
 
 IFS=. read -r -a parts <<<"$latest"
-echo "${parts[0]}.${parts[1]}.$((10#${parts[2]} + 1)) bump"
+major=$((10#${parts[0]}))
+minor=$((10#${parts[1]}))
+patch=$((10#${parts[2]}))
+case "$kind" in
+  major) echo "$((major + 1)).0.0 bump" ;;
+  minor) echo "$major.$((minor + 1)).0 bump" ;;
+  patch) echo "$major.$minor.$((patch + 1)) bump" ;;
+esac

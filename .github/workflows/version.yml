@@ -42,7 +42,19 @@ jobs:
           fi
 
           current=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
-          read -r new action < <(git tag --list 'v*.*.*' | scripts/next-version.sh "$current")
+          # Latest plain vX.Y.Z tag (numeric order); its version is the
+          # baseline for the commit range and the breaking-change rule.
+          latest=$(git tag --list 'v*.*.*' | sed -n 's/^v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
+          if [[ -n "$latest" ]]; then
+            range="v$latest..HEAD"
+            baseline=$latest
+          else
+            range="HEAD"
+            baseline=$current
+          fi
+          kind=$(git log --no-merges --format='%H%x1f%B%x1e' "$range" | scripts/bump-kind.sh "$baseline")
+          echo "Commits in $range -> $kind"
+          read -r new action < <(git tag --list 'v*.*.*' | scripts/next-version.sh "$current" "$kind")
           tag="v$new"
           echo "Cargo.toml version: $current -> release $new ($action)"
 
