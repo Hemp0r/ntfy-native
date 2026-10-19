@@ -48,15 +48,29 @@ Der Assistent (beim ersten Start automatisch, sonst über „Einrichten …“ i
 1. **Server-Adresse**, z. B. `https://ntfy.sh` oder ein eigener Server. Mit „Weiter“ prüft die App, ob dort ein ntfy-Server erreichbar ist. Verlangt der Server schon dafür eine Anmeldung (etwa hinter einem Proxy mit Basic-Auth), geht es mit dem Hinweis „Der Server verlangt eine Anmeldung.“ direkt zur Anmeldung.
 2. **Anmeldung**: ohne Anmeldung, Access-Token oder Benutzername und Passwort. Falsche Zugangsdaten meldet der Assistent sofort. Beim Bearbeiten behält ein leeres Feld das gespeicherte Token bzw. Passwort – aber nur, solange Schema, Host und Port der Adresse gleich bleiben; für eine neue Server-Adresse müssen die Zugangsdaten neu eingegeben werden, damit sie nie an einen anderen Server gehen.
 3. **Topics**: ein oder mehrere Topics; Topics ohne Leserecht werden markiert.
-4. **Benachrichtigungen**: ob dringende Nachrichten (Priorität 5) „Nicht stören“ durchbrechen dürfen, und „Test-Benachrichtigung senden“ zum Ausprobieren (die Test-Benachrichtigung wird sofort gesendet). Erscheint nichts, die Mitteilungen für ntfy-native in den Systemeinstellungen erlauben.
+4. **Benachrichtigungen**: ob dringende Nachrichten (Priorität 5) „Nicht stören“ durchbrechen dürfen, und „Test-Benachrichtigung senden“ zum Ausprobieren (die Test-Benachrichtigung wird sofort gesendet). Erscheint nichts, die Mitteilungen für ntfy-native in den Systemeinstellungen erlauben. Bei der Ersteinrichtung steht hier außerdem „Beim Anmelden automatisch starten“ (standardmäßig an, siehe [Autostart](#autostart)).
 
-Erst „Fertig“ speichert den Server und übernimmt die Einstellung für dringende Nachrichten; bei einem Fehler oder „Abbrechen“ bleiben Server und Einstellungen unverändert. Während des Speicherns sind „Zurück“ und „Abbrechen“ gesperrt. Zugangsdaten landen wie beim Import im Schlüsselbund bzw. in der Anmeldeinformationsverwaltung, nie in `settings.json` oder im Log.
+Erst „Fertig“ speichert den Server und übernimmt die Einstellung für dringende Nachrichten sowie den Autostart; bei einem Fehler oder „Abbrechen“ bleiben Server und Einstellungen unverändert. Während des Speicherns sind „Zurück“ und „Abbrechen“ gesperrt. Zugangsdaten landen wie beim Import im Schlüsselbund bzw. in der Anmeldeinformationsverwaltung, nie in `settings.json` oder im Log.
 
 ## Einstellungen
 
-Das Einstellungsfenster („Einstellungen …“ im Tray-Menü oder im Popover) verwaltet alle Server: „Server hinzufügen“, „Bearbeiten“ (Adresse, Anmeldung und Topics im Assistenten; ein leer gelassenes Token- bzw. Passwortfeld behält das gespeicherte, solange die Adresse auf denselben Server zeigt) und „Entfernen“. Die Server-Cache-Dauer wählt man je Server direkt in der Liste (12 Std., 24 Std., 72 Std., 7 Tage). Je Topic lassen sich „Stumm“ und „Dringend“ (Standard, An, Aus) einstellen. Unter „Allgemein“ stehen die globale Einstellung für dringende Nachrichten, die Ordner für Konfiguration und Logs sowie die Version. Änderungen gelten sofort, ohne Neustart.
+Das Einstellungsfenster („Einstellungen …“ im Tray-Menü oder im Popover) verwaltet alle Server: „Server hinzufügen“, „Bearbeiten“ (Adresse, Anmeldung und Topics im Assistenten; ein leer gelassenes Token- bzw. Passwortfeld behält das gespeicherte, solange die Adresse auf denselben Server zeigt) und „Entfernen“. Die Server-Cache-Dauer wählt man je Server direkt in der Liste (12 Std., 24 Std., 72 Std., 7 Tage). Je Topic lassen sich „Stumm“ und „Dringend“ (Standard, An, Aus) einstellen. Unter „Allgemein“ stehen die globale Einstellung für dringende Nachrichten, der Schalter „Beim Anmelden automatisch starten“ (siehe [Autostart](#autostart)), die Ordner für Konfiguration und Logs sowie die Version. Änderungen gelten sofort, ohne Neustart.
 
 Ist das Einstellungsfenster oder der Assistent schon offen, holt jeder weitere Aufruf (Tray-Klick, „Einstellungen …“, „Einrichten …“) dieses Fenster nach vorn, statt es zu ersetzen; nicht gespeicherte Eingaben bleiben erhalten. Nur das Popover wird durch ein anderes Fenster ersetzt.
+
+## Autostart
+
+ntfy-native kann beim Anmelden automatisch starten (nur das Tray-Icon, kein Fenster). Ob der Autostart aktiv ist, entscheidet allein das Betriebssystem; ntfy-native speichert dafür keinen eigenen Wert und schaltet ihn nie ungefragt ein.
+
+- **Assistent:** Bei der Ersteinrichtung (Assistent beim ersten Start bzw. über „Einrichten …“) bietet der Schritt „Benachrichtigungen“ die Option „Beim Anmelden automatisch starten“ an, standardmäßig eingeschaltet. Sie wird erst nach erfolgreichem Speichern mit „Fertig“ angewendet. Klappt das nicht oder verlangt macOS eine Bestätigung, bleibt der Assistent auf der Abschlussseite stehen, zeigt den Hinweis und schließt sich erst mit „Schließen“; der Server ist trotzdem gespeichert. Beim Hinzufügen weiterer Server über die Einstellungen erscheint die Option nicht.
+- **Einstellungen:** Der Schalter unter „Allgemein“ zeigt den tatsächlichen Zustand im Betriebssystem und wirkt sofort. Fehler erscheinen direkt darunter. Ohne App-Bundle (z. B. `cargo run` auf macOS) ist er ausgegraut mit dem Hinweis „Nur in der installierten App verfügbar“.
+- **Bestehende Installationen** sehen keinen Assistenten; der Autostart bleibt aus, bis man ihn in den Einstellungen einschaltet.
+
+**Windows:** Der Eintrag ist der Wert `ntfy-native` unter `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` mit dem Pfad zur laufenden `ntfy-native.exe`. Sichtbar und abschaltbar ist er im Task-Manager › Autostart (bzw. Einstellungen › Apps › Autostart). Dort deaktiviert, zeigen die Einstellungen „aus“ mit dem Hinweis „Im Task-Manager deaktiviert – zum Aktivieren hier einschalten“; erst ein ausdrückliches Einschalten des Schalters aktiviert ihn wieder. Wird die `.exe` an einen anderen Ort verschoben (etwa ein neu entpacktes ZIP), korrigiert ntfy-native beim Start einen aktiven Eintrag auf den neuen Pfad; ein abgeschalteter bleibt aus.
+
+**macOS:** ntfy-native meldet sich als Anmeldeobjekt an (Systemeinstellungen › Allgemein › Anmeldeobjekte, Liste „Beim Anmelden öffnen“). Verlangt macOS dort eine Bestätigung, zeigt die App „macOS verlangt eine Bestätigung: Systemeinstellungen › Allgemein › Anmeldeobjekte“. Lässt macOS das Anmeldeobjekt nicht zu, weil die App nicht mit einer Developer ID signiert ist (ad-hoc signierte Releases), legt ntfy-native stattdessen den LaunchAgent `~/Library/LaunchAgents/dev.hemp0r.ntfy-native.plist` an; er erscheint in den Anmeldeobjekten unter „Im Hintergrund erlauben“. Wird der LaunchAgent dort abgeschaltet, zeigt der Schalter „aus“ mit dem Hinweis „In den Systemeinstellungen › Allgemein › Anmeldeobjekte deaktiviert – dort wieder erlauben“; ein abgeschaltetes Anmeldeobjekt meldet macOS als „Bestätigung nötig“ (Schalter an, mit dem Bestätigungs-Hinweis). Wieder erlauben lässt sich beides nur in den Systemeinstellungen, nicht aus der App; der Schalter in der App entfernt den Eintrag beim Ausschalten ganz.
+
+**Entfernen:** Vor dem Löschen der App den Schalter in den Einstellungen ausschalten; das entfernt das Anmeldeobjekt bzw. den LaunchAgent und den `Run`-Wert. Ist die App schon gelöscht, lässt sich ein übrig gebliebener Eintrag von Hand entfernen: unter Windows mit `reg delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v ntfy-native /f`, unter macOS durch Löschen der genannten `.plist` bzw. über „–“ in den Anmeldeobjekten.
 
 ## Konfiguration
 
@@ -258,13 +272,9 @@ Diese Schritte lassen sich nicht automatisieren und werden einmal pro Release au
 
 Releases entstehen vollautomatisch beim Merge auf `main`:
 
-1. `.github/workflows/version.yml` bestimmt die nächste Version (Logik in `scripts/next-version.sh`, getestet über `scripts/test-next-version.sh` in der CI):
-   - Gibt es noch kein Tag `vX.Y.Z`, wird die Version aus `Cargo.toml` unverändert veröffentlicht (erstes Release: `0.1.0`, ohne zusätzlichen Commit).
-   - Ist die Version in `Cargo.toml` höher als das neueste Tag (numerischer Semver-Vergleich), wird sie unverändert veröffentlicht. Für ein neues MAJOR/MINOR setzt man sie daher im PR in `Cargo.toml`: `0.2.0` ergibt exakt das Release `0.2.0`.
-   - Andernfalls wird der Patch des neuesten Tags um 1 erhöht (neuestes Tag `v0.1.5` ergibt `0.1.6`). Der Workflow schreibt die Version in `Cargo.toml` und `Cargo.lock` und committet als `chore(release): vX.Y.Z`.
-   - Tags, die nicht exakt `vMAJOR.MINOR.PATCH` entsprechen (z. B. `v1.0.0-rc1`), werden ignoriert. Pre-Releases gibt es nicht.
+1. `.github/workflows/version.yml` bestimmt die nächste Version aus den Commits seit dem letzten Release (Regeln siehe [Versionen und Release Notes](#versionen-und-release-notes)). Muss die Version steigen, schreibt der Workflow sie in `Cargo.toml` und `Cargo.lock` und committet als `chore(release): vX.Y.Z`.
 2. Der Workflow setzt das annotierte Tag `vX.Y.Z` und pusht Commit und Tag gemeinsam (ohne Force-Push). Existiert das Tag bereits oder ist `main` zwischenzeitlich weitergelaufen, bricht der Lauf ab; der nächste Merge holt das nach.
-3. Anschließend ruft er `.github/workflows/release.yml` auf: Prüfung (fmt, clippy, Tests auf macOS und Windows), universelle macOS-DMG (Apple Silicon + Intel) sowie Windows-ZIPs (x64, ARM64), alles samt `SHA256SUMS.txt` im GitHub-Release. Schlägt nur das Release fehl, genügt „Re-run failed jobs“ oder „Run workflow“ auf dem Workflow „Release“ (Eingabe `tag`, z. B. `v0.1.0`). „Re-run all jobs“ auf dem Version-Lauf bricht bewusst ab, weil der Commit bereits einem Release-Tag zugeordnet ist.
+3. Anschließend ruft er `.github/workflows/release.yml` auf: Prüfung (fmt, clippy, Tests auf macOS und Windows), universelle macOS-DMG (Apple Silicon + Intel) sowie Windows-ZIPs (x64, ARM64), alles samt `SHA256SUMS.txt` und den aus den Commits erzeugten Release Notes im GitHub-Release. Schlägt nur das Release fehl, genügt „Re-run failed jobs“ oder „Run workflow“ auf dem Workflow „Release“ (Eingabe `tag`, z. B. `v0.1.0`). „Re-run all jobs“ auf dem Version-Lauf bricht bewusst ab, weil der Commit bereits einem Release-Tag zugeordnet ist.
 4. Branch Protection bzw. Rulesets auf `main` müssen Pushes von `github-actions[bot]` erlauben, sonst scheitert der Push von Versions-Commit und Tag.
 
 Optionale Repository-Secrets (ohne sie wird die DMG ad-hoc signiert und der Lauf gibt Warnungen aus):
@@ -276,3 +286,20 @@ Optionale Repository-Secrets (ohne sie wird die DMG ad-hoc signiert und der Lauf
 | `MACOS_PROVISION_PROFILE_BASE64` | setzt die Zertifikats-Secrets voraus (ohne Signatur wird das Profil ignoriert); bettet das Provisioning-Profil ein und aktiviert das zeitkritische Entitlement. Die Entitlements werden aus dem Profil übernommen; dessen App-ID muss auf `.dev.hemp0r.ntfy-native` enden, sonst bricht der Lauf ab. Ohne Profil startet macOS die App mit diesem Entitlement nicht, daher wird es dann weggelassen |
 
 Die Windows-Builds sind nicht signiert (SmartScreen warnt beim ersten Start). Ein MSI-Installer folgt in Teil 3 des Plans.
+
+## Versionen und Release Notes
+
+Version und Release Notes ergeben sich aus den Commit-Nachrichten nach [Conventional Commits](https://www.conventionalcommits.org/de/): `typ(scope)!: beschreibung`, z. B. `feat(autostart): offer autostart in first-run wizard` oder `fix: reconnect after sleep`. Scope und `!` sind optional; erlaubte Typen sind `feat`, `fix`, `docs`, `ci`, `test`, `refactor`, `perf`, `build`, `style`, `chore` und `revert`.
+
+**Nächste Version** (`scripts/bump-kind.sh` und `scripts/next-version.sh`, in der CI getestet über `scripts/test-bump-kind.sh` und `scripts/test-next-version.sh`), betrachtet werden die Commits seit dem neuesten Tag `vX.Y.Z`:
+
+- mindestens ein `feat` → Minor: `X.(Y+1).0` (z. B. `v0.1.2` → `0.2.0`),
+- sonst (nur `fix`, `docs`, Commits ohne Typ …) → Patch: `X.Y.(Z+1)`,
+- ein Breaking Change (`!` vor dem Doppelpunkt, z. B. `feat(api)!: …`, oder eine Zeile `BREAKING CHANGE:` bzw. `BREAKING-CHANGE:` im Commit-Text) → vor 1.0 Minor, ab 1.0 Major (`(X+1).0.0`),
+- gibt es noch kein Tag `vX.Y.Z`, wird die Version aus `Cargo.toml` unverändert veröffentlicht,
+- ist die Version in `Cargo.toml` höher als das neueste Tag (numerischer Vergleich), wird sie unverändert veröffentlicht – so lässt sich etwa `1.0.0` bewusst setzen,
+- Merge-Commits und `chore(release):`-Commits zählen nicht; Tags, die nicht exakt `vMAJOR.MINOR.PATCH` sind (z. B. `v1.0.0-rc1`), werden ignoriert. Pre-Releases gibt es nicht.
+
+**Release Notes** (`scripts/release-notes.sh`, getestet über `scripts/test-release-notes.sh`) umfassen die Commits vom nächstälteren Tag `vX.Y.Z` bis zum veröffentlichten Tag – auch beim erneuten Ausführen eines alten Releases. Sie sind gruppiert in „Features“ (`feat`), „Fehlerbehebungen“ (`fix`) und „Sonstiges“ (alles andere, auch Commits ohne Typ); leere Gruppen entfallen. Jeder Eintrag ist die erste Zeile der Commit-Nachricht ohne Typ, mit dem Scope fett davor, „⚠️ Breaking:“ bei Breaking Changes und dem Kurz-SHA als Link auf den Commit. Am Ende steht ein Vergleichslink zum vorherigen Release, sofern es eines gibt. Eine nicht konforme Commit-Nachricht lässt das Release nie scheitern, sie landet unter „Sonstiges“.
+
+**PR-Titel:** Wird ein PR per Squash gemergt, wird sein Titel zur Commit-Zeile. Der Workflow `.github/workflows/pr-title.yml` prüft daher mit `scripts/check-commit-subject.sh`, dass jeder PR-Titel dem Schema `typ(scope)!: beschreibung` mit einem der obigen Typen folgt. Bei normalen Merges zählen die einzelnen Commits des PRs, der Merge-Commit selbst nicht.
