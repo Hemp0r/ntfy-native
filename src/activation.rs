@@ -2,8 +2,8 @@
 //! click, so it may pass its foreground rights on; the child activates
 //! itself once its window is up (`ui::focus`).
 
-/// Windows: allows the next started process to call `SetForegroundWindow`.
-/// Call right before spawning the child.
+/// Windows: lets other processes (the UI child) call `SetForegroundWindow`
+/// while the core still holds the foreground from the tray click.
 pub fn allow_child_foreground() {
     #[cfg(target_os = "windows")]
     {
@@ -13,6 +13,21 @@ pub fn allow_child_foreground() {
             tracing::debug!(error = %e, "AllowSetForegroundWindow failed");
         }
     }
+}
+
+/// Lets an already running child take the foreground when it is asked to
+/// come forward. Main thread (macOS).
+pub fn bring_child_forward(pid: u32) {
+    allow_child_foreground();
+    #[cfg(target_os = "macos")]
+    {
+        activate_core();
+        if !yield_to_child(pid) {
+            tracing::debug!(pid, "could not yield activation to the UI process");
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = pid;
 }
 
 /// macOS: makes the core the active app, so it has activation to yield.

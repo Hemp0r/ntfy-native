@@ -91,6 +91,7 @@ pub struct UiApp {
     activations: u8,
     last_activation: Option<Instant>,
     placement: Option<Placement>,
+    focus_requested: bool,
     closing: bool,
 }
 
@@ -116,6 +117,7 @@ impl UiApp {
             activations: 0,
             last_activation: None,
             placement: None,
+            focus_requested: false,
             closing: false,
         }
     }
@@ -171,6 +173,7 @@ impl UiApp {
                     self.wizard.on_save_result(request_id, &result);
                     self.settings.on_save_result(request_id, &result);
                 }
+                Ok(CoreMsg::Focus) => self.focus_requested = true,
                 Ok(CoreMsg::Close) => {
                     tracing::info!("core asked the window to close");
                     return Flow::Close;
@@ -212,6 +215,10 @@ impl UiApp {
     /// Another activation attempt may follow.
     fn activation_pending(&self) -> bool {
         !self.had_focus && self.activations <= ACTIVATION_RETRIES
+    }
+
+    fn take_focus_request(&mut self) -> bool {
+        std::mem::take(&mut self.focus_requested)
     }
 
     fn note_focus(&mut self, focused: Option<bool>) {
@@ -270,6 +277,13 @@ impl eframe::App for UiApp {
                         .send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 }
             }
+        }
+        if self.take_focus_request() {
+            // The core yielded (macOS) or allowed (Windows) the foreground.
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+            focus::activate(frame);
         }
         if self.frames >= 2 && self.activation_pending() {
             ui.ctx().request_repaint_after(ACTIVATION_RETRY);
@@ -371,6 +385,16 @@ mod tests {
         assert_eq!(a.drain_inbox(), Flow::Close);
         drop(tx);
         assert_eq!(a.drain_inbox(), Flow::Close);
+    }
+
+    #[test]
+    fn focus_request_brings_the_window_forward_once() {
+        let (mut a, tx) = app(UiMode::Settings);
+        assert!(!a.take_focus_request());
+        tx.send(CoreMsg::Focus).unwrap();
+        assert_eq!(a.drain_inbox(), Flow::Continue);
+        assert!(a.take_focus_request());
+        assert!(!a.take_focus_request());
     }
 
     #[test]

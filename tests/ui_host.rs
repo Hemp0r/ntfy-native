@@ -1,4 +1,5 @@
-//! Drives `UiHost` against the real binary in `--ui probe` mode.
+//! Drives `UiHost` against the real binary; children run the windowless
+//! probe loop (`--ui probe`, or any mode with the headless switch).
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
@@ -10,10 +11,13 @@ use ntfy_native::cli::{UiArgs, UiMode};
 use ntfy_native::engine::{Command, EngineHandle};
 use ntfy_native::ipc::{CoreMsg, UiRequest};
 use ntfy_native::snapshot::UiSnapshot;
-use ntfy_native::ui_host::{HostEvent, UiHost};
+use ntfy_native::ui::process::HEADLESS_ENV;
+use ntfy_native::ui_host::{HostEvent, Outcome, UiHost};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// `close()` and replacing a child must not wait for it.
+const NON_BLOCKING: Duration = Duration::from_millis(50);
 
 struct Harness {
     host: UiHost,
@@ -35,6 +39,7 @@ fn harness() -> Harness {
         }),
     )
     .with_env("HOME", home.path())
+    .with_env(HEADLESS_ENV, "1")
     // Children inherit stderr, where debug builds also log.
     .with_env("NTFY_NATIVE_LOG", "off");
     Harness {
@@ -45,13 +50,14 @@ fn harness() -> Harness {
     }
 }
 
+fn args(mode: UiMode) -> UiArgs {
+    UiArgs::window(mode)
+}
+
 fn probe(ignore_close: bool) -> UiArgs {
     UiArgs {
-        mode: UiMode::Probe,
-        anchor: None,
-        monitor: None,
-        scale: None,
         probe_ignore_close: ignore_close,
+        ..args(UiMode::Probe)
     }
 }
 
@@ -64,6 +70,13 @@ fn snapshot() -> UiSnapshot {
         gaps: vec![],
         paused_until: None,
         urgent_breaks_dnd: false,
+    }
+}
+
+fn started(o: Outcome) -> u32 {
+    match o {
+        Outcome::Started(pid) => pid,
+        other => panic!("expected a new child, got {other:?}"),
     }
 }
 
@@ -80,12 +93,22 @@ impl Harness {
         }
     }
 
-    /// Waits for the probe's answer to a snapshot.
+    /// Waits for the probe's answer to a snapshot. A `ResendSnapshot`
+    /// (the hello won the race against `deliver`) is skipped.
     fn expect_test_request(&mut self) {
-        match self.command() {
-            Command::Ui(UiRequest::SendTestNotification) => {}
-            other => panic!("unexpected command {other:?}"),
+        loop {
+            match self.command() {
+                Command::ResendSnapshot => {}
+                Command::Ui(UiRequest::SendTestNotification) => return,
+                other => panic!("unexpected command {other:?}"),
+            }
         }
+    }
+
+    /// Delivers a snapshot and waits for the answer: the child is connected.
+    fn connect(&mut self) {
+        self.host.deliver(CoreMsg::Snapshot(snapshot()));
+        self.expect_test_request();
     }
 
     fn no_command_for(&mut self, d: Duration) {
@@ -97,6 +120,10 @@ impl Harness {
 
     fn event(&self) -> HostEvent {
         self.events.recv_timeout(TIMEOUT).expect("host event")
+    }
+
+    fn child_exited(&self) {
+        assert_eq!(self.event(), HostEvent::ChildExited);
     }
 }
 
@@ -119,42 +146,39 @@ fn reaped(_pid: u32) -> bool {
 #[test]
 fn opens_child_and_forwards_requests() {
     let mut h = harness();
-    h.host.open(probe(false));
+    started(h.host.open(probe(false)));
     assert_eq!(h.host.current_mode(), Some(UiMode::Probe));
-    h.host.deliver(CoreMsg::Snapshot(snapshot()));
-    h.expect_test_request();
-    for _ in 0..2 {
-        h.host.deliver(CoreMsg::Snapshot(snapshot()));
-        h.expect_test_request();
+    for _ in 0..3 {
+        h.connect();
     }
 }
 
 #[test]
 fn toggle_closes_open_popover() {
     let mut h = harness();
-    h.host.toggle_popover(probe(false));
-    assert_eq!(h.host.current_mode(), Some(UiMode::Probe));
-    let pid = h.host.pid().expect("pid");
-    h.host.toggle_popover(probe(false));
+    let pid = started(h.host.toggle_popover(args(UiMode::Popover)));
+    assert_eq!(h.host.current_mode(), Some(UiMode::Popover));
+    assert_eq!(
+        h.host.toggle_popover(args(UiMode::Popover)),
+        Outcome::Closed
+    );
     assert_eq!(h.host.current_mode(), None);
     assert_eq!(h.host.pid(), None);
+    h.child_exited();
     assert!(reaped(pid), "child still exists");
-    assert_eq!(h.event(), HostEvent::ChildExited);
     // A third click opens a fresh one.
-    h.host.toggle_popover(probe(false));
-    assert_eq!(h.host.current_mode(), Some(UiMode::Probe));
-    assert_ne!(h.host.pid(), Some(pid));
+    let again = started(h.host.toggle_popover(args(UiMode::Popover)));
+    assert_ne!(again, pid);
+    assert_eq!(h.host.current_mode(), Some(UiMode::Popover));
 }
 
 #[test]
 fn child_exit_is_detected() {
     let mut h = harness();
-    h.host.open(probe(false));
-    let pid = h.host.pid().expect("pid");
-    h.host.deliver(CoreMsg::Snapshot(snapshot()));
-    h.expect_test_request();
+    let pid = started(h.host.open(probe(false)));
+    h.connect();
     h.host.deliver(CoreMsg::Close);
-    assert_eq!(h.event(), HostEvent::ChildExited);
+    h.child_exited();
     assert_eq!(h.host.current_mode(), None);
     assert!(reaped(pid), "zombie or still running");
     // Nothing reaches a gone child, and the engine never blocks on it.
@@ -165,37 +189,52 @@ fn child_exit_is_detected() {
 #[test]
 fn hanging_child_is_killed_on_close() {
     let mut h = harness();
-    h.host.open(probe(true));
-    let pid = h.host.pid().expect("pid");
-    h.host.deliver(CoreMsg::Snapshot(snapshot()));
-    h.expect_test_request();
+    let pid = started(h.host.open(probe(true)));
+    h.connect();
     let start = Instant::now();
     h.host.close();
-    let took = start.elapsed();
-    assert!(took <= Duration::from_millis(1500), "close took {took:?}");
+    assert!(start.elapsed() < NON_BLOCKING, "close blocked");
     assert_eq!(h.host.current_mode(), None);
+    h.child_exited();
+    let took = start.elapsed();
+    // It ignored `Close`, so only the kill after the grace period ended it.
+    assert!(took >= Duration::from_millis(900), "not killed: {took:?}");
+    assert!(took <= Duration::from_millis(2000), "killed late: {took:?}");
     assert!(reaped(pid), "hanging child survived close");
-    assert_eq!(h.event(), HostEvent::ChildExited);
+}
+
+#[test]
+fn replacing_a_hanging_child_does_not_wait() {
+    let mut h = harness();
+    let old = started(h.host.open(probe(true)));
+    h.connect();
+    let start = Instant::now();
+    let new = started(h.host.open(probe(false)));
+    assert!(start.elapsed() < NON_BLOCKING, "replace blocked");
+    assert_ne!(new, old);
+    h.child_exited();
+    assert!(reaped(old), "replaced child survived");
+    h.connect();
 }
 
 #[test]
 fn new_child_gets_last_snapshot() {
     let mut h = harness();
     h.host.deliver(CoreMsg::Snapshot(snapshot()));
-    h.host.open(probe(false));
+    let old = started(h.host.open(probe(false)));
     h.expect_test_request();
     // A replacement child gets it again, the old one is gone.
-    let old = h.host.pid().expect("pid");
-    h.host.open(probe(false));
-    assert!(reaped(old), "replaced child still exists");
+    started(h.host.open(probe(false)));
     h.expect_test_request();
+    h.child_exited();
+    assert!(reaped(old), "replaced child still exists");
     h.no_command_for(Duration::from_millis(200));
 }
 
 #[test]
 fn child_without_snapshot_asks_the_engine() {
     let mut h = harness();
-    h.host.open(probe(false));
+    started(h.host.open(probe(false)));
     assert!(matches!(h.command(), Command::ResendSnapshot));
     h.host.deliver(CoreMsg::Snapshot(snapshot()));
     h.expect_test_request();
@@ -206,13 +245,12 @@ fn messages_before_the_handshake_are_not_sent() {
     // A result for an old child must not precede the hello (the probe would
     // exit with "missing hello" and never answer).
     let mut h = harness();
-    h.host.open(probe(false));
+    started(h.host.open(probe(false)));
     h.host.deliver(CoreMsg::SaveResult {
         request_id: 1,
         result: Ok("a".into()),
     });
-    h.host.deliver(CoreMsg::Snapshot(snapshot()));
-    h.expect_test_request();
+    h.connect();
 }
 
 #[test]
@@ -220,25 +258,78 @@ fn click_right_after_self_close_does_not_reopen() {
     // The click on the tray icon that took focus from the popover closes it
     // before the click arrives; that click must not reopen it.
     let mut h = harness();
-    h.host.toggle_popover(probe(false));
-    h.host.deliver(CoreMsg::Snapshot(snapshot()));
-    h.expect_test_request();
+    started(h.host.toggle_popover(args(UiMode::Popover)));
+    h.connect();
     h.host.deliver(CoreMsg::Close);
-    assert_eq!(h.event(), HostEvent::ChildExited);
-    h.host.toggle_popover(probe(false));
+    h.child_exited();
+    assert_eq!(
+        h.host.toggle_popover(args(UiMode::Popover)),
+        Outcome::Nothing
+    );
     assert_eq!(h.host.current_mode(), None);
     // A later click opens it again.
     thread::sleep(Duration::from_millis(600));
-    h.host.toggle_popover(probe(false));
-    assert_eq!(h.host.current_mode(), Some(UiMode::Probe));
+    started(h.host.toggle_popover(args(UiMode::Popover)));
+    assert_eq!(h.host.current_mode(), Some(UiMode::Popover));
+}
+
+#[test]
+fn open_settings_window_is_focused_not_replaced() {
+    let mut h = harness();
+    let pid = started(h.host.open(args(UiMode::Settings)));
+    h.connect();
+    assert_eq!(h.host.open(args(UiMode::Settings)), Outcome::Focused(pid));
+    assert_eq!(h.host.open(args(UiMode::Wizard)), Outcome::Focused(pid));
+    // A tray click does not open a popover over it either.
+    assert_eq!(
+        h.host.toggle_popover(args(UiMode::Popover)),
+        Outcome::Focused(pid)
+    );
+    assert_eq!(h.host.current_mode(), Some(UiMode::Settings));
+    assert_eq!(h.host.pid(), Some(pid));
+    // A new child would have answered the stored snapshot.
+    h.no_command_for(Duration::from_millis(300));
+    assert!(h.events.try_recv().is_err(), "a child exited");
+}
+
+#[test]
+fn open_wizard_is_focused_not_replaced() {
+    let mut h = harness();
+    let pid = started(h.host.open(args(UiMode::Wizard)));
+    h.connect();
+    assert_eq!(h.host.open(args(UiMode::Settings)), Outcome::Focused(pid));
+    assert_eq!(h.host.current_mode(), Some(UiMode::Wizard));
+}
+
+#[test]
+fn popover_is_replaced_by_settings() {
+    let mut h = harness();
+    let popover = started(h.host.toggle_popover(args(UiMode::Popover)));
+    h.connect();
+    let settings = started(h.host.open(args(UiMode::Settings)));
+    assert_ne!(settings, popover);
+    assert_eq!(h.host.current_mode(), Some(UiMode::Settings));
+    h.child_exited();
+    assert!(reaped(popover), "popover still exists");
+    h.connect();
 }
 
 #[test]
 fn dropping_the_host_closes_the_child() {
     let mut h = harness();
-    h.host.open(probe(true));
-    let pid = h.host.pid().expect("pid");
+    let pid = started(h.host.open(probe(true)));
     let Harness { host, .. } = h;
     drop(host);
     assert!(reaped(pid), "child outlived the host");
+}
+
+#[test]
+fn close_and_wait_also_waits_for_earlier_closes() {
+    // Quitting right after closing a hanging window must not leave it behind.
+    let mut h = harness();
+    let pid = started(h.host.open(probe(true)));
+    h.connect();
+    h.host.close();
+    h.host.close_and_wait();
+    assert!(reaped(pid), "hanging child survived the quit");
 }

@@ -21,6 +21,9 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Upper bound for flushing queued messages to the core at exit.
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 const LOG_PREFIX: &str = "ui";
+/// Tests only: any mode runs the windowless probe loop, so the core's
+/// window policy can be tested with real modes.
+pub const HEADLESS_ENV: &str = "NTFY_NATIVE_UI_HEADLESS";
 
 pub struct Bridge {
     pub inbox: Receiver<CoreMsg>,
@@ -148,6 +151,7 @@ pub fn kind(m: &CoreMsg) -> &'static str {
         CoreMsg::TestResult { .. } => "test_result",
         CoreMsg::SaveResult { .. } => "save_result",
         CoreMsg::Close => "close",
+        CoreMsg::Focus => "focus",
     }
 }
 
@@ -176,7 +180,7 @@ fn init_logging() -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard>
 }
 
 fn run_logged(args: UiArgs) -> anyhow::Result<()> {
-    if args.mode == UiMode::Probe {
+    if args.mode == UiMode::Probe || std::env::var_os(HEADLESS_ENV).is_some() {
         let bridge = start_bridge(|| {});
         return run_probe(bridge, args.probe_ignore_close);
     }

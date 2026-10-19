@@ -32,7 +32,7 @@ use crate::tray::{
     MonitorRect, OPEN_CONFIG_ID, OPEN_LOGS_ID, QUIT_ID, SETTINGS_ID, SETUP_ID, Tray, popover_args,
 };
 use crate::ui::layout::AnchorRect;
-use crate::ui_host::{HostEvent, UiHost, UiSink};
+use crate::ui_host::{HostEvent, Outcome, UiHost, UiSink};
 
 /// Accepted in the default location when `config.yaml` is missing.
 const FALLBACK_CONFIG_NAME: &str = "config.yml";
@@ -239,21 +239,15 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
                 }
                 if first_start {
                     tracing::info!("nothing set up, opening the setup wizard");
-                    open_ui(&mut host, &proxy, |h| {
-                        h.open(UiArgs::window(UiMode::Wizard))
-                    });
+                    after_show(host.open(UiArgs::window(UiMode::Wizard)), &proxy);
                 }
             }
             Event::UserEvent(UserEvent::TrayClick(icon)) => {
                 let args = popover_args(icon, &monitors(target));
-                if host.current_mode() == Some(UiMode::Popover) {
-                    host.toggle_popover(args);
-                } else {
-                    open_ui(&mut host, &proxy, |h| h.toggle_popover(args));
-                }
+                after_show(host.toggle_popover(args), &proxy);
             }
             Event::UserEvent(UserEvent::OpenUi(mode) | UserEvent::Host(HostEvent::Open(mode))) => {
-                open_ui(&mut host, &proxy, |h| h.open(UiArgs::window(mode)));
+                after_show(host.open(UiArgs::window(mode)), &proxy);
             }
             Event::UserEvent(UserEvent::Host(HostEvent::Quit)) => request_quit(&engine.tx, &proxy),
             Event::UserEvent(UserEvent::Host(HostEvent::ChildExited)) => {}
@@ -269,9 +263,7 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
             }
             Event::UserEvent(UserEvent::DevCycle { open }) => {
                 if open {
-                    open_ui(&mut host, &proxy, |h| {
-                        h.open(UiArgs::window(UiMode::Popover))
-                    });
+                    after_show(host.open(UiArgs::window(UiMode::Popover)), &proxy);
                 } else {
                     host.close();
                 }
@@ -291,7 +283,7 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
             Event::UserEvent(UserEvent::Exit) => *control_flow = ControlFlow::Exit,
             // Also reached when the OS terminates the app (logout, shutdown).
             Event::LoopDestroyed => {
-                host.close();
+                host.close_and_wait();
                 tray = None;
                 if let Some(thread) = engine_thread.take() {
                     stop_engine(&engine, thread);
@@ -333,18 +325,16 @@ fn monitors(target: &EventLoopWindowTarget<UserEvent>) -> Vec<MonitorRect> {
         .collect()
 }
 
-/// Runs `f` (which may start a UI process) with the foreground handed to
-/// the new process where the platform needs the core's help.
-fn open_ui(host: &mut UiHost, proxy: &EventLoopProxy<UserEvent>, f: impl FnOnce(&mut UiHost)) {
+/// macOS: a new child may only activate itself once the core, active from
+/// the click, yields to it. Nothing happens when nothing opened.
+fn after_show(outcome: Outcome, proxy: &EventLoopProxy<UserEvent>) {
     #[cfg(target_os = "macos")]
-    crate::activation::activate_core();
-    let before = host.pid();
-    f(host);
-    let started = host.pid().filter(|p| Some(*p) != before);
-    #[cfg(target_os = "macos")]
-    yield_when_registered(started, proxy.clone());
+    if let Outcome::Started(pid) = outcome {
+        crate::activation::activate_core();
+        yield_when_registered(pid, proxy.clone());
+    }
     #[cfg(not(target_os = "macos"))]
-    let _ = (started, proxy);
+    let _ = (outcome, proxy);
 }
 
 /// Upper bound for the UI process to register as an application.
@@ -352,10 +342,7 @@ fn open_ui(host: &mut UiHost, proxy: &EventLoopProxy<UserEvent>, f: impl FnOnce(
 const REGISTER_WAIT: Duration = Duration::from_secs(3);
 
 #[cfg(target_os = "macos")]
-fn yield_when_registered(pid: Option<u32>, proxy: EventLoopProxy<UserEvent>) {
-    let Some(pid) = pid else {
-        return;
-    };
+fn yield_when_registered(pid: u32, proxy: EventLoopProxy<UserEvent>) {
     spawn_detached("ui-activation", move || {
         let deadline = Instant::now() + REGISTER_WAIT;
         while Instant::now() < deadline {

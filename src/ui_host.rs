@@ -1,16 +1,16 @@
 //! Core side of the UI process: spawns, replaces and closes the `--ui`
 //! child and bridges its JSON-lines protocol to the engine. Nothing here
-//! blocks the engine: messages go through a channel to a writer thread, and
-//! a reader thread handles everything the child sends.
+//! blocks the engine or the main thread: messages go through a queue to a
+//! writer thread, a reader thread handles everything the child sends, and
+//! closed children are reaped on their own thread.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command as Process, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread;
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::actions::open_local_dir;
@@ -18,6 +18,7 @@ use crate::activation;
 use crate::cli::{UiArgs, UiMode};
 use crate::engine::{Command, EngineHandle};
 use crate::ipc::{CoreMsg, PROTOCOL_VERSION, UiMsg, UiRequest, read_msg, write_msg};
+use crate::msg_queue::MsgQueue;
 use crate::snapshot::UiSnapshot;
 
 /// How long a child may take to exit after `Close` before it is killed.
@@ -35,7 +36,25 @@ pub enum HostEvent {
     ChildExited,
 }
 
+/// What `open` or `toggle_popover` did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// A new child with this pid.
+    Started(u32),
+    /// The open settings or wizard window (this pid) was brought forward.
+    Focused(u32),
+    Closed,
+    /// Nothing opened (the click that closed the popover, or a failure).
+    Nothing,
+}
+
 pub type EventSink = Arc<dyn Fn(HostEvent) + Send + Sync>;
+
+/// Settings and wizard hold user input: another request focuses them
+/// instead of replacing them. Only the popover is replaced.
+fn keeps_window(mode: UiMode) -> bool {
+    matches!(mode, UiMode::Settings | UiMode::Wizard)
+}
 
 /// What a request from the UI turns into.
 #[derive(Debug, PartialEq)]
@@ -58,11 +77,18 @@ fn route(req: UiRequest) -> Route {
 }
 
 /// The current child's input, shared with `deliver` and the reader thread.
+/// Dropping it ends the queue, so the writer closes the child's stdin.
 struct Link {
     id: u64,
-    writer: Sender<CoreMsg>,
+    queue: Arc<MsgQueue>,
     /// Hello exchanged; before that nothing but the hello may be written.
     connected: bool,
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        self.queue.close();
+    }
 }
 
 #[derive(Default)]
@@ -91,7 +117,7 @@ impl UiSink {
             o.snapshot = Some(s.clone());
         }
         if let Some(link) = o.link.as_ref().filter(|l| l.connected) {
-            let _ = link.writer.send(msg);
+            link.queue.push(msg);
         }
     }
 }
@@ -126,6 +152,8 @@ pub struct UiHost {
     folders: Folders,
     sink: UiSink,
     current: Option<Running>,
+    /// Threads still reaping closed children.
+    reapers: Vec<JoinHandle<()>>,
     next_id: u64,
 }
 
@@ -141,6 +169,7 @@ impl UiHost {
                 outlet: Arc::default(),
             },
             current: None,
+            reapers: Vec::new(),
             next_id: 1,
         }
     }
@@ -166,9 +195,113 @@ impl UiHost {
         self.sink.clone()
     }
 
-    /// Replaces a running child (close, wait up to a second, then kill).
-    pub fn open(&mut self, args: UiArgs) {
+    /// An open settings or wizard window is brought forward instead;
+    /// otherwise a running child (the popover) is replaced.
+    pub fn open(&mut self, args: UiArgs) -> Outcome {
+        if let Some(pid) = self.kept_window() {
+            return self.focus(pid);
+        }
         self.close();
+        self.spawn(args)
+    }
+
+    /// An open window of `args.mode` is closed, an open settings or wizard
+    /// window is brought forward, otherwise one is opened.
+    pub fn toggle_popover(&mut self, args: UiArgs) -> Outcome {
+        if self.current_mode() == Some(args.mode) {
+            self.close();
+            return Outcome::Closed;
+        }
+        if let Some(pid) = self.kept_window() {
+            return self.focus(pid);
+        }
+        let just_closed = {
+            let mut o = lock(&self.sink.outlet);
+            match o.self_closed.take() {
+                Some((mode, at)) => mode == args.mode && at.elapsed() < REOPEN_DEBOUNCE,
+                None => false,
+            }
+        };
+        if just_closed {
+            tracing::debug!("click closed the popover, not reopening");
+            return Outcome::Nothing;
+        }
+        self.open(args)
+    }
+
+    /// Sends to the child once it is connected; a snapshot is also kept for
+    /// the next child.
+    pub fn deliver(&self, msg: CoreMsg) {
+        self.sink.deliver(msg);
+    }
+
+    /// Asks the child to close; a reaper thread kills it if it has not
+    /// exited after a second. Returns at once.
+    pub fn close(&mut self) {
+        let Some(run) = self.detach() else {
+            return;
+        };
+        self.reapers.retain(|r| !r.is_finished());
+        let process = run.process.clone();
+        match spawn_thread("ui-reaper", move || reap(&process, CLOSE_GRACE)) {
+            Ok(handle) => self.reapers.push(handle),
+            Err(e) => {
+                tracing::warn!(error = %e, "starting the reaper failed, reaping inline");
+                reap(&run.process, CLOSE_GRACE);
+            }
+        }
+    }
+
+    /// Like [`UiHost::close`], but returns only once this and every earlier
+    /// closed child is gone. For quitting, so no child outlives the app.
+    pub fn close_and_wait(&mut self) {
+        if let Some(run) = self.detach() {
+            reap(&run.process, CLOSE_GRACE);
+        }
+        for r in self.reapers.drain(..) {
+            let _ = r.join();
+        }
+    }
+
+    pub fn current_mode(&self) -> Option<UiMode> {
+        self.current.as_ref().filter(|r| r.alive()).map(|r| r.mode)
+    }
+
+    pub fn pid(&self) -> Option<u32> {
+        self.current.as_ref().filter(|r| r.alive()).map(|r| r.pid)
+    }
+
+    fn kept_window(&self) -> Option<u32> {
+        self.current
+            .as_ref()
+            .filter(|r| r.alive() && keeps_window(r.mode))
+            .map(|r| r.pid)
+    }
+
+    fn focus(&self, pid: u32) -> Outcome {
+        tracing::debug!(pid, "bringing the open window forward");
+        // Hand over the foreground before the window asks for it.
+        activation::bring_child_forward(pid);
+        self.deliver(CoreMsg::Focus);
+        Outcome::Focused(pid)
+    }
+
+    /// Stops talking to the current child: `Close` if connected, then its
+    /// stdin is closed. The caller reaps it.
+    fn detach(&mut self) -> Option<Running> {
+        let run = self.current.take()?;
+        run.closing.store(true, Ordering::SeqCst);
+        let link = lock(&self.sink.outlet).link.take_if(|l| l.id == run.id);
+        if let Some(link) = link.filter(|l| l.connected) {
+            link.queue.push(CoreMsg::Close);
+        }
+        if run.alive() {
+            tracing::info!(mode = ?run.mode, pid = run.pid, "closing UI process");
+        }
+        Some(run)
+    }
+
+    fn spawn(&mut self, args: UiArgs) -> Outcome {
         activation::allow_child_foreground();
         let mut cmd = Process::new(&self.exe);
         cmd.args(args.to_args())
@@ -180,18 +313,18 @@ impl UiHost {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, mode = ?args.mode, "starting the UI process failed");
-                return;
+                return Outcome::Nothing;
             }
         };
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             tracing::error!("UI process without pipes");
             kill_and_wait(&mut child);
-            return;
+            return Outcome::Nothing;
         };
         let id = self.next_id;
         self.next_id += 1;
         let pid = child.id();
-        let (writer, inbox) = mpsc::channel();
+        let queue = Arc::new(MsgQueue::default());
         let running = Running {
             id,
             mode: args.mode,
@@ -202,7 +335,7 @@ impl UiHost {
         };
         lock(&self.sink.outlet).link = Some(Link {
             id,
-            writer,
+            queue: queue.clone(),
             connected: false,
         });
         let reader = Reader {
@@ -216,86 +349,28 @@ impl UiHost {
             on_event: self.on_event.clone(),
             folders: self.folders.clone(),
         };
-        let started = spawn_thread("ui-host-write", move || write_loop(inbox, stdin))
+        let started = spawn_thread("ui-host-write", move || write_loop(&queue, stdin))
             .and_then(|_| spawn_thread("ui-host-read", move || reader.run(stdout)));
         if let Err(e) = started {
             tracing::error!(error = %e, "starting the UI threads failed");
             lock(&self.sink.outlet).link = None;
             kill_and_wait(&mut lock(&running.process));
-            return;
+            return Outcome::Nothing;
         }
         tracing::info!(mode = ?args.mode, pid, "UI process started");
         self.current = Some(running);
-    }
-
-    /// An open window of `args.mode` is closed, otherwise one is opened.
-    pub fn toggle_popover(&mut self, args: UiArgs) {
-        if self.current_mode() == Some(args.mode) {
-            self.close();
-            return;
-        }
-        let just_closed = {
-            let mut o = lock(&self.sink.outlet);
-            match o.self_closed.take() {
-                Some((mode, at)) => mode == args.mode && at.elapsed() < REOPEN_DEBOUNCE,
-                None => false,
-            }
-        };
-        if just_closed {
-            tracing::debug!("click closed the popover, not reopening");
-            return;
-        }
-        self.open(args);
-    }
-
-    /// Sends to the child once it is connected; a snapshot is also kept for
-    /// the next child.
-    pub fn deliver(&self, msg: CoreMsg) {
-        self.sink.deliver(msg);
-    }
-
-    /// Asks the child to close and kills it if it has not exited after a
-    /// second. Returns once it is gone.
-    pub fn close(&mut self) {
-        let Some(run) = self.current.take() else {
-            return;
-        };
-        run.closing.store(true, Ordering::SeqCst);
-        {
-            let mut o = lock(&self.sink.outlet);
-            if let Some(link) = o.link.take_if(|l| l.id == run.id)
-                && link.connected
-            {
-                let _ = link.writer.send(CoreMsg::Close);
-            }
-            // Dropping the link closes the child's stdin after `Close`.
-        }
-        if run.alive() {
-            tracing::info!(mode = ?run.mode, pid = run.pid, "closing UI process");
-        }
-        reap(&run.process, CLOSE_GRACE);
-    }
-
-    pub fn current_mode(&self) -> Option<UiMode> {
-        self.current.as_ref().filter(|r| r.alive()).map(|r| r.mode)
-    }
-
-    pub fn pid(&self) -> Option<u32> {
-        self.current.as_ref().filter(|r| r.alive()).map(|r| r.pid)
+        Outcome::Started(pid)
     }
 }
 
 impl Drop for UiHost {
     fn drop(&mut self) {
-        self.close();
+        self.close_and_wait();
     }
 }
 
-fn spawn_thread(name: &str, f: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
-    thread::Builder::new()
-        .name(name.into())
-        .spawn(f)
-        .map(|_| ())
+fn spawn_thread(name: &str, f: impl FnOnce() + Send + 'static) -> std::io::Result<JoinHandle<()>> {
+    thread::Builder::new().name(name.into()).spawn(f)
 }
 
 fn kill_and_wait(child: &mut Child) {
@@ -324,10 +399,10 @@ fn reap(process: &Mutex<Child>, grace: Duration) {
     kill_and_wait(&mut lock(process));
 }
 
-/// Ends when the link is dropped (closing stdin) or the child stops reading.
-fn write_loop(inbox: Receiver<CoreMsg>, stdin: ChildStdin) {
+/// Ends when the queue is closed (closing stdin) or the child stops reading.
+fn write_loop(queue: &MsgQueue, stdin: ChildStdin) {
     let mut out = BufWriter::new(stdin);
-    for m in inbox {
+    while let Some(m) = queue.pop() {
         if let Err(e) = write_msg(&mut out, &m) {
             tracing::debug!(error = %e, "writing to the UI process failed");
             break;
@@ -362,13 +437,14 @@ impl Reader {
                 }
             }
         };
-        {
+        let link = {
             let mut o = lock(&self.outlet);
-            o.link.take_if(|l| l.id == self.id);
             if clean && !self.closing.load(Ordering::SeqCst) {
                 o.self_closed = Some((self.mode, Instant::now()));
             }
-        }
+            o.link.take_if(|l| l.id == self.id)
+        };
+        drop(link);
         if clean {
             reap(&self.process, CLOSE_GRACE);
         } else {
@@ -395,11 +471,11 @@ impl Reader {
             let Some(link) = link.as_mut().filter(|l| l.id == self.id) else {
                 return;
             };
-            let _ = link.writer.send(CoreMsg::Hello {
+            link.queue.push(CoreMsg::Hello {
                 version: PROTOCOL_VERSION,
             });
             if let Some(s) = snapshot {
-                let _ = link.writer.send(CoreMsg::Snapshot(s.clone()));
+                link.queue.push(CoreMsg::Snapshot(s.clone()));
             }
             link.connected = true;
             snapshot.is_none()
@@ -461,17 +537,30 @@ mod tests {
         }
     }
 
-    fn sink_with_link(connected: bool) -> (UiSink, Receiver<CoreMsg>) {
+    #[test]
+    fn only_settings_and_wizard_are_kept() {
+        assert!(keeps_window(UiMode::Settings));
+        assert!(keeps_window(UiMode::Wizard));
+        assert!(!keeps_window(UiMode::Popover));
+        assert!(!keeps_window(UiMode::Probe));
+    }
+
+    fn sink_with_link(connected: bool) -> (UiSink, Arc<MsgQueue>) {
         let sink = UiSink {
             outlet: Arc::default(),
         };
-        let (writer, rx) = mpsc::channel();
+        let queue = Arc::new(MsgQueue::default());
         lock(&sink.outlet).link = Some(Link {
             id: 1,
-            writer,
+            queue: queue.clone(),
             connected,
         });
-        (sink, rx)
+        (sink, queue)
+    }
+
+    fn sent(sink: UiSink, queue: &MsgQueue) -> Vec<CoreMsg> {
+        drop(sink);
+        std::iter::from_fn(|| queue.pop()).collect()
     }
 
     fn snapshot() -> UiSnapshot {
@@ -488,16 +577,28 @@ mod tests {
 
     #[test]
     fn sink_holds_messages_until_connected_but_keeps_the_snapshot() {
-        let (sink, rx) = sink_with_link(false);
+        let (sink, queue) = sink_with_link(false);
         sink.deliver(CoreMsg::Snapshot(snapshot()));
-        sink.deliver(CoreMsg::Close);
-        assert!(rx.try_recv().is_err());
+        sink.deliver(CoreMsg::Focus);
         assert_eq!(lock(&sink.outlet).snapshot, Some(snapshot()));
+        assert_eq!(sent(sink, &queue), []);
 
-        let (sink, rx) = sink_with_link(true);
+        let (sink, queue) = sink_with_link(true);
         sink.deliver(CoreMsg::Snapshot(snapshot()));
+        sink.deliver(CoreMsg::Focus);
+        assert_eq!(
+            sent(sink, &queue),
+            [CoreMsg::Snapshot(snapshot()), CoreMsg::Focus]
+        );
+    }
+
+    #[test]
+    fn dropping_the_link_ends_the_writer_queue() {
+        let (sink, queue) = sink_with_link(true);
         sink.deliver(CoreMsg::Close);
-        let got: Vec<_> = rx.try_iter().collect();
-        assert_eq!(got, [CoreMsg::Snapshot(snapshot()), CoreMsg::Close]);
+        lock(&sink.outlet).link = None;
+        assert_eq!(queue.pop(), Some(CoreMsg::Close));
+        assert_eq!(queue.pop(), None);
+        assert!(!queue.push(CoreMsg::Focus));
     }
 }

@@ -56,6 +56,8 @@ Erst „Fertig“ speichert; bei einem Fehler oder „Abbrechen“ bleibt alles 
 
 Das Einstellungsfenster („Einstellungen …“ im Tray-Menü oder im Popover) verwaltet alle Server: „Server hinzufügen“, „Bearbeiten“ (Adresse, Anmeldung, Topics, Server-Cache-Dauer; ein leer gelassenes Token- bzw. Passwortfeld behält das gespeicherte) und „Entfernen“. Je Topic lassen sich „Stumm“ und „Dringend“ (Standard, An, Aus) einstellen. Unter „Allgemein“ stehen die globale Einstellung für dringende Nachrichten, die Ordner für Konfiguration und Logs sowie die Version. Änderungen gelten sofort, ohne Neustart.
 
+Ist das Einstellungsfenster oder der Assistent schon offen, holt jeder weitere Aufruf (Tray-Klick, „Einstellungen …“, „Einrichten …“) dieses Fenster nach vorn, statt es zu ersetzen; nicht gespeicherte Eingaben bleiben erhalten. Nur das Popover wird durch ein anderes Fenster ersetzt.
+
 ## Konfiguration
 
 Die Datei `config.yaml` ist eine Alternative zum Einrichtungsassistenten, vor allem für eine automatische Installation (z. B. per Softwareverteilung): Liegt sie beim ersten Start am Standardort, wird sie importiert und der Assistent öffnet sich nicht.

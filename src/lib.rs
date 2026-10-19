@@ -16,6 +16,7 @@ pub mod instance_lock;
 pub mod ipc;
 pub mod logging;
 pub mod media;
+pub mod msg_queue;
 pub mod notification;
 pub mod notify;
 pub mod ntfy;

@@ -25,6 +25,8 @@ pub enum CoreMsg {
         result: Result<String, String>,
     },
     Close,
+    /// Bring the open window to the front (it was requested again).
+    Focus,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -222,6 +224,7 @@ mod tests {
                 result: Err("bad".into()),
             },
             CoreMsg::Close,
+            CoreMsg::Focus,
         ];
         for m in core {
             roundtrip(m);
