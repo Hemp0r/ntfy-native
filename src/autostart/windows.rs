@@ -99,11 +99,12 @@ mod sys {
 
         fn set(&self, enabled: bool) -> Result<AutostartState> {
             if enabled {
+                // Read first, so a failing read leaves nothing half-applied.
+                let user_off = get_binary(APPROVED_KEY, VALUE_NAME)?
+                    .is_some_and(|b| startup_approved_disabled(&b));
                 self.write_run_value()?;
                 // Switching on explicitly overrides a Task Manager disable.
-                if get_binary(APPROVED_KEY, VALUE_NAME)?
-                    .is_some_and(|b| startup_approved_disabled(&b))
-                {
+                if user_off {
                     set_value(APPROVED_KEY, VALUE_NAME, REG_BINARY, &ENABLED_APPROVAL)?;
                 }
             } else {

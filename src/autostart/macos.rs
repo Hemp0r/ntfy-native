@@ -40,6 +40,10 @@ pub fn launch_agent_plist(label: &str, program: &Path) -> String {
 <dict>
 	<key>Label</key>
 	<string>{}</string>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>{}</string>
+	</array>
 	<key>ProgramArguments</key>
 	<array>
 		<string>{}</string>
@@ -50,6 +54,7 @@ pub fn launch_agent_plist(label: &str, program: &Path) -> String {
 </plist>
 "#,
         xml_escape(label),
+        xml_escape(APP_ID),
         xml_escape(&program.to_string_lossy())
     )
 }
@@ -69,37 +74,74 @@ fn xml_escape(s: &str) -> String {
     out
 }
 
+/// `kSMErrorInvalidSignature`.
+pub const SM_ERROR_INVALID_SIGNATURE: isize = 3;
+/// `kSMErrorLaunchDeniedByUser`.
+pub const SM_ERROR_LAUNCH_DENIED_BY_USER: isize = 11;
+
+/// A failed `SMAppService.register`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SmError {
+    pub code: isize,
+    pub message: String,
+    /// Status read after the failure.
+    pub status: SmStatus,
+}
+
 /// Which mechanism serves autostart after trying `SMAppService.register`
 /// (`register` = status after it, or its error), and the resulting state.
-/// Registration fails or does not take for apps without a proper signature;
-/// those fall back to a LaunchAgent.
+/// Only a refused signature (ad-hoc builds) or a missing app falls back to a
+/// LaunchAgent; a login item the user denied is never bypassed.
 pub fn choose_mechanism(
     in_bundle: bool,
-    register: Result<SmStatus, String>,
-) -> (Mechanism, AutostartState) {
+    register: Result<SmStatus, SmError>,
+) -> Result<(Mechanism, AutostartState), String> {
+    use Mechanism::{LaunchAgent, ServiceManagement};
     if !in_bundle {
-        return (Mechanism::ServiceManagement, AutostartState::Unavailable);
+        return Ok((ServiceManagement, AutostartState::Unavailable));
     }
-    match register {
-        Ok(SmStatus::Enabled) => (Mechanism::ServiceManagement, AutostartState::Enabled),
-        Ok(SmStatus::RequiresApproval) => {
-            (Mechanism::ServiceManagement, AutostartState::NeedsApproval)
+    let status = match register {
+        Err(e) if e.code == SM_ERROR_INVALID_SIGNATURE => {
+            return Ok((LaunchAgent, AutostartState::Enabled));
         }
-        Ok(SmStatus::NotFound | SmStatus::NotRegistered) | Err(_) => {
-            (Mechanism::LaunchAgent, AutostartState::Enabled)
-        }
+        Err(e) if e.status == SmStatus::NotRegistered => return Err(e.message),
+        Err(e) => e.status,
+        Ok(status) => status,
+    };
+    match status {
+        SmStatus::Enabled => Ok((ServiceManagement, AutostartState::Enabled)),
+        SmStatus::RequiresApproval => Ok((ServiceManagement, AutostartState::NeedsApproval)),
+        SmStatus::NotFound => Ok((LaunchAgent, AutostartState::Enabled)),
+        SmStatus::NotRegistered => Err("the login item was not registered".into()),
     }
 }
 
-/// Current state from the `SMAppService` status and whether our
-/// LaunchAgent exists; either one active counts as enabled.
-pub fn current_state(in_bundle: bool, sm: SmStatus, launch_agent: bool) -> AutostartState {
-    match (in_bundle, sm, launch_agent) {
-        (false, _, _) => AutostartState::Unavailable,
-        (true, SmStatus::Enabled, _) | (true, _, true) => AutostartState::Enabled,
-        (true, SmStatus::RequiresApproval, false) => AutostartState::NeedsApproval,
-        (true, SmStatus::NotRegistered | SmStatus::NotFound, false) => AutostartState::Disabled,
+/// Current state from the login item's status and our LaunchAgent's
+/// background-item status (`None` without a LaunchAgent). Either one active
+/// counts as enabled; a LaunchAgent turned off under "Allow in the
+/// Background" as disabled by the user.
+pub fn current_state(
+    in_bundle: bool,
+    sm: SmStatus,
+    launch_agent: Option<SmStatus>,
+) -> AutostartState {
+    if !in_bundle {
+        return AutostartState::Unavailable;
     }
+    match (sm, launch_agent) {
+        (SmStatus::Enabled, _) | (_, Some(SmStatus::Enabled)) => AutostartState::Enabled,
+        (_, Some(SmStatus::RequiresApproval)) => AutostartState::DisabledByUser,
+        (SmStatus::RequiresApproval, _) => AutostartState::NeedsApproval,
+        _ => AutostartState::Disabled,
+    }
+}
+
+/// Whether macOS runs the app from a temporary copy (Gatekeeper App
+/// Translocation); such a path is gone after the next login.
+pub fn is_translocated(program: &Path) -> bool {
+    program
+        .components()
+        .any(|c| c.as_os_str() == "AppTranslocation")
 }
 
 #[cfg(target_os = "macos")]
@@ -110,11 +152,12 @@ mod sys {
 
     use anyhow::{Context, Result, anyhow, bail};
     use objc2::rc::autoreleasepool;
-    use objc2_foundation::NSBundle;
+    use objc2_foundation::{NSBundle, NSString, NSURL};
     use objc2_service_management::{SMAppService, SMAppServiceStatus};
 
     use super::{
-        Mechanism, SmStatus, choose_mechanism, current_state, launch_agent_path, launch_agent_plist,
+        Mechanism, SM_ERROR_INVALID_SIGNATURE, SmError, SmStatus, choose_mechanism, current_state,
+        is_translocated, launch_agent_path, launch_agent_plist,
     };
     use crate::autostart::{Autostart, AutostartState, should_repair};
     use crate::notify::write_if_changed;
@@ -124,6 +167,7 @@ mod sys {
         program: PathBuf,
         plist: PathBuf,
         in_bundle: bool,
+        force_launch_agent: bool,
     }
 
     impl MacAutostart {
@@ -138,11 +182,30 @@ mod sys {
                 program,
                 plist: launch_agent_path(&home),
                 in_bundle,
+                force_launch_agent: false,
             })
         }
 
-        fn launch_agent_present(&self) -> bool {
-            self.plist.is_file()
+        /// For manual checks: `set(true)` skips the login item as if the
+        /// signature had been refused.
+        pub fn launch_agent_only(program: PathBuf) -> Result<Self> {
+            Ok(Self {
+                force_launch_agent: true,
+                ..Self::new(program)?
+            })
+        }
+
+        /// Background-item status of our LaunchAgent, `None` without one.
+        fn launch_agent_status(&self) -> Option<SmStatus> {
+            if !self.plist.is_file() {
+                return None;
+            }
+            let path = NSString::from_str(&self.plist.to_string_lossy());
+            // SAFETY: status query for a file URL.
+            let status = autoreleasepool(|_| unsafe {
+                SMAppService::statusForLegacyURL(&NSURL::fileURLWithPath(&path))
+            });
+            Some(map_status(status))
         }
 
         fn write_launch_agent(&self) -> Result<()> {
@@ -162,9 +225,7 @@ mod sys {
         }
     }
 
-    fn sm_status() -> SmStatus {
-        // SAFETY: plain status query of the main app service.
-        let status = autoreleasepool(|_| unsafe { SMAppService::mainAppService().status() });
+    fn map_status(status: SMAppServiceStatus) -> SmStatus {
         if status == SMAppServiceStatus::Enabled {
             SmStatus::Enabled
         } else if status == SMAppServiceStatus::RequiresApproval {
@@ -176,14 +237,25 @@ mod sys {
         }
     }
 
+    fn sm_status() -> SmStatus {
+        // SAFETY: plain status query of the main app service.
+        map_status(autoreleasepool(|_| unsafe {
+            SMAppService::mainAppService().status()
+        }))
+    }
+
     /// `register` (unless already enabled) and the status afterwards.
-    fn sm_register() -> Result<SmStatus, String> {
+    fn sm_register() -> Result<SmStatus, SmError> {
         if sm_status() == SmStatus::Enabled {
             return Ok(SmStatus::Enabled);
         }
         // SAFETY: registers the running app's own bundle.
         autoreleasepool(|_| unsafe { SMAppService::mainAppService().registerAndReturnError() })
-            .map_err(|e| format!("{} (code {})", e.localizedDescription(), e.code()))?;
+            .map_err(|e| SmError {
+                code: e.code(),
+                message: format!("{} (code {})", e.localizedDescription(), e.code()),
+                status: sm_status(),
+            })?;
         Ok(sm_status())
     }
 
@@ -198,7 +270,7 @@ mod sys {
             if !self.in_bundle {
                 return AutostartState::Unavailable;
             }
-            current_state(true, sm_status(), self.launch_agent_present())
+            current_state(true, sm_status(), self.launch_agent_status())
         }
 
         fn set(&self, enabled: bool) -> Result<AutostartState> {
@@ -206,14 +278,29 @@ mod sys {
                 bail!("autostart needs the app bundle");
             }
             if enabled {
-                let register = sm_register();
-                if let Err(e) = &register {
-                    tracing::info!(error = %e, "login item registration failed, using a LaunchAgent");
+                if is_translocated(&self.program) {
+                    bail!("app is running from a temporary location; move it to /Applications");
                 }
-                match choose_mechanism(true, register) {
+                let register = if self.force_launch_agent {
+                    Err(SmError {
+                        code: SM_ERROR_INVALID_SIGNATURE,
+                        message: "login item skipped".into(),
+                        status: SmStatus::NotRegistered,
+                    })
+                } else {
+                    sm_register()
+                };
+                if let Err(e) = &register {
+                    tracing::info!(error = %e.message, "login item registration failed");
+                }
+                match choose_mechanism(true, register)
+                    .map_err(|e| anyhow!(e))
+                    .context("registering the login item")?
+                {
                     (_, AutostartState::Unavailable) => bail!("autostart needs the app bundle"),
                     (Mechanism::LaunchAgent, _) => self.write_launch_agent()?,
-                    // Avoid a second start through a leftover LaunchAgent.
+                    // No second start, and no bypass of a denied login
+                    // item, through a leftover LaunchAgent.
                     (Mechanism::ServiceManagement, _) => self.remove_launch_agent()?,
                 }
             } else {
@@ -235,13 +322,17 @@ mod sys {
 
         fn repair(&self) -> Result<()> {
             // The login item always refers to the running bundle; only the
-            // LaunchAgent names a path.
-            if !self.in_bundle || !self.launch_agent_present() {
+            // LaunchAgent names a path. A temporary location is no target.
+            if !self.in_bundle || is_translocated(&self.program) {
                 return Ok(());
             }
+            let Some(agent) = self.launch_agent_status() else {
+                return Ok(());
+            };
             let targets = fs::read_to_string(&self.plist)
                 .is_ok_and(|s| s == launch_agent_plist(APP_ID, &self.program));
-            if should_repair(self.state(), targets) {
+            let agent_state = current_state(true, SmStatus::NotRegistered, Some(agent));
+            if should_repair(agent_state, targets) {
                 self.write_launch_agent()?;
                 tracing::info!(program = %self.program.display(), "autostart entry repaired");
             }
@@ -272,6 +363,12 @@ mod tests {
             "{plist}"
         );
         assert!(!plist.contains("Tom & Jerry"), "{plist}");
+        assert!(
+            plist.contains(
+                "<key>AssociatedBundleIdentifiers</key>\n\t<array>\n\t\t<string>dev.hemp0r.ntfy-native</string>\n\t</array>"
+            ),
+            "{plist}"
+        );
         let mut reader = quick_xml::Reader::from_str(&plist);
         let mut depth = 0usize;
         loop {
@@ -285,60 +382,116 @@ mod tests {
         assert_eq!(depth, 0, "balanced elements");
     }
 
+    fn sm_error(code: isize, status: SmStatus) -> SmError {
+        SmError {
+            code,
+            message: format!("error {code}"),
+            status,
+        }
+    }
+
     #[test]
     fn mac_mechanism_choice() {
+        use Mechanism::{LaunchAgent, ServiceManagement};
         assert_eq!(
-            choose_mechanism(false, Ok(SmStatus::Enabled)).1,
+            choose_mechanism(false, Ok(SmStatus::Enabled)).unwrap().1,
             Unavailable
         );
+        let no_bundle = Err(sm_error(SM_ERROR_INVALID_SIGNATURE, SmStatus::NotFound));
+        assert_eq!(choose_mechanism(false, no_bundle).unwrap().1, Unavailable);
         assert_eq!(
-            choose_mechanism(false, Err("no bundle".into())).1,
-            Unavailable
+            choose_mechanism(true, Ok(SmStatus::Enabled)).unwrap(),
+            (ServiceManagement, Enabled)
         );
         assert_eq!(
-            choose_mechanism(true, Ok(SmStatus::Enabled)),
-            (Mechanism::ServiceManagement, Enabled)
+            choose_mechanism(true, Ok(SmStatus::RequiresApproval)).unwrap(),
+            (ServiceManagement, NeedsApproval)
         );
         assert_eq!(
-            choose_mechanism(true, Ok(SmStatus::RequiresApproval)),
-            (Mechanism::ServiceManagement, NeedsApproval)
+            choose_mechanism(true, Ok(SmStatus::NotFound)).unwrap(),
+            (LaunchAgent, Enabled)
+        );
+        assert!(choose_mechanism(true, Ok(SmStatus::NotRegistered)).is_err());
+        // Ad-hoc or broken signature: LaunchAgent.
+        let bad_signature = sm_error(SM_ERROR_INVALID_SIGNATURE, SmStatus::NotRegistered);
+        assert_eq!(
+            choose_mechanism(true, Err(bad_signature)).unwrap(),
+            (LaunchAgent, Enabled)
         );
         assert_eq!(
-            choose_mechanism(true, Ok(SmStatus::NotFound)),
-            (Mechanism::LaunchAgent, Enabled)
+            choose_mechanism(true, Err(sm_error(1, SmStatus::NotFound))).unwrap(),
+            (LaunchAgent, Enabled)
+        );
+        // Denied by the user: no bypass through a LaunchAgent.
+        let denied = sm_error(SM_ERROR_LAUNCH_DENIED_BY_USER, SmStatus::RequiresApproval);
+        assert_eq!(
+            choose_mechanism(true, Err(denied)).unwrap(),
+            (ServiceManagement, NeedsApproval)
         );
         assert_eq!(
-            choose_mechanism(true, Ok(SmStatus::NotRegistered)),
-            (Mechanism::LaunchAgent, Enabled)
+            choose_mechanism(true, Err(sm_error(12, SmStatus::Enabled))).unwrap(),
+            (ServiceManagement, Enabled),
+            "already registered"
         );
-        assert_eq!(
-            choose_mechanism(true, Err("Invalid code signature".into())),
-            (Mechanism::LaunchAgent, Enabled)
-        );
+        let other = choose_mechanism(true, Err(sm_error(1, SmStatus::NotRegistered)));
+        assert_eq!(other.unwrap_err(), "error 1");
+        let denied_unregistered = sm_error(SM_ERROR_LAUNCH_DENIED_BY_USER, SmStatus::NotRegistered);
+        assert!(choose_mechanism(true, Err(denied_unregistered)).is_err());
     }
 
     #[test]
     fn mac_state_from_status() {
-        assert_eq!(current_state(false, SmStatus::Enabled, true), Unavailable);
-        assert_eq!(current_state(true, SmStatus::Enabled, false), Enabled);
+        use SmStatus as S;
         assert_eq!(
-            current_state(true, SmStatus::NotFound, true),
+            current_state(false, S::Enabled, Some(S::Enabled)),
+            Unavailable
+        );
+        assert_eq!(current_state(true, S::Enabled, None), Enabled);
+        assert_eq!(
+            current_state(true, S::NotFound, Some(S::Enabled)),
             Enabled,
             "LaunchAgent"
         );
         assert_eq!(
-            current_state(true, SmStatus::RequiresApproval, false),
+            current_state(true, S::NotRegistered, Some(S::RequiresApproval)),
+            DisabledByUser,
+            "LaunchAgent turned off under Allow in the Background"
+        );
+        assert_eq!(
+            current_state(true, S::NotRegistered, Some(S::NotRegistered)),
+            Disabled
+        );
+        assert_eq!(
+            current_state(true, S::NotRegistered, Some(S::NotFound)),
+            Disabled
+        );
+        assert_eq!(
+            current_state(true, S::RequiresApproval, None),
             NeedsApproval
         );
         assert_eq!(
-            current_state(true, SmStatus::RequiresApproval, true),
+            current_state(true, S::RequiresApproval, Some(S::Enabled)),
             Enabled
         );
+        assert_eq!(current_state(true, S::NotRegistered, None), Disabled);
+        assert_eq!(current_state(true, S::NotFound, None), Disabled);
         assert_eq!(
-            current_state(true, SmStatus::NotRegistered, false),
-            Disabled
+            current_state(true, S::Enabled, Some(S::RequiresApproval)),
+            Enabled
         );
-        assert_eq!(current_state(true, SmStatus::NotFound, false), Disabled);
+    }
+
+    #[test]
+    fn translocated_paths_detected() {
+        assert!(is_translocated(Path::new(
+            "/private/var/folders/xy/T/AppTranslocation/1234-ABCD/d/ntfy-native.app/Contents/MacOS/ntfy-native"
+        )));
+        assert!(!is_translocated(Path::new(
+            "/Applications/ntfy-native.app/Contents/MacOS/ntfy-native"
+        )));
+        assert!(!is_translocated(Path::new(
+            "/Users/a/AppTranslocationX/ntfy-native"
+        )));
     }
 
     #[test]
