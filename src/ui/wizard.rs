@@ -3,12 +3,13 @@
 use eframe::egui::{self, Align, Key, Label, Layout, RichText, ScrollArea, TextEdit};
 use zeroize::Zeroize;
 
+use crate::autostart::AutostartState;
 use crate::i18n::UiStrings;
 use crate::instance_edit::{AuthDraft, InstanceDraft};
 use crate::ipc::{TestOutcome, TopicAccess, UiRequest};
 use crate::settings::{Instance, Topic};
 use crate::snapshot::{InstanceView, draft_from_view};
-use crate::ui::problem::Problem;
+use crate::ui::problem::{Problem, autostart_hint};
 use crate::validate::{check_url, same_origin, valid_topic_name};
 
 /// The token/password field; its egui state (with undo history) is dropped after the Auth step.
@@ -69,6 +70,20 @@ pub struct Wizard {
     original_url: String,
     /// The urgent switch as set in this wizard; sent only once saved.
     urgent_set: Option<bool>,
+    /// First setup only: offer to start at login, applied once saved.
+    pub offer_autostart: bool,
+    /// The "start at login" option as shown.
+    pub autostart_choice: bool,
+    /// As the OS reports it, mirrored from the latest snapshot.
+    pub autostart_state: AutostartState,
+    /// The user changed the option, so snapshots no longer adjust it.
+    autostart_touched: bool,
+    /// Request id of the running `SetAutostart`.
+    autostart_pending: Option<u64>,
+    /// Autostart answered with a state worth a hint on the Done page.
+    autostart_notice: Option<AutostartState>,
+    /// Left the Done page with "Close".
+    closed: bool,
 }
 
 impl Drop for Wizard {
@@ -95,6 +110,14 @@ impl Wizard {
         Self::with_draft(draft, false)
     }
 
+    /// The first setup: also offers to start at login (on by default).
+    pub fn first_run() -> Self {
+        let mut w = Self::new();
+        w.offer_autostart = true;
+        w.autostart_choice = true;
+        w
+    }
+
     /// Prefilled from the snapshot; empty secrets keep the stored ones.
     pub fn edit(view: &InstanceView) -> Self {
         Self::with_draft(draft_from_view(view), true)
@@ -106,6 +129,13 @@ impl Wizard {
             original_auth: draft.auth.clone(),
             original_url: draft.url.clone(),
             urgent_set: None,
+            offer_autostart: false,
+            autostart_choice: false,
+            autostart_state: AutostartState::Disabled,
+            autostart_touched: false,
+            autostart_pending: None,
+            autostart_notice: None,
+            closed: false,
             login_required: false,
             draft,
             editing,
@@ -208,14 +238,16 @@ impl Wizard {
         };
     }
 
-    /// Once saved, returns the changed urgent switch to send.
+    /// Once saved, returns what else to send: the changed urgent switch and
+    /// the autostart choice.
     pub fn on_save_result(
         &mut self,
         request_id: u64,
         result: &Result<String, String>,
-    ) -> Option<UiRequest> {
+        next_id: &mut u64,
+    ) -> Vec<UiRequest> {
         if self.busy != Some(request_id) || self.step != WizardStep::Notifications {
-            return None;
+            return Vec::new();
         }
         self.busy = None;
         match result {
@@ -223,15 +255,82 @@ impl Wizard {
                 self.error = None;
                 self.step = WizardStep::Done;
                 self.secret.zeroize();
-                self.urgent_set
+                let urgent = self
+                    .urgent_set
                     .take()
                     .filter(|enabled| *enabled != self.urgent_global)
-                    .map(|enabled| UiRequest::SetUrgentGlobal { enabled })
+                    .map(|enabled| UiRequest::SetUrgentGlobal { enabled });
+                urgent
+                    .into_iter()
+                    .chain(self.autostart_request(next_id))
+                    .collect()
             }
             Err(reason) => {
                 self.error = Some(Problem::SaveFailed(reason.clone()));
-                None
+                Vec::new()
             }
+        }
+    }
+
+    /// Switching on is always sent; switching off only when it is on.
+    fn autostart_request(&mut self, next_id: &mut u64) -> Option<UiRequest> {
+        let enabled = self.autostart_choice;
+        let state = self.autostart_state;
+        if !self.offer_autostart
+            || state == AutostartState::Unavailable
+            || !(enabled || state == AutostartState::Enabled)
+        {
+            return None;
+        }
+        let request_id = *next_id;
+        *next_id += 1;
+        self.autostart_pending = Some(request_id);
+        Some(UiRequest::SetAutostart {
+            request_id,
+            enabled,
+        })
+    }
+
+    /// `true` when the window may close; otherwise the Done page shows why.
+    pub fn on_autostart_result(
+        &mut self,
+        request_id: u64,
+        result: &Result<AutostartState, String>,
+    ) -> bool {
+        if self.autostart_pending != Some(request_id) {
+            return false;
+        }
+        self.autostart_pending = None;
+        match result {
+            Ok(AutostartState::Enabled | AutostartState::Disabled) => {}
+            Ok(state) => self.autostart_notice = Some(*state),
+            Err(reason) => self.error = Some(Problem::AutostartFailed(reason.clone())),
+        }
+        self.finished()
+    }
+
+    /// Cancelled, or saved with nothing left to wait for or to show.
+    pub fn finished(&self) -> bool {
+        self.cancelled
+            || self.closed
+            || (self.step == WizardStep::Done
+                && self.autostart_pending.is_none()
+                && self.autostart_notice.is_none()
+                && self.error.is_none())
+    }
+
+    /// The user's choice; sent only once saved.
+    pub fn set_autostart(&mut self, enabled: bool) {
+        self.autostart_choice = enabled;
+        self.autostart_touched = true;
+    }
+
+    /// Mirrors the OS state. Turned off there, the option starts unchecked:
+    /// only an explicit choice switches it on again.
+    pub fn set_autostart_state(&mut self, state: AutostartState) {
+        self.autostart_state = state;
+        if self.offer_autostart && !self.autostart_touched {
+            self.autostart_choice = state != AutostartState::DisabledByUser;
         }
     }
 
@@ -390,12 +489,7 @@ pub fn wizard_ui(
         forget_secret_field(ui.ctx());
     }
     if w.step == WizardStep::Done {
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.vertical_centered(|ui| {
-                ui.add_space(ui.available_height() / 3.0);
-                ui.heading(s.wizard_done);
-            });
-        });
+        egui::CentralPanel::default().show(ui, |ui| done_page(ui, w, s));
         return;
     }
     egui::Panel::bottom("wizard_buttons").show(ui, |ui| buttons(ui, w, s, out, next_id));
@@ -425,6 +519,29 @@ pub fn wizard_ui(
                 out.extend(w.next(next_id));
             }
         });
+    });
+}
+
+fn done_page(ui: &mut egui::Ui, w: &mut Wizard, s: &UiStrings) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(ui.available_height() / 3.0);
+        ui.heading(s.wizard_done);
+        ui.add_space(12.0);
+        if w.autostart_pending.is_some() {
+            ui.spinner();
+        }
+        let hint = w
+            .autostart_notice
+            .and_then(|state| autostart_hint(state, s));
+        if let Some(hint) = hint {
+            ui.add(Label::new(hint).wrap());
+        }
+        if let Some(e) = &w.error {
+            ui.add(Label::new(RichText::new(e.text(s)).color(ui.visuals().error_fg_color)).wrap());
+        }
+        if (hint.is_some() || w.error.is_some()) && ui.button(s.close).clicked() {
+            w.closed = true;
+        }
     });
 }
 
@@ -619,16 +736,32 @@ fn notifications_step(ui: &mut egui::Ui, w: &mut Wizard, s: &UiStrings, out: &mu
     if ui.checkbox(&mut urgent, s.urgent_global).changed() {
         w.set_urgent(urgent);
     }
+    if w.offer_autostart {
+        ui.add_space(6.0);
+        let available = w.autostart_state != AutostartState::Unavailable;
+        let mut on = w.autostart_choice && available;
+        if ui
+            .add_enabled(available, egui::Checkbox::new(&mut on, s.autostart))
+            .changed()
+        {
+            w.set_autostart(on);
+        }
+        if let Some(hint) = autostart_hint(w.autostart_state, s) {
+            ui.add(Label::new(RichText::new(hint).small().weak()).wrap());
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable as _;
+    use egui_kittest::kittest::{NodeT as _, Queryable as _};
 
     use super::*;
+    use crate::autostart::AutostartState;
     use crate::i18n::UI_EN;
     use crate::snapshot::{AuthView, InstanceStatus};
+    use crate::ui::problem::autostart_hint;
     use crate::validate::UrlError;
 
     fn ok(names: &[(&str, bool)]) -> TestOutcome {
@@ -664,7 +797,10 @@ mod tests {
     }
 
     fn at_topics(id: &mut u64) -> Wizard {
-        let mut w = Wizard::new();
+        at_topics_from(Wizard::new(), id)
+    }
+
+    fn at_topics_from(mut w: Wizard, id: &mut u64) -> Wizard {
         w.draft.url = "https://ntfy.example.org".into();
         w.next(id).unwrap();
         answer(&mut w, ok(&[]));
@@ -675,7 +811,11 @@ mod tests {
     }
 
     fn at_notifications(id: &mut u64) -> Wizard {
-        let mut w = at_topics(id);
+        at_notifications_from(Wizard::new(), id)
+    }
+
+    fn at_notifications_from(w: Wizard, id: &mut u64) -> Wizard {
+        let mut w = at_topics_from(w, id);
         w.draft.topics = vec![topic("alerts")];
         w.next(id).unwrap();
         answer(&mut w, ok(&[("alerts", true)]));
@@ -824,7 +964,7 @@ mod tests {
         w.on_test_result(first, &TestOutcome::NotNtfy);
         assert_eq!(w.error, None);
         assert_eq!(w.busy, Some(second));
-        w.on_save_result(second, &Ok("a".into()));
+        w.on_save_result(second, &Ok("a".into()), &mut id);
         assert_eq!(w.busy, Some(second), "a save result is not a test result");
     }
 
@@ -882,7 +1022,7 @@ mod tests {
         assert_eq!(draft.cache_duration_secs, 43_200);
         assert_eq!(draft.topics, [topic("alerts")]);
 
-        w.on_save_result(request_id, &Err("could not save settings".into()));
+        w.on_save_result(request_id, &Err("could not save settings".into()), &mut id);
         assert_eq!(w.step, WizardStep::Notifications);
         assert_eq!(
             w.error,
@@ -892,9 +1032,9 @@ mod tests {
         let Some(UiRequest::SaveInstance { request_id, .. }) = w.next(&mut id) else {
             panic!("retry");
         };
-        w.on_save_result(request_id + 1, &Ok("x".into()));
+        w.on_save_result(request_id + 1, &Ok("x".into()), &mut id);
         assert_eq!(w.step, WizardStep::Notifications);
-        w.on_save_result(request_id, &Ok("ntfy.example.org".into()));
+        w.on_save_result(request_id, &Ok("ntfy.example.org".into()), &mut id);
         assert_eq!(w.step, WizardStep::Done);
         assert_eq!(w.busy, None);
         assert_eq!(w.error, None);
@@ -1075,7 +1215,7 @@ mod tests {
         assert_eq!(draft.topics, [topic("news")]);
         h.state_mut()
             .w
-            .on_save_result(*request_id, &Err("disk full".into()));
+            .on_save_result(*request_id, &Err("disk full".into()), &mut 100);
         h.run_steps(4);
         h.get_by_label("Saving failed: disk full");
         click(&mut h, "Back");
@@ -1099,7 +1239,7 @@ mod tests {
         assert_eq!(h.state().w.step, WizardStep::Notifications);
         h.state_mut()
             .w
-            .on_save_result(request_id, &Ok("ntfy.example.org".into()));
+            .on_save_result(request_id, &Ok("ntfy.example.org".into()), &mut id);
         assert_eq!(h.state().w.step, WizardStep::Done);
     }
 
@@ -1179,7 +1319,7 @@ mod tests {
         let Some(UiRequest::SaveInstance { request_id, .. }) = request else {
             panic!("save");
         };
-        w.on_save_result(request_id, &Ok("a".into()));
+        w.on_save_result(request_id, &Ok("a".into()), &mut id);
         assert!(w.secret.is_empty());
     }
 
@@ -1330,8 +1470,8 @@ mod tests {
         assert_eq!(
             h.state_mut()
                 .w
-                .on_save_result(request_id, &Err("disk full".into())),
-            None
+                .on_save_result(request_id, &Err("disk full".into()), &mut id),
+            []
         );
         click(&mut h, "Finish");
         let out = take(&mut h);
@@ -1339,8 +1479,10 @@ mod tests {
             panic!("{out:?}");
         };
         assert_eq!(
-            h.state_mut().w.on_save_result(*request_id, &Ok("a".into())),
-            Some(UiRequest::SetUrgentGlobal { enabled: true })
+            h.state_mut()
+                .w
+                .on_save_result(*request_id, &Ok("a".into()), &mut id),
+            [UiRequest::SetUrgentGlobal { enabled: true }]
         );
 
         // Unchanged switch: nothing extra.
@@ -1348,7 +1490,7 @@ mod tests {
         let Some(UiRequest::SaveInstance { request_id, .. }) = w.next(&mut id) else {
             panic!("save");
         };
-        assert_eq!(w.on_save_result(request_id, &Ok("a".into())), None);
+        assert_eq!(w.on_save_result(request_id, &Ok("a".into()), &mut id), []);
 
         // Cancelled: nothing is sent.
         let mut h = harness(at_notifications(&mut id));
@@ -1400,5 +1542,215 @@ mod tests {
             assert_eq!(w.error, Some(Problem::Url(problem)), "{url}");
         }
         assert_eq!(id, 1, "no request sent");
+    }
+
+    fn toggled(h: &Harness<'static, T>, label: &str) -> Option<egui::accesskit::Toggled> {
+        h.get_by_label(label).accesskit_node().toggled()
+    }
+
+    /// Finishes a wizard at the Notifications step with a successful save.
+    fn saved(w: &mut Wizard, id: &mut u64) -> Vec<UiRequest> {
+        let Some(UiRequest::SaveInstance { request_id, .. }) = w.next(id) else {
+            panic!("save");
+        };
+        w.on_save_result(request_id, &Ok("a".into()), id)
+    }
+
+    fn autostart_request(out: &[UiRequest]) -> (u64, bool) {
+        match out {
+            [
+                UiRequest::SetAutostart {
+                    request_id,
+                    enabled,
+                },
+            ] => (*request_id, *enabled),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn first_run_offers_autostart_default_on() {
+        let w = Wizard::first_run();
+        assert!(w.offer_autostart);
+        assert!(w.autostart_choice);
+        assert_eq!(w.step, WizardStep::Server);
+        assert!(!w.editing);
+
+        let mut id = 1;
+        let mut h = harness(at_notifications_from(Wizard::first_run(), &mut id));
+        h.run_steps(4);
+        assert_eq!(
+            toggled(&h, UI_EN.autostart),
+            Some(egui::accesskit::Toggled::True)
+        );
+        click(&mut h, UI_EN.autostart);
+        assert!(take(&mut h).is_empty(), "the option waits for Finish");
+        assert!(!h.state().w.autostart_choice);
+        assert_eq!(
+            toggled(&h, UI_EN.autostart),
+            Some(egui::accesskit::Toggled::False)
+        );
+    }
+
+    #[test]
+    fn settings_wizard_does_not_offer_autostart() {
+        let mut id = 1;
+        for w in [Wizard::new(), Wizard::edit(&view(AuthView::Token))] {
+            assert!(!w.offer_autostart);
+            let mut h = harness(at_notifications_from(w, &mut id));
+            h.run_steps(4);
+            h.get_by_label(UI_EN.urgent_global);
+            assert!(h.query_by_label(UI_EN.autostart).is_none());
+        }
+        let mut w = at_notifications(&mut id);
+        assert_eq!(saved(&mut w, &mut id), []);
+        assert!(w.finished());
+    }
+
+    #[test]
+    fn autostart_sent_only_after_successful_save() {
+        let mut id = 1;
+        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        let Some(UiRequest::SaveInstance { request_id, .. }) = w.next(&mut id) else {
+            panic!("save");
+        };
+        assert_eq!(
+            w.on_save_result(request_id, &Err("disk full".into()), &mut id),
+            []
+        );
+        assert_eq!(w.step, WizardStep::Notifications);
+        assert!(!w.finished());
+
+        let out = saved(&mut w, &mut id);
+        let (autostart_id, enabled) = autostart_request(&out);
+        assert!(enabled);
+        assert!(autostart_id < id, "fresh id from the counter");
+        assert_eq!(w.step, WizardStep::Done);
+        assert!(!w.finished(), "waits for the autostart result");
+
+        assert!(!w.on_autostart_result(autostart_id + 1, &Ok(AutostartState::Enabled)));
+        assert!(!w.finished(), "not our request");
+        assert!(w.on_autostart_result(autostart_id, &Ok(AutostartState::Enabled)));
+        assert!(w.finished());
+
+        // Urgent switch and autostart together.
+        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        w.set_urgent(true);
+        let out = saved(&mut w, &mut id);
+        assert!(
+            matches!(
+                out[..],
+                [
+                    UiRequest::SetUrgentGlobal { enabled: true },
+                    UiRequest::SetAutostart { enabled: true, .. }
+                ]
+            ),
+            "{out:?}"
+        );
+
+        // Cancelled: nothing is sent.
+        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        w.cancel();
+        assert!(w.cancelled && w.finished());
+    }
+
+    #[test]
+    fn autostart_unchecked_sends_nothing_when_off() {
+        let mut id = 1;
+        for state in [
+            AutostartState::Disabled,
+            AutostartState::DisabledByUser,
+            AutostartState::Unavailable,
+        ] {
+            let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+            w.set_autostart_state(state);
+            w.set_autostart(false);
+            assert_eq!(saved(&mut w, &mut id), [], "{state:?}");
+            assert!(w.finished(), "{state:?}");
+        }
+
+        // Already on and unchecked: turned off.
+        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        w.set_autostart_state(AutostartState::Enabled);
+        w.set_autostart(false);
+        let (request_id, enabled) = autostart_request(&saved(&mut w, &mut id));
+        assert!(!enabled);
+        assert!(w.on_autostart_result(request_id, &Ok(AutostartState::Disabled)));
+        assert!(w.finished());
+
+        // Unavailable: never sent, the option is shown disabled.
+        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        w.set_autostart_state(AutostartState::Unavailable);
+        let mut h = harness(w);
+        h.run_steps(4);
+        assert!(
+            h.get_by_label(UI_EN.autostart)
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.get_by_label(UI_EN.autostart_unavailable);
+        let mut w = std::mem::take(&mut h.state_mut().w);
+        assert_eq!(saved(&mut w, &mut id), []);
+
+        // Turned off in the OS: not switched on again unless chosen here.
+        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        w.set_autostart_state(AutostartState::DisabledByUser);
+        assert!(!w.autostart_choice);
+        let mut h = harness(w);
+        h.run_steps(4);
+        assert_eq!(
+            toggled(&h, UI_EN.autostart),
+            Some(egui::accesskit::Toggled::False)
+        );
+        click(&mut h, UI_EN.autostart);
+        h.state_mut()
+            .w
+            .set_autostart_state(AutostartState::DisabledByUser);
+        let mut w = std::mem::take(&mut h.state_mut().w);
+        assert!(w.autostart_choice, "a snapshot keeps the choice");
+        let (_, enabled) = autostart_request(&saved(&mut w, &mut id));
+        assert!(enabled);
+    }
+
+    #[test]
+    fn needs_approval_keeps_done_page_with_hint() {
+        let mut id = 1;
+        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        let (request_id, _) = autostart_request(&saved(&mut w, &mut id));
+        let mut h = harness(w);
+        h.run_steps(4);
+        h.get_by_label(UI_EN.wizard_done);
+        assert!(h.query_by_label(UI_EN.close).is_none(), "still waiting");
+        assert!(
+            !h.state_mut()
+                .w
+                .on_autostart_result(request_id, &Ok(AutostartState::NeedsApproval))
+        );
+        h.run_steps(4);
+        assert_eq!(h.state().w.step, WizardStep::Done);
+        assert!(!h.state().w.finished());
+        h.get_by_label(UI_EN.autostart_needs_approval);
+        click(&mut h, UI_EN.close);
+        assert!(h.state().w.finished());
+        assert!(take(&mut h).is_empty());
+
+        // An error from the core is shown localized.
+        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        let (request_id, _) = autostart_request(&saved(&mut w, &mut id));
+        assert!(!w.on_autostart_result(request_id, &Err("permission denied".into())));
+        let mut h = harness(w);
+        h.run_steps(4);
+        h.get_by_label("Could not set up autostart: permission denied");
+        assert!(!h.state().w.finished());
+        click(&mut h, UI_EN.close);
+        assert!(h.state().w.finished());
+
+        // Still off in the OS (macOS Login Items): pointed there.
+        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        let (request_id, _) = autostart_request(&saved(&mut w, &mut id));
+        assert!(!w.on_autostart_result(request_id, &Ok(AutostartState::DisabledByUser)));
+        let mut h = harness(w);
+        h.run_steps(4);
+        h.get_by_label(autostart_hint(AutostartState::DisabledByUser, &UI_EN).unwrap());
     }
 }

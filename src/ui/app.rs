@@ -13,7 +13,7 @@ use crate::ui::layout::{AnchorRect, popover_position};
 use crate::ui::popover::{PopoverState, popover_ui};
 use crate::ui::settings_view::{SettingsState, settings_ui};
 use crate::ui::text::UiStrings;
-use crate::ui::wizard::{Wizard, WizardStep, wizard_ui};
+use crate::ui::wizard::{Wizard, wizard_ui};
 
 pub const POPOVER_SIZE: (f32, f32) = (360.0, 480.0);
 pub const SETTINGS_SIZE: (f32, f32) = (560.0, 620.0);
@@ -112,7 +112,11 @@ impl UiApp {
             snapshot: None,
             popover: PopoverState::default(),
             settings: SettingsState::default(),
-            wizard: Wizard::new(),
+            wizard: if mode == UiMode::Wizard {
+                Wizard::first_run()
+            } else {
+                Wizard::new()
+            },
             next_id: 1,
             frames: 0,
             had_focus: false,
@@ -167,6 +171,7 @@ impl UiApp {
                     self.popover.on_snapshot();
                     self.settings.on_snapshot(&s);
                     self.wizard.urgent_global = s.urgent_breaks_dnd;
+                    self.wizard.set_autostart_state(s.autostart);
                     self.snapshot = Some(s);
                 }
                 // Request ids come from one counter, so every state only takes its own.
@@ -179,11 +184,20 @@ impl UiApp {
                 }
                 Ok(CoreMsg::SaveResult { request_id, result }) => {
                     self.popover.on_save_result(request_id, &result);
-                    let follow_ups = [
-                        self.wizard.on_save_result(request_id, &result),
-                        self.settings.on_save_result(request_id, &result),
-                    ];
-                    self.forward(follow_ups.into_iter().flatten().collect());
+                    let mut follow_ups =
+                        self.wizard
+                            .on_save_result(request_id, &result, &mut self.next_id);
+                    follow_ups.extend(self.settings.on_save_result(
+                        request_id,
+                        &result,
+                        &mut self.next_id,
+                    ));
+                    self.forward(follow_ups);
+                }
+                Ok(CoreMsg::AutostartResult { request_id, result }) => {
+                    // Closing is decided once the inbox is empty.
+                    self.wizard.on_autostart_result(request_id, &result);
+                    self.settings.on_autostart_result(request_id, &result);
                 }
                 Ok(CoreMsg::Focus) => self.focus_requested = true,
                 Ok(CoreMsg::Close) => {
@@ -201,10 +215,9 @@ impl UiApp {
         }
     }
 
-    /// The wizard window closes once saved or cancelled.
+    /// The wizard window closes once saved (and autostart set up) or cancelled.
     fn wizard_finished(&self) -> bool {
-        self.mode == UiMode::Wizard
-            && (self.wizard.step == WizardStep::Done || self.wizard.cancelled)
+        self.mode == UiMode::Wizard && self.wizard.finished()
     }
 
     /// eframe shows the window only after the first frame, so activate on
@@ -358,9 +371,11 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::autostart::AutostartState;
     use crate::i18n::UI_EN;
     use crate::ipc::TestOutcome;
     use crate::ui::layout::AnchorRect;
+    use crate::ui::wizard::WizardStep;
 
     fn app(mode: UiMode) -> (UiApp, Sender<CoreMsg>) {
         let (tx, inbox) = channel();
@@ -473,6 +488,7 @@ mod tests {
 
         a.wizard.step = WizardStep::Notifications;
         a.wizard.busy = Some(8);
+        a.wizard.set_autostart(false);
         tx.send(CoreMsg::SaveResult {
             request_id: 8,
             result: Ok("a".into()),
@@ -480,6 +496,84 @@ mod tests {
         .unwrap();
         assert_eq!(a.drain_inbox(), Flow::Close);
         assert_eq!(a.wizard.step, WizardStep::Done);
+    }
+
+    #[test]
+    fn first_run_wizard_closes_after_the_autostart_result() {
+        let (tx, inbox) = channel();
+        let (outbox, sent) = channel();
+        let mut a = UiApp::new(UiMode::Wizard, &UI_EN, inbox, outbox);
+        assert!(a.wizard.offer_autostart && a.wizard.autostart_choice);
+        let (s, _tx) = app(UiMode::Settings);
+        assert!(!s.wizard.offer_autostart);
+
+        let mut snap = snapshot();
+        snap.autostart = AutostartState::Enabled;
+        tx.send(CoreMsg::Snapshot(snap)).unwrap();
+        assert_eq!(a.drain_inbox(), Flow::Continue);
+        assert_eq!(a.wizard.autostart_state, AutostartState::Enabled);
+
+        a.wizard.step = WizardStep::Notifications;
+        a.wizard.busy = Some(8);
+        a.next_id = 9;
+        tx.send(CoreMsg::SaveResult {
+            request_id: 8,
+            result: Ok("a".into()),
+        })
+        .unwrap();
+        assert_eq!(a.drain_inbox(), Flow::Continue, "waits for autostart");
+        assert_eq!(
+            sent.try_recv().unwrap(),
+            UiMsg::Request(UiRequest::SetAutostart {
+                request_id: 9,
+                enabled: true
+            })
+        );
+        assert_eq!(a.next_id, 10);
+        tx.send(CoreMsg::AutostartResult {
+            request_id: 9,
+            result: Ok(AutostartState::NeedsApproval),
+        })
+        .unwrap();
+        assert_eq!(a.drain_inbox(), Flow::Continue, "shows the hint");
+        assert_eq!(a.drain_inbox(), Flow::Continue);
+
+        let (tx, inbox) = channel();
+        let (outbox, _sent) = channel();
+        let mut a = UiApp::new(UiMode::Wizard, &UI_EN, inbox, outbox);
+        a.wizard.step = WizardStep::Notifications;
+        a.wizard.busy = Some(1);
+        a.next_id = 2;
+        tx.send(CoreMsg::SaveResult {
+            request_id: 1,
+            result: Ok("a".into()),
+        })
+        .unwrap();
+        tx.send(CoreMsg::AutostartResult {
+            request_id: 2,
+            result: Ok(AutostartState::Enabled),
+        })
+        .unwrap();
+        assert_eq!(a.drain_inbox(), Flow::Close);
+    }
+
+    #[test]
+    fn autostart_results_reach_the_settings() {
+        let (mut a, tx) = app(UiMode::Settings);
+        a.settings.autostart_pending = Some((4, true));
+        tx.send(CoreMsg::AutostartResult {
+            request_id: 4,
+            result: Err("access denied".into()),
+        })
+        .unwrap();
+        assert_eq!(a.drain_inbox(), Flow::Continue);
+        assert_eq!(a.settings.autostart_pending, None);
+        assert_eq!(
+            a.settings.autostart_error,
+            Some(crate::ui::problem::Problem::AutostartFailed(
+                "access denied".into()
+            ))
+        );
     }
 
     #[test]
@@ -497,16 +591,24 @@ mod tests {
         let mut id = 8;
         assert!(a.wizard.urgent_choice());
         a.wizard.next(&mut id).unwrap();
+        a.next_id = id;
         assert!(sent.try_recv().is_err(), "nothing before the save");
         tx.send(CoreMsg::SaveResult {
             request_id: 8,
             result: Ok("a".into()),
         })
         .unwrap();
-        assert_eq!(a.drain_inbox(), Flow::Close);
+        assert_eq!(a.drain_inbox(), Flow::Continue);
+        let sent: Vec<UiMsg> = sent.try_iter().collect();
         assert_eq!(
-            sent.try_recv().unwrap(),
-            UiMsg::Request(UiRequest::SetUrgentGlobal { enabled: true })
+            sent,
+            [
+                UiMsg::Request(UiRequest::SetUrgentGlobal { enabled: true }),
+                UiMsg::Request(UiRequest::SetAutostart {
+                    request_id: 9,
+                    enabled: true
+                })
+            ]
         );
     }
 

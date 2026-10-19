@@ -4,11 +4,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use eframe::egui::{self, Align, Color32, ComboBox, Frame, Label, Layout, RichText, ScrollArea};
 
+use crate::autostart::AutostartState;
 use crate::i18n::{UiStrings, fill};
 use crate::ipc::{TestOutcome, UiRequest};
 use crate::settings::Topic;
 use crate::snapshot::{InstanceStatus, InstanceView, UiSnapshot, draft_from_view};
-use crate::ui::problem::Problem;
+use crate::ui::problem::{Problem, autostart_hint};
 use crate::ui::wizard::{Wizard, WizardStep, forget_secret_field, wizard_ui};
 
 /// 12 h, 24 h, 72 h, 7 days.
@@ -30,6 +31,11 @@ pub struct SettingsState {
     /// Instances changed by a confirmed request, disabled until the next snapshot shows the change.
     pub locked: BTreeSet<String>,
     pub error: Option<Problem>,
+    /// Running `SetAutostart`: request id and the requested value.
+    pub autostart_pending: Option<(u64, bool)>,
+    /// The core's answer to it, shown until the next snapshot.
+    pub autostart_answer: Option<AutostartState>,
+    pub autostart_error: Option<Problem>,
 }
 
 impl SettingsState {
@@ -46,29 +52,48 @@ impl SettingsState {
         &mut self,
         request_id: u64,
         result: &Result<String, String>,
-    ) -> Option<UiRequest> {
+        next_id: &mut u64,
+    ) -> Vec<UiRequest> {
         if let Some(w) = &mut self.editor {
-            let follow_up = w.on_save_result(request_id, result);
+            let follow_ups = w.on_save_result(request_id, result, next_id);
             if w.step == WizardStep::Done {
                 if let Ok(id) = result {
                     self.locked.insert(id.clone());
                 }
                 self.editor = None;
-                return follow_up;
+                return follow_ups;
             }
         }
-        let instance_id = self.pending.remove(&request_id)?;
+        let Some(instance_id) = self.pending.remove(&request_id) else {
+            return Vec::new();
+        };
         match result {
             Ok(_) => {
                 self.locked.insert(instance_id);
             }
             Err(reason) => self.error = Some(Problem::SaveFailed(reason.clone())),
         }
-        None
+        Vec::new()
+    }
+
+    pub fn on_autostart_result(
+        &mut self,
+        request_id: u64,
+        result: &Result<AutostartState, String>,
+    ) {
+        if self.autostart_pending.map(|(id, _)| id) != Some(request_id) {
+            return;
+        }
+        self.autostart_pending = None;
+        match result {
+            Ok(state) => self.autostart_answer = Some(*state),
+            Err(reason) => self.autostart_error = Some(Problem::AutostartFailed(reason.clone())),
+        }
     }
 
     pub fn on_snapshot(&mut self, snap: &UiSnapshot) {
         self.locked.clear();
+        self.autostart_answer = None;
         if let Some(w) = &mut self.editor {
             w.urgent_global = snap.urgent_breaks_dnd;
         }
@@ -152,8 +177,52 @@ pub fn settings_ui(
             if ui.checkbox(&mut urgent, s.urgent_global).changed() {
                 out.push(UiRequest::SetUrgentGlobal { enabled: urgent });
             }
+            ui.add_space(4.0);
+            autostart(ui, snap, state, s, out, next_id);
         });
     });
+}
+
+/// Shows the OS state; switching sends a request right away.
+fn autostart(
+    ui: &mut egui::Ui,
+    snap: &UiSnapshot,
+    state: &mut SettingsState,
+    s: &UiStrings,
+    out: &mut Vec<UiRequest>,
+    next_id: &mut u64,
+) {
+    let current = state.autostart_answer.unwrap_or(snap.autostart);
+    let available = current != AutostartState::Unavailable;
+    let mut on = match state.autostart_pending {
+        Some((_, requested)) => requested,
+        None => matches!(
+            current,
+            AutostartState::Enabled | AutostartState::NeedsApproval
+        ),
+    };
+    let enabled = available && state.autostart_pending.is_none();
+    if ui
+        .add_enabled(enabled, egui::Checkbox::new(&mut on, s.autostart))
+        .changed()
+    {
+        let request_id = *next_id;
+        *next_id += 1;
+        state.autostart_pending = Some((request_id, on));
+        state.autostart_error = None;
+        out.push(UiRequest::SetAutostart {
+            request_id,
+            enabled: on,
+        });
+    }
+    if state.autostart_pending.is_none()
+        && let Some(hint) = autostart_hint(current, s)
+    {
+        ui.add(Label::new(RichText::new(hint).small().weak()).wrap());
+    }
+    if let Some(e) = &state.autostart_error {
+        ui.add(Label::new(RichText::new(e.text(s)).color(ui.visuals().error_fg_color)).wrap());
+    }
 }
 
 fn dot(ui: &mut egui::Ui, color: Color32) {
@@ -323,12 +392,14 @@ fn footer(ui: &mut egui::Ui, snap: &UiSnapshot, s: &UiStrings, out: &mut Vec<UiR
 #[cfg(test)]
 mod tests {
     use egui_kittest::Harness;
-    use egui_kittest::kittest::Queryable as _;
+    use egui_kittest::kittest::{NodeT as _, Queryable as _};
 
     use super::*;
+    use crate::autostart::AutostartState;
     use crate::i18n::UI_EN;
     use crate::instance_edit::AuthDraft;
     use crate::snapshot::AuthView;
+    use crate::ui::problem::autostart_hint;
     use crate::ui::wizard::secret_field_id;
 
     struct T {
@@ -536,9 +607,11 @@ mod tests {
                 .is_none()
         );
 
-        h.state_mut()
-            .state
-            .on_save_result(request_id, &Err("could not save settings".into()));
+        h.state_mut().state.on_save_result(
+            request_id,
+            &Err("could not save settings".into()),
+            &mut 100,
+        );
         h.run_steps(4);
         h.get_by_label("Saving failed: could not save settings");
         assert!(h.state().state.pending.is_empty());
@@ -551,7 +624,7 @@ mod tests {
         };
         h.state_mut()
             .state
-            .on_save_result(*request_id, &Ok("a".into()));
+            .on_save_result(*request_id, &Ok("a".into()), &mut 100);
         h.run_steps(4);
         assert_eq!(h.state().state.error, None);
         click(&mut h, "Remove");
@@ -617,8 +690,8 @@ mod tests {
         assert_eq!(
             h.state_mut()
                 .state
-                .on_save_result(*request_id, &Ok("a".into())),
-            Some(UiRequest::SetUrgentGlobal { enabled: true })
+                .on_save_result(*request_id, &Ok("a".into()), &mut 100),
+            [UiRequest::SetUrgentGlobal { enabled: true }]
         );
         h.run_steps(4);
         assert!(h.state().state.editor.is_none());
@@ -653,10 +726,14 @@ mod tests {
             };
             ids.push(*request_id);
         }
+        h.state_mut().state.on_save_result(
+            ids[0],
+            &Err("could not save settings".into()),
+            &mut 100,
+        );
         h.state_mut()
             .state
-            .on_save_result(ids[0], &Err("could not save settings".into()));
-        h.state_mut().state.on_save_result(ids[1], &Ok("b".into()));
+            .on_save_result(ids[1], &Ok("b".into()), &mut 100);
         h.run_steps(4);
         h.get_by_label("Saving failed: could not save settings");
         assert!(h.state().state.pending.is_empty());
@@ -692,5 +769,137 @@ mod tests {
         assert!(h.state().state.editor.is_none());
         h.get_by_label("Servers");
         assert!(take(&mut h).is_empty());
+    }
+
+    fn autostart_snapshot(state: AutostartState) -> UiSnapshot {
+        let mut snap = snapshot();
+        snap.autostart = state;
+        snap
+    }
+
+    fn autostart_toggled(h: &Harness<'static, T>) -> Option<egui::accesskit::Toggled> {
+        h.get_by_label(UI_EN.autostart).accesskit_node().toggled()
+    }
+
+    #[test]
+    fn settings_toggle_reflects_disabled_by_user_and_sends_request() {
+        use egui::accesskit::Toggled;
+
+        let hint = autostart_hint(AutostartState::DisabledByUser, &UI_EN).unwrap();
+        let mut h = harness(autostart_snapshot(AutostartState::DisabledByUser));
+        assert_eq!(autostart_toggled(&h), Some(Toggled::False));
+        h.get_by_label(hint);
+        click(&mut h, UI_EN.autostart);
+        let out = take(&mut h);
+        let [
+            UiRequest::SetAutostart {
+                request_id,
+                enabled: true,
+            },
+        ] = out.as_slice()
+        else {
+            panic!("{out:?}");
+        };
+        let request_id = *request_id;
+        // Shows the request while it runs; no second one meanwhile.
+        assert_eq!(autostart_toggled(&h), Some(Toggled::True));
+        assert!(
+            h.get_by_label(UI_EN.autostart)
+                .accesskit_node()
+                .is_disabled()
+        );
+        click(&mut h, UI_EN.autostart);
+        assert!(take(&mut h).is_empty());
+
+        // Still off in the OS (macOS): back to off with the hint.
+        h.state_mut()
+            .state
+            .on_autostart_result(request_id, &Ok(AutostartState::DisabledByUser));
+        h.run_steps(4);
+        assert_eq!(autostart_toggled(&h), Some(Toggled::False));
+        h.get_by_label(hint);
+
+        // An error is shown localized and the switch shows the real state.
+        click(&mut h, UI_EN.autostart);
+        let out = take(&mut h);
+        let [UiRequest::SetAutostart { request_id, .. }] = out.as_slice() else {
+            panic!("{out:?}");
+        };
+        let request_id = *request_id;
+        h.state_mut()
+            .state
+            .on_autostart_result(request_id + 1, &Err("other".into()));
+        h.state_mut()
+            .state
+            .on_autostart_result(request_id, &Err("access denied".into()));
+        h.run_steps(4);
+        h.get_by_label("Could not set up autostart: access denied");
+        assert!(
+            h.query_by_label("Could not set up autostart: other")
+                .is_none()
+        );
+        assert_eq!(autostart_toggled(&h), Some(Toggled::False));
+
+        // The core's answer is shown until the next snapshot.
+        click(&mut h, UI_EN.autostart);
+        let out = take(&mut h);
+        let [UiRequest::SetAutostart { request_id, .. }] = out.as_slice() else {
+            panic!("{out:?}");
+        };
+        let request_id = *request_id;
+        h.state_mut()
+            .state
+            .on_autostart_result(request_id, &Ok(AutostartState::Enabled));
+        h.run_steps(4);
+        assert_eq!(autostart_toggled(&h), Some(Toggled::True));
+        assert!(h.query_by_label(hint).is_none());
+        assert!(
+            h.query_by_label("Could not set up autostart: access denied")
+                .is_none()
+        );
+        let snap = autostart_snapshot(AutostartState::Enabled);
+        h.state_mut().state.on_snapshot(&snap);
+        h.state_mut().snap = snap;
+        h.run_steps(4);
+        assert_eq!(autostart_toggled(&h), Some(Toggled::True));
+        click(&mut h, UI_EN.autostart);
+        let out = take(&mut h);
+        assert!(
+            matches!(out[..], [UiRequest::SetAutostart { enabled: false, .. }]),
+            "{out:?}"
+        );
+
+        // Waiting for approval counts as on, with a hint.
+        let h = harness(autostart_snapshot(AutostartState::NeedsApproval));
+        assert_eq!(autostart_toggled(&h), Some(Toggled::True));
+        h.get_by_label(UI_EN.autostart_needs_approval);
+    }
+
+    #[test]
+    fn settings_toggle_disabled_when_unavailable() {
+        let mut h = harness(autostart_snapshot(AutostartState::Unavailable));
+        assert!(
+            h.get_by_label(UI_EN.autostart)
+                .accesskit_node()
+                .is_disabled()
+        );
+        h.get_by_label(UI_EN.autostart_unavailable);
+        click(&mut h, UI_EN.autostart);
+        assert!(take(&mut h).is_empty());
+
+        let h = harness(autostart_snapshot(AutostartState::Disabled));
+        assert!(
+            !h.get_by_label(UI_EN.autostart)
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(h.query_by_label(UI_EN.autostart_unavailable).is_none());
+    }
+
+    #[test]
+    fn add_server_does_not_offer_autostart() {
+        let mut h = harness(snapshot());
+        click(&mut h, UI_EN.add_server);
+        assert!(!h.state().state.editor.as_ref().unwrap().offer_autostart);
     }
 }

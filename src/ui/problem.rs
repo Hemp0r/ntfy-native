@@ -1,5 +1,6 @@
 //! Error states shown inline in the windows; localized only when drawn.
 
+use crate::autostart::AutostartState;
 use crate::conntest::RATE_LIMITED;
 use crate::i18n::{UiStrings, fill};
 use crate::ipc::TestOutcome;
@@ -22,6 +23,8 @@ pub enum Problem {
     TopicDuplicate,
     /// Reason from the core (English, secret-free).
     SaveFailed(String),
+    /// Reason from the core (English).
+    AutostartFailed(String),
 }
 
 impl Problem {
@@ -55,7 +58,22 @@ impl Problem {
             Problem::TopicInvalid => s.err_topic_invalid.to_owned(),
             Problem::TopicDuplicate => s.err_topic_duplicate.to_owned(),
             Problem::SaveFailed(reason) => fill(s.err_save_failed, &[("reason", reason)]),
+            Problem::AutostartFailed(reason) => fill(s.autostart_failed, &[("reason", reason)]),
         }
+    }
+}
+
+/// What to tell the user about an autostart state; `None` when it is plainly on or off.
+pub fn autostart_hint(state: AutostartState, s: &UiStrings) -> Option<&'static str> {
+    match state {
+        AutostartState::Enabled | AutostartState::Disabled => None,
+        AutostartState::NeedsApproval => Some(s.autostart_needs_approval),
+        // Windows can switch it on again; macOS only in System Settings.
+        AutostartState::DisabledByUser if cfg!(target_os = "macos") => {
+            Some(s.autostart_disabled_by_user_macos)
+        }
+        AutostartState::DisabledByUser => Some(s.autostart_disabled_by_user),
+        AutostartState::Unavailable => Some(s.autostart_unavailable),
     }
 }
 
@@ -157,5 +175,39 @@ mod tests {
             p.text(&UI_DE),
             "Speichern fehlgeschlagen: could not save settings"
         );
+    }
+
+    #[test]
+    fn autostart_failures_and_hints_are_localized() {
+        let p = Problem::AutostartFailed("access denied".into());
+        assert_eq!(p.text(&UI_EN), "Could not set up autostart: access denied");
+        assert_eq!(
+            p.text(&UI_DE),
+            "Autostart konnte nicht eingerichtet werden: access denied"
+        );
+        assert_eq!(autostart_hint(AutostartState::Enabled, &UI_EN), None);
+        assert_eq!(autostart_hint(AutostartState::Disabled, &UI_EN), None);
+        assert_eq!(
+            autostart_hint(AutostartState::NeedsApproval, &UI_DE),
+            Some(
+                "macOS verlangt eine Bestätigung: Systemeinstellungen › Allgemein › Anmeldeobjekte"
+            )
+        );
+        assert_eq!(
+            autostart_hint(AutostartState::Unavailable, &UI_EN),
+            Some("Only available in the installed app")
+        );
+        let by_user = autostart_hint(AutostartState::DisabledByUser, &UI_EN);
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                by_user,
+                Some("Disabled in System Settings › General › Login Items – allow it there")
+            );
+        } else {
+            assert_eq!(
+                by_user,
+                Some("Disabled in Task Manager – switch on here to enable")
+            );
+        }
     }
 }

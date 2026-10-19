@@ -189,6 +189,13 @@ ui_strings! {
     net_refused: "Verbindung abgelehnt", "connection refused";
     net_failed: "Verbindung fehlgeschlagen", "connection failed";
     net_rate_limited: "zu viele Anfragen", "too many requests";
+    autostart: "Beim Anmelden automatisch starten", "Start automatically at login";
+    autostart_needs_approval: "macOS verlangt eine Bestätigung: Systemeinstellungen › Allgemein › Anmeldeobjekte", "macOS needs your approval: System Settings › General › Login Items";
+    autostart_disabled_by_user: "Im Task-Manager deaktiviert – zum Aktivieren hier einschalten", "Disabled in Task Manager – switch on here to enable";
+    autostart_disabled_by_user_macos: "In den Systemeinstellungen › Allgemein › Anmeldeobjekte deaktiviert – dort wieder erlauben", "Disabled in System Settings › General › Login Items – allow it there";
+    autostart_unavailable: "Nur in der installierten App verfügbar", "Only available in the installed app";
+    autostart_failed: "Autostart konnte nicht eingerichtet werden: {reason}", "Could not set up autostart: {reason}";
+    close: "Schließen", "Close";
 }
 
 pub fn ui_strings_for(locale: &str) -> &'static UiStrings {
@@ -264,6 +271,12 @@ mod tests {
         assert_eq!(ui_strings_for("en").quit, "Quit");
         assert_eq!(DE.menu_settings, "Einstellungen …");
         assert_eq!(EN.menu_setup, "Set up …");
+        assert_eq!(UI_DE.autostart, "Beim Anmelden automatisch starten");
+        assert_eq!(UI_EN.close, "Close");
+        assert_eq!(
+            UI_DE.autostart_disabled_by_user_macos,
+            "In den Systemeinstellungen › Allgemein › Anmeldeobjekte deaktiviert – dort wieder erlauben"
+        );
     }
 
     #[test]
