@@ -207,7 +207,7 @@ Quelle ist `assets/icon.svg` (weiße Glocke auf grünem, abgerundetem Quadrat). 
 
 ## Manuelle Prüfung Windows
 
-Diese Schritte lassen sich nicht automatisieren und werden einmal pro Release auf einem Windows-11-Rechner durchgeführt (Release-Build, `ntfy-native.exe` aus dem ZIP). Vorbereitung: App über „Beenden“ schließen und den Zustand zurücksetzen (siehe Entfernen-Skript unter [Windows: Toast-Benachrichtigungen](#windows-toast-benachrichtigungen)), sodass weder `config.yaml` noch `settings.json` existieren. Logs: `%APPDATA%\hemp0r\ntfy-native\data\logs\`.
+Diese Schritte lassen sich nicht automatisieren und werden einmal pro Release auf einem Windows-11-Rechner durchgeführt (Release-Build, `ntfy-native.exe` aus dem ZIP). Vorbereitung: App über „Beenden“ schließen und den Zustand zurücksetzen (siehe die PowerShell-Befehle im Abschnitt [Windows: Toast-Benachrichtigungen](#windows-toast-benachrichtigungen)), sodass weder `config.yaml` noch `settings.json` existieren. Logs: `%APPDATA%\hemp0r\ntfy-native\data\logs\`.
 
 **Erststart und Assistent**
 
@@ -218,7 +218,7 @@ Diese Schritte lassen sich nicht automatisieren und werden einmal pro Release au
 **Popover**
 
 4. Linksklick auf das Tray-Icon (Taskleiste unten). Erwartet: Das Popover erscheint direkt am Icon, vollständig sichtbar über der Taskleiste, und hat sofort den Fokus (Tastatureingabe geht hinein).
-5. Dasselbe mit der Taskleiste oben und links (Einstellungen › Personalisierung › Taskleiste; unter Windows 11 ist nur unten garantiert, links/oben gegebenenfalls über Drittwerkzeuge) sowie, falls vorhanden, auf einem zweiten Monitor. Erwartet: Das Popover liegt am Icon, nie unter der Taskleiste und nie außerhalb des Bildschirms.
+5. Optional: Dasselbe mit der Taskleiste oben bzw. links (unter Windows 11 ist unten die einzige native Position; oben/links nur mit Drittwerkzeugen oder unter Windows 10 über Einstellungen › Personalisierung › Taskleiste) sowie, falls vorhanden, auf einem zweiten Monitor. Erwartet: Das Popover liegt am Icon, nie unter der Taskleiste und nie außerhalb des Bildschirms.
 6. Popover öffnen, daneben klicken. Erwartet: Es schließt sich. Erneut öffnen, Esc drücken. Erwartet: Es schließt sich. Erneut öffnen, nochmals auf das Tray-Icon klicken. Erwartet: Es schließt sich und öffnet sich nicht sofort wieder.
 7. Topic-Schalter (Stumm) umlegen, dann eine Nachricht senden. Erwartet: Bei stummem Topic kein Toast, nach erneutem Umlegen wieder Toast.
 8. „Pause“ › „15 Minuten“. Erwartet: Das Tray-Icon bzw. -Menü zeigt „Pausiert“, gesendete Nachrichten erzeugen keinen Toast; „Fortsetzen“ stellt „Verbunden“ wieder her.
@@ -239,19 +239,19 @@ Diese Schritte lassen sich nicht automatisieren und werden einmal pro Release au
 
 **Speicher**
 
-17. Alle Fenster schließen (Popover, Einstellungen, Assistent), im Task-Manager (Registerkarte „Details“, Spalte „Arbeitsset (privat)“ einblenden) 1 Minute warten. Erwartet: Genau ein Prozess `ntfy-native.exe`, privater Arbeitssatz unter 30 MB. Popover mehrmals öffnen und schließen. Erwartet: Währenddessen erscheint kurz ein zweiter Prozess, nach dem Schließen ist er verschwunden und der Wert liegt weiter unter 30 MB.
+17. Alle Fenster schließen (Popover, Einstellungen, Assistent), im Task-Manager (Registerkarte „Details“, Spalte „Arbeitsset (privat)“ einblenden) 1 Minute warten. Erwartet: Genau ein Prozess `ntfy-native.exe`, privater Arbeitssatz unter 30 MB. Danach Popover bzw. Einstellungen öffnen: Solange das Fenster offen ist, läuft ein zweiter `ntfy-native.exe` (der UI-Prozess, gestartet mit `--ui …`; es wird kein WebView verwendet). Nach dem Schließen bleibt innerhalb weniger Sekunden genau ein `ntfy-native.exe` übrig, dessen privater Arbeitssatz unter 30 MB liegt. Mehrmals wiederholen.
 
 **Startmenü und Info-Center**
 
 18. Nach dem Erststart im Log nach `start menu shortcut written` suchen, App beenden und erneut starten. Erwartet: `%APPDATA%\Microsoft\Windows\Start Menu\Programs\ntfy-native.lnk` existiert, die Logzeile steht nur im Log des ersten Starts, beim zweiten Start nicht erneut.
 19. Einstellungen › System › Benachrichtigungen öffnen. Erwartet: „ntfy-native“ steht in der Liste (mit Icon) und lässt sich ein- und ausschalten.
-20. Mehrere Toasts erzeugen, das Info-Center (Win+N) öffnen. Erwartet: Die Toasts bleiben dort stehen, ein Klick öffnet die Click-URL; nach „Beenden“ der App startet ein Klick auf einen älteren Toast die App nicht als zweites Tray-Icon und öffnet die Click-URL.
+20. Mehrere Toasts erzeugen, das Info-Center (Win+N) öffnen. Erwartet: Die Toasts bleiben dort stehen, ein Klick öffnet die Click-URL; nach „Beenden“ der App startet ein Klick auf einen älteren Toast die App neu; erwartet: kein zweites Tray-Icon, es läuft nur eine Instanz, und die Click-URL öffnet sich.
 
 **macOS-Entsprechungen** (Bundle über `scripts/macos-dev-bundle.sh`)
 
 21. Erststart ohne Konfiguration. Erwartet: Der Assistent öffnet sich von selbst und hat den Fokus; nach „Fertig“ zeigt das Menü „Verbunden“, der Test-Toast erscheint (Mitteilungen beim ersten Start erlauben).
 22. Linksklick auf das Menüleisten-Icon. Erwartet: Das Popover erscheint direkt unter dem Icon (auch auf einem zweiten Monitor), hat den Fokus, schließt sich bei Esc, bei einem Klick daneben und bei einem zweiten Klick auf das Icon.
-23. Schritte 7 bis 16 sinngemäß wiederholen (Stumm, Pause, Click-URL, „+ Topic“, Einstellungen, Fenster nach vorn, auch minimiert im Dock-losen Betrieb). Erwartet: gleiches Verhalten wie unter Windows.
+23. Schritte 7 bis 16 sinngemäß wiederholen (Stumm, Pause, Click-URL, „+ Topic“, Einstellungen, Fenster nach vorn, auch wenn das Einstellungsfenster minimiert ist). Erwartet: gleiches Verhalten wie unter Windows.
 24. Aktivitätsanzeige bei geschlossenen Fenstern. Erwartet: Genau ein Prozess `ntfy-native`, Speicher (Spalte „Speicher“ bzw. `phys_footprint`) unter 30 MB.
 
 ## Release
