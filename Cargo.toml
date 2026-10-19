@@ -10,7 +10,7 @@ description = "Lightweight tray app bridging ntfy servers to native OS notificat
 anyhow = "1.0.104"
 chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 directories = "6.0.0"
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "default_fonts", "accesskit", "clipboard"] }
+eframe = { version = "0.37.0", default-features = false, features = ["glow", "accesskit", "clipboard"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 httpdate = "1.0.3"
 humantime = "2.4.0"

@@ -1,19 +1,23 @@
 //! The eframe app of the UI process: one window per process, kind by mode.
 
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
+use std::time::Duration;
 
 use eframe::egui;
 
 use crate::cli::{UiArgs, UiMode};
-use crate::ipc::{CoreMsg, UiMsg};
+use crate::ipc::{CoreMsg, UiMsg, UiRequest};
 use crate::snapshot::UiSnapshot;
 use crate::ui::focus;
 use crate::ui::layout::popover_position;
+use crate::ui::popover::{PopoverState, popover_ui};
 use crate::ui::text::UiStrings;
 
 pub const POPOVER_SIZE: (f32, f32) = (360.0, 480.0);
 pub const SETTINGS_SIZE: (f32, f32) = (560.0, 620.0);
 pub const WIZARD_SIZE: (f32, f32) = (520.0, 560.0);
+/// Keeps relative ages ("5 min ago") current while the popover is open.
+const AGE_REFRESH: Duration = Duration::from_secs(30);
 
 /// Window title and builder for a window mode. `Probe` has no window.
 pub fn viewport(args: &UiArgs, strings: &UiStrings) -> Option<egui::ViewportBuilder> {
@@ -58,10 +62,12 @@ pub struct UiApp {
     mode: UiMode,
     strings: &'static UiStrings,
     inbox: Receiver<CoreMsg>,
-    #[allow(dead_code)] // used by the popover/settings/wizard contents
     outbox: Sender<UiMsg>,
     snapshot: Option<UiSnapshot>,
-    activated: bool,
+    popover: PopoverState,
+    next_id: u64,
+    /// Frames drawn so far, saturating.
+    frames: u8,
     had_focus: bool,
     closing: bool,
 }
@@ -79,7 +85,9 @@ impl UiApp {
             inbox,
             outbox,
             snapshot: None,
-            activated: false,
+            popover: PopoverState::default(),
+            next_id: 1,
+            frames: 0,
             had_focus: false,
             closing: false,
         }
@@ -89,6 +97,9 @@ impl UiApp {
         loop {
             match self.inbox.try_recv() {
                 Ok(CoreMsg::Snapshot(s)) => self.snapshot = Some(s),
+                Ok(CoreMsg::SaveResult { request_id, result }) => {
+                    self.popover.on_save_result(request_id, &result);
+                }
                 Ok(CoreMsg::Close) => {
                     tracing::info!("core asked the window to close");
                     return Flow::Close;
@@ -100,6 +111,19 @@ impl UiApp {
                     return Flow::Close;
                 }
             }
+        }
+    }
+
+    /// eframe shows the window only after the first frame, so activate on the second, once.
+    fn activation_due(&mut self) -> bool {
+        self.frames = self.frames.saturating_add(1);
+        self.frames == 2
+    }
+
+    fn forward(&self, requests: Vec<UiRequest>) {
+        for r in requests {
+            // A closed outbox means the core is gone; the inbox notices that too.
+            let _ = self.outbox.send(UiMsg::Request(r));
         }
     }
 
@@ -131,9 +155,28 @@ impl eframe::App for UiApp {
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
-        if !self.activated {
-            self.activated = true;
+        if self.frames == 0 {
+            // Make sure a second frame follows, on which the window is visible.
+            ui.ctx().request_repaint();
+        }
+        if self.activation_due() {
             focus::activate(frame);
+        }
+        if let (UiMode::Popover, Some(snap)) = (self.mode, &self.snapshot) {
+            let mut out = Vec::new();
+            let now = chrono::Utc::now().timestamp();
+            popover_ui(
+                ui,
+                snap,
+                &mut self.popover,
+                self.strings,
+                now,
+                &mut out,
+                &mut self.next_id,
+            );
+            self.forward(out);
+            ui.ctx().request_repaint_after(AGE_REFRESH);
+            return;
         }
         let title = match self.mode {
             UiMode::Popover => self.strings.popover_title,
@@ -192,6 +235,47 @@ mod tests {
         assert_eq!(a.drain_inbox(), Flow::Close);
         drop(tx);
         assert_eq!(a.drain_inbox(), Flow::Close);
+    }
+
+    #[test]
+    fn save_result_reaches_the_popover() {
+        let (mut a, tx) = app(UiMode::Popover);
+        a.popover.pending = Some(3);
+        a.popover.add_topic = "new".into();
+        tx.send(CoreMsg::SaveResult {
+            request_id: 3,
+            result: Ok("a".into()),
+        })
+        .unwrap();
+        assert_eq!(a.drain_inbox(), Flow::Continue);
+        assert_eq!(a.popover.pending, None);
+        assert!(a.popover.add_topic.is_empty());
+    }
+
+    #[test]
+    fn requests_go_to_the_outbox() {
+        let (tx, inbox) = channel();
+        let (outbox, rx) = channel();
+        let a = UiApp::new(UiMode::Popover, &UI_EN, inbox, outbox);
+        a.forward(vec![UiRequest::OpenSettings, UiRequest::Quit]);
+        let sent: Vec<UiMsg> = rx.try_iter().collect();
+        assert_eq!(
+            sent,
+            [
+                UiMsg::Request(UiRequest::OpenSettings),
+                UiMsg::Request(UiRequest::Quit)
+            ]
+        );
+        drop(tx);
+    }
+
+    #[test]
+    fn focus_is_activated_once_on_the_second_frame() {
+        let (mut a, _tx) = app(UiMode::Popover);
+        assert!(!a.activation_due());
+        assert!(a.activation_due());
+        assert!(!a.activation_due());
+        assert!(!a.activation_due());
     }
 
     #[test]

@@ -133,6 +133,7 @@ ui_strings! {
     keep_secret_hint: "Leer lassen, um das gespeicherte zu behalten", "Leave empty to keep the stored one";
     topics_heading: "Topics", "Topics";
     topic_name: "Topic-Name", "Topic name";
+    topic_server: "Server", "Server";
     topic_not_readable: "Kein Leserecht", "No read access";
     notifications_heading: "Benachrichtigungen", "Notifications";
     send_test: "Test-Benachrichtigung senden", "Send test notification";
@@ -153,6 +154,8 @@ ui_strings! {
     err_not_ntfy: "Unter dieser Adresse antwortet kein ntfy-Server", "No ntfy server answers at this address";
     err_auth: "Anmeldung abgelehnt – Token bzw. Passwort prüfen", "Login rejected – check token or password";
     err_no_topics: "Mindestens ein Topic angeben", "Add at least one topic";
+    err_topic_invalid: "Ungültiger Topic-Name (erlaubt: Buchstaben, Ziffern, - und _)", "Invalid topic name (allowed: letters, digits, - and _)";
+    err_topic_duplicate: "Dieses Topic gibt es schon", "This topic already exists";
     servers_heading: "Server", "Servers";
     add_server: "Server hinzufügen", "Add server";
     edit: "Bearbeiten", "Edit";

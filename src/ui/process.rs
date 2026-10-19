@@ -14,6 +14,7 @@ use crate::cli::{UiArgs, UiMode};
 use crate::ipc::{CoreMsg, PROTOCOL_VERSION, UiMsg, UiRequest, read_msg, write_msg};
 use crate::paths::AppPaths;
 use crate::ui::app::{UiApp, viewport};
+use crate::ui::fonts;
 use crate::ui::text::{UiStrings, ui_strings};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -245,6 +246,15 @@ fn run_probe(bridge: Bridge, ignore_close: bool) -> anyhow::Result<()> {
     tail.finish()
 }
 
+/// Windows without a computed position (no anchor, monitor or scale) are centred.
+fn window_options(viewport: eframe::egui::ViewportBuilder) -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        centered: viewport.position.is_none(),
+        viewport,
+        ..Default::default()
+    }
+}
+
 fn run_window(
     args: &UiArgs,
     strings: &'static UiStrings,
@@ -254,11 +264,7 @@ fn run_window(
 ) -> anyhow::Result<()> {
     let viewport = viewport(args, strings).ok_or_else(|| anyhow!("mode has no window"))?;
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-    let mut options = eframe::NativeOptions {
-        viewport,
-        centered: args.mode != UiMode::Popover || args.anchor.is_none(),
-        ..Default::default()
-    };
+    let mut options = window_options(viewport);
     #[cfg(target_os = "macos")]
     {
         use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
@@ -276,7 +282,10 @@ fn run_window(
         strings.popover_title,
         options,
         Some(ctx),
-        Box::new(move |_cc| Ok(Box::new(UiApp::new(mode, strings, inbox, outbox)))),
+        Box::new(move |cc| {
+            fonts::install(&cc.egui_ctx);
+            Ok(Box::new(UiApp::new(mode, strings, inbox, outbox)))
+        }),
     )
     .map_err(|e| anyhow!("ui window failed: {e}"))
 }
@@ -356,6 +365,27 @@ mod tests {
             n += 1;
         }
         assert_eq!(n, 100);
+    }
+
+    #[test]
+    fn popover_without_position_is_centered() {
+        use crate::ui::layout::AnchorRect;
+        let mut args = UiArgs {
+            mode: UiMode::Popover,
+            anchor: Some(AnchorRect {
+                x: 10.0,
+                y: 0.0,
+                w: 20.0,
+                h: 20.0,
+            }),
+            monitor: Some((0.0, 0.0, 1000.0, 800.0)),
+            scale: None,
+            probe_ignore_close: false,
+        };
+        let strings = crate::i18n::ui_strings_for("en");
+        assert!(window_options(viewport(&args, strings).unwrap()).centered);
+        args.scale = Some(1.0);
+        assert!(!window_options(viewport(&args, strings).unwrap()).centered);
     }
 
     #[test]
