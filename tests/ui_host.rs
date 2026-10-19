@@ -1,5 +1,5 @@
 //! Drives `UiHost` against the real binary; children run the windowless
-//! probe loop (`--ui probe`, or any mode with the headless switch).
+//! probe loop (`--ui probe`, or any mode with the hidden `--headless`).
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
@@ -11,7 +11,6 @@ use ntfy_native::cli::{UiArgs, UiMode};
 use ntfy_native::engine::{Command, EngineHandle};
 use ntfy_native::ipc::{CoreMsg, UiRequest};
 use ntfy_native::snapshot::UiSnapshot;
-use ntfy_native::ui::process::HEADLESS_ENV;
 use ntfy_native::ui_host::{HostEvent, Outcome, UiHost};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 
@@ -39,7 +38,6 @@ fn harness() -> Harness {
         }),
     )
     .with_env("HOME", home.path())
-    .with_env(HEADLESS_ENV, "1")
     // Children inherit stderr, where debug builds also log.
     .with_env("NTFY_NATIVE_LOG", "off");
     Harness {
@@ -51,7 +49,10 @@ fn harness() -> Harness {
 }
 
 fn args(mode: UiMode) -> UiArgs {
-    UiArgs::window(mode)
+    UiArgs {
+        headless: true,
+        ..UiArgs::window(mode)
+    }
 }
 
 fn probe(ignore_close: bool) -> UiArgs {
@@ -287,6 +288,8 @@ fn open_settings_window_is_focused_not_replaced() {
     );
     assert_eq!(h.host.current_mode(), Some(UiMode::Settings));
     assert_eq!(h.host.pid(), Some(pid));
+    // The window ignores the focus request (no window), but stays.
+    h.host.focus_window();
     // A new child would have answered the stored snapshot.
     h.no_command_for(Duration::from_millis(300));
     assert!(h.events.try_recv().is_err(), "a child exited");

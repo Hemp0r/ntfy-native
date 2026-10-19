@@ -64,9 +64,13 @@ enum UserEvent {
     TrayClick(AnchorRect),
     OpenUi(UiMode),
     Host(HostEvent),
-    /// The UI child registered as an application and may be activated.
+    /// The core is active and the UI child registered: yield activation to
+    /// it, then (`focus`) ask the already open window to come forward.
     #[cfg(target_os = "macos")]
-    YieldTo(u32),
+    YieldTo {
+        pid: u32,
+        focus: bool,
+    },
     DevCycle {
         open: bool,
     },
@@ -239,31 +243,40 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
                 }
                 if first_start {
                     tracing::info!("nothing set up, opening the setup wizard");
-                    after_show(host.open(UiArgs::window(UiMode::Wizard)), &proxy);
+                    show(&mut host, &proxy, |h| {
+                        h.open(UiArgs::window(UiMode::Wizard))
+                    });
                 }
             }
             Event::UserEvent(UserEvent::TrayClick(icon)) => {
                 let args = popover_args(icon, &monitors(target));
-                after_show(host.toggle_popover(args), &proxy);
+                show(&mut host, &proxy, |h| h.toggle_popover(args));
             }
             Event::UserEvent(UserEvent::OpenUi(mode) | UserEvent::Host(HostEvent::Open(mode))) => {
-                after_show(host.open(UiArgs::window(mode)), &proxy);
+                show(&mut host, &proxy, |h| h.open(UiArgs::window(mode)));
             }
             Event::UserEvent(UserEvent::Host(HostEvent::Quit)) => request_quit(&engine.tx, &proxy),
             Event::UserEvent(UserEvent::Host(HostEvent::ChildExited)) => {}
             #[cfg(target_os = "macos")]
-            Event::UserEvent(UserEvent::YieldTo(pid)) => {
+            Event::UserEvent(UserEvent::YieldTo { pid, focus }) => {
                 if host.pid() != Some(pid) {
                     tracing::debug!(pid, "UI process replaced before activation was yielded");
-                } else if crate::activation::yield_to_child(pid) {
-                    tracing::debug!(pid, "activation yielded to the UI process");
                 } else {
-                    tracing::debug!(pid, "UI process gone before activation could be yielded");
+                    if crate::activation::yield_to_child(pid) {
+                        tracing::debug!(pid, "activation yielded to the UI process");
+                    } else {
+                        tracing::debug!(pid, "UI process gone before activation could be yielded");
+                    }
+                    if focus {
+                        host.focus_window();
+                    }
                 }
             }
             Event::UserEvent(UserEvent::DevCycle { open }) => {
                 if open {
-                    after_show(host.open(UiArgs::window(UiMode::Popover)), &proxy);
+                    show(&mut host, &proxy, |h| {
+                        h.open(UiArgs::window(UiMode::Popover))
+                    });
                 } else {
                     host.close();
                 }
@@ -325,29 +338,53 @@ fn monitors(target: &EventLoopWindowTarget<UserEvent>) -> Vec<MonitorRect> {
         .collect()
 }
 
-/// macOS: a new child may only activate itself once the core, active from
-/// the click, yields to it. Nothing happens when nothing opened.
-fn after_show(outcome: Outcome, proxy: &EventLoopProxy<UserEvent>) {
+/// Hands the foreground to a new child or to the already open window.
+/// macOS: activation is cooperative, so the core activates itself (it just
+/// got the click) and yields to the child once both took effect; an open
+/// window is asked to come forward only after that. Windows: the window
+/// may take the foreground right away. Nothing happens when nothing opened.
+fn show(
+    host: &mut UiHost,
+    proxy: &EventLoopProxy<UserEvent>,
+    action: impl FnOnce(&mut UiHost) -> Outcome,
+) {
+    let (pid, focus) = match action(host) {
+        Outcome::Started(pid) => (pid, false),
+        Outcome::Focused(pid) => (pid, true),
+        Outcome::Closed | Outcome::Nothing => return,
+    };
     #[cfg(target_os = "macos")]
-    if let Outcome::Started(pid) = outcome {
+    {
+        let _ = host;
         crate::activation::activate_core();
-        yield_when_registered(pid, proxy.clone());
+        yield_when_ready(pid, focus, proxy.clone());
     }
     #[cfg(not(target_os = "macos"))]
-    let _ = (outcome, proxy);
+    {
+        let _ = (pid, proxy);
+        if focus {
+            crate::activation::allow_child_foreground();
+            host.focus_window();
+        }
+    }
 }
 
 /// Upper bound for the UI process to register as an application.
 #[cfg(target_os = "macos")]
 const REGISTER_WAIT: Duration = Duration::from_secs(3);
+/// Yield anyway if the core has not become active by then.
+#[cfg(target_os = "macos")]
+const CORE_ACTIVE_WAIT: Duration = Duration::from_millis(300);
 
 #[cfg(target_os = "macos")]
-fn yield_when_registered(pid: u32, proxy: EventLoopProxy<UserEvent>) {
+fn yield_when_ready(pid: u32, focus: bool, proxy: EventLoopProxy<UserEvent>) {
     spawn_detached("ui-activation", move || {
-        let deadline = Instant::now() + REGISTER_WAIT;
-        while Instant::now() < deadline {
-            if crate::activation::child_registered(pid) {
-                let _ = proxy.send_event(UserEvent::YieldTo(pid));
+        let start = Instant::now();
+        while start.elapsed() < REGISTER_WAIT {
+            let core_ready =
+                crate::activation::core_active() || start.elapsed() >= CORE_ACTIVE_WAIT;
+            if core_ready && crate::activation::child_registered(pid) {
+                let _ = proxy.send_event(UserEvent::YieldTo { pid, focus });
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));

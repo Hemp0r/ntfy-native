@@ -15,21 +15,6 @@ pub fn allow_child_foreground() {
     }
 }
 
-/// Lets an already running child take the foreground when it is asked to
-/// come forward. Main thread (macOS).
-pub fn bring_child_forward(pid: u32) {
-    allow_child_foreground();
-    #[cfg(target_os = "macos")]
-    {
-        activate_core();
-        if !yield_to_child(pid) {
-            tracing::debug!(pid, "could not yield activation to the UI process");
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    let _ = pid;
-}
-
 /// macOS: makes the core the active app, so it has activation to yield.
 /// Main thread only.
 #[cfg(target_os = "macos")]
@@ -40,6 +25,15 @@ pub fn activate_core() {
         Some(mtm) => NSApplication::sharedApplication(mtm).activate(),
         None => tracing::warn!("activate_core called off the main thread"),
     }
+}
+
+/// macOS: whether the core is the active app (activation is cooperative
+/// and takes effect a moment after `activate_core`). Any thread.
+#[cfg(target_os = "macos")]
+pub fn core_active() -> bool {
+    objc2::rc::autoreleasepool(|_| {
+        objc2_app_kit::NSRunningApplication::currentApplication().isActive()
+    })
 }
 
 /// macOS: whether the child has registered as an application yet (only

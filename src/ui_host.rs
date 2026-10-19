@@ -41,7 +41,8 @@ pub enum HostEvent {
 pub enum Outcome {
     /// A new child with this pid.
     Started(u32),
-    /// The open settings or wizard window (this pid) was brought forward.
+    /// The settings or wizard window (this pid) is already open; bring it
+    /// forward with [`UiHost::focus_window`].
     Focused(u32),
     Closed,
     /// Nothing opened (the click that closed the popover, or a failure).
@@ -278,12 +279,16 @@ impl UiHost {
             .map(|r| r.pid)
     }
 
+    /// The caller hands over the foreground, then calls `focus_window`.
     fn focus(&self, pid: u32) -> Outcome {
-        tracing::debug!(pid, "bringing the open window forward");
-        // Hand over the foreground before the window asks for it.
-        activation::bring_child_forward(pid);
-        self.deliver(CoreMsg::Focus);
+        tracing::debug!(pid, "settings or wizard already open");
         Outcome::Focused(pid)
+    }
+
+    /// Asks the connected window to come to the front. Call once the core
+    /// has handed over the foreground (`Outcome::Focused`).
+    pub fn focus_window(&self) {
+        self.deliver(CoreMsg::Focus);
     }
 
     /// Stops talking to the current child: `Close` if connected, then its

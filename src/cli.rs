@@ -38,6 +38,9 @@ pub struct UiArgs {
     /// Scale factor of that monitor.
     pub scale: Option<f32>,
     pub probe_ignore_close: bool,
+    /// Tests only: run the windowless probe loop in any mode, so the core's
+    /// window policy can be tested with real modes. Hidden flag.
+    pub headless: bool,
 }
 
 impl UiMode {
@@ -60,6 +63,7 @@ impl UiArgs {
             monitor: None,
             scale: None,
             probe_ignore_close: false,
+            headless: false,
         }
     }
 
@@ -80,6 +84,9 @@ impl UiArgs {
         }
         if self.probe_ignore_close {
             v.push("--probe-ignore-close".into());
+        }
+        if self.headless {
+            v.push("--headless".into());
         }
         v
     }
@@ -102,6 +109,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction>
     let mut monitor = None;
     let mut scale = None;
     let mut probe_ignore_close = false;
+    let mut headless = false;
     let mut ui_only = None;
     while let Some(arg) = parser.next()? {
         match arg {
@@ -137,6 +145,10 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction>
                 probe_ignore_close = true;
                 ui_only = Some("--probe-ignore-close");
             }
+            Long("headless") => {
+                headless = true;
+                ui_only = Some("--headless");
+            }
             _ => return Err(arg.unexpected().into()),
         }
     }
@@ -150,6 +162,7 @@ pub fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<CliAction>
             monitor,
             scale,
             probe_ignore_close,
+            headless,
         })),
         None => match ui_only {
             Some(flag) => bail!("{flag} requires --ui"),
@@ -245,6 +258,7 @@ mod tests {
                 monitor: Some((0.0, 0.0, 2880.0, 1800.0)),
                 scale: Some(2.0),
                 probe_ignore_close: false,
+                headless: false,
             }
         );
         for (flag, mode) in [
@@ -263,6 +277,11 @@ mod tests {
             panic!("probe-ignore-close")
         };
         assert!(ui.probe_ignore_close);
+        let Ok(CliAction::Ui(ui)) = parse_args(args(["--ui", "settings", "--headless"])) else {
+            panic!("headless")
+        };
+        assert!(ui.headless && !ui.probe_ignore_close);
+        assert!(!UiArgs::window(UiMode::Settings).headless);
     }
 
     #[test]
@@ -278,6 +297,7 @@ mod tests {
             &["--ui", "popover", "--scale", "x"],
             &["--anchor", "1,2,3,4"],
             &["--probe-ignore-close"],
+            &["--headless"],
             &["--ui", "settings", "--config", "c.yaml"],
             &["--import", "c.yaml", "--ui", "settings"],
         ] {
@@ -301,6 +321,7 @@ mod tests {
             monitor: Some((-1920.0, 0.0, 1920.0, 1080.0)),
             scale: Some(1.25),
             probe_ignore_close: false,
+            headless: false,
         };
         let probe = UiArgs {
             mode: UiMode::Probe,
@@ -308,8 +329,13 @@ mod tests {
             monitor: None,
             scale: None,
             probe_ignore_close: true,
+            headless: false,
         };
-        for a in [full, probe] {
+        let headless = UiArgs {
+            headless: true,
+            ..UiArgs::window(UiMode::Settings)
+        };
+        for a in [full, probe, headless] {
             let argv = a.to_args();
             assert_eq!(argv[0], "--ui");
             let Ok(CliAction::Ui(back)) = parse_args(argv.iter().map(OsString::from)) else {

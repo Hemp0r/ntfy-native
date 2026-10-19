@@ -92,6 +92,8 @@ pub struct UiApp {
     last_activation: Option<Instant>,
     placement: Option<Placement>,
     focus_requested: bool,
+    /// Brings the window to the foreground; replaced in tests.
+    activator: fn(&eframe::Frame),
     closing: bool,
 }
 
@@ -118,8 +120,15 @@ impl UiApp {
             last_activation: None,
             placement: None,
             focus_requested: false,
+            activator: focus::activate,
             closing: false,
         }
+    }
+
+    #[cfg(test)]
+    fn with_activator(mut self, activator: fn(&eframe::Frame)) -> UiApp {
+        self.activator = activator;
+        self
     }
 
     /// Remembers where the popover was placed, see [`UiApp::position_fix`].
@@ -249,7 +258,9 @@ impl UiApp {
 }
 
 impl eframe::App for UiApp {
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// Also runs while the window is minimized or hidden (eframe then skips
+    /// `ui`), so everything that must reach such a window happens here.
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let (focused, escape) =
             ctx.input(|i| (i.viewport().focused, i.key_pressed(egui::Key::Escape)));
         if self.closing {
@@ -259,6 +270,11 @@ impl eframe::App for UiApp {
         if self.drain_inbox() == Flow::Close || self.popover_dismissed(focused, escape) {
             self.closing = true;
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        } else if self.take_focus_request() {
+            // The core yielded (macOS) or allowed (Windows) the foreground.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            (self.activator)(frame);
         }
     }
 
@@ -268,7 +284,7 @@ impl eframe::App for UiApp {
             ui.ctx().request_repaint();
         }
         if self.activation_due(Instant::now()) {
-            focus::activate(frame);
+            (self.activator)(frame);
             if self.frames == 2 {
                 let ppp = ui.ctx().input(|i| i.viewport().native_pixels_per_point);
                 if let Some(pos) = self.position_fix(ppp) {
@@ -277,13 +293,6 @@ impl eframe::App for UiApp {
                         .send_viewport_cmd(egui::ViewportCommand::OuterPosition(pos));
                 }
             }
-        }
-        if self.take_focus_request() {
-            // The core yielded (macOS) or allowed (Windows) the foreground.
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
-            focus::activate(frame);
         }
         if self.frames >= 2 && self.activation_pending() {
             ui.ctx().request_repaint_after(ACTIVATION_RETRY);
@@ -339,6 +348,9 @@ impl eframe::App for UiApp {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use eframe::App as _;
     use std::sync::mpsc::channel;
     use std::time::Instant;
 
@@ -360,6 +372,7 @@ mod tests {
             monitor: None,
             scale: None,
             probe_ignore_close: false,
+            headless: false,
         }
     }
 
@@ -387,14 +400,42 @@ mod tests {
         assert_eq!(a.drain_inbox(), Flow::Close);
     }
 
+    static ACTIVATIONS: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_activation(_: &eframe::Frame) {
+        ACTIVATIONS.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Commands one logic-only pass (what eframe runs for a minimized or
+    /// hidden window) sends to the root viewport.
+    fn logic_pass(a: &mut UiApp, ctx: &egui::Context) -> Vec<egui::ViewportCommand> {
+        let mut frame = eframe::Frame::_new_kittest();
+        let out = ctx.run_logic(&egui::RawInput::default(), |ctx| a.logic(ctx, &mut frame));
+        out.viewport_commands
+            .get(&egui::ViewportId::ROOT)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     #[test]
-    fn focus_request_brings_the_window_forward_once() {
-        let (mut a, tx) = app(UiMode::Settings);
-        assert!(!a.take_focus_request());
+    fn focus_request_is_handled_without_a_ui_pass() {
+        let (a, tx) = app(UiMode::Settings);
+        let mut a = a.with_activator(count_activation);
+        let ctx = egui::Context::default();
+        assert!(logic_pass(&mut a, &ctx).is_empty());
         tx.send(CoreMsg::Focus).unwrap();
-        assert_eq!(a.drain_inbox(), Flow::Continue);
-        assert!(a.take_focus_request());
-        assert!(!a.take_focus_request());
+        let cmds = logic_pass(&mut a, &ctx);
+        assert_eq!(
+            cmds,
+            [
+                egui::ViewportCommand::Minimized(false),
+                egui::ViewportCommand::Focus
+            ]
+        );
+        assert_eq!(ACTIVATIONS.load(Ordering::SeqCst), 1);
+        // Once per request.
+        assert!(logic_pass(&mut a, &ctx).is_empty());
+        assert_eq!(ACTIVATIONS.load(Ordering::SeqCst), 1);
     }
 
     #[test]
