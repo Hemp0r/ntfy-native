@@ -147,6 +147,7 @@ pub fn kind(m: &CoreMsg) -> &'static str {
         CoreMsg::Snapshot(_) => "snapshot",
         CoreMsg::TestResult { .. } => "test_result",
         CoreMsg::SaveResult { .. } => "save_result",
+        CoreMsg::AutostartResult { .. } => "autostart_result",
         CoreMsg::Close => "close",
         CoreMsg::Focus => "focus",
     }

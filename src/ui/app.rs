@@ -388,6 +388,7 @@ mod tests {
             gaps: vec![],
             paused_until: None,
             urgent_breaks_dnd: false,
+            autostart: crate::autostart::AutostartState::Disabled,
         }
     }
 

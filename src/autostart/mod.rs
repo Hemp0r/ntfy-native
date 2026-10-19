@@ -104,6 +104,11 @@ impl MemoryAutostart {
         }
     }
 
+    /// Simulates a change made in the OS.
+    pub fn set_state(&self, state: AutostartState) {
+        self.lock().state = state;
+    }
+
     /// Makes the next `set` or `repair` fail without changing anything.
     pub fn fail_next(&self) {
         self.lock().fail_next = true;

@@ -172,6 +172,7 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
                 }
             }
         }),
+        autostart,
         tune: |_| {},
         enable_triggers: true,
     });
