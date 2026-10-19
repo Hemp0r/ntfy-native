@@ -14,6 +14,7 @@ use tray_icon::menu::MenuEvent;
 use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
 use crate::actions::{SystemOpener, open_local_dir};
+use crate::autostart::platform_autostart;
 use crate::cli::{Cli, UiArgs, UiMode};
 use crate::engine::{Command, EngineDeps, EngineHandle, spawn_engine_thread};
 use crate::i18n::{Strings, fill, strings};
@@ -107,6 +108,10 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
     // First start: nothing set up and no failed import to look at first.
     let first_start = settings.instances.is_empty() && import_error.is_none();
     let exe = std::env::current_exe().context("locating the executable")?;
+    let autostart = platform_autostart(exe.clone());
+    if let Err(e) = autostart.repair() {
+        tracing::warn!(error = %format!("{e:#}"), "repairing the autostart entry failed");
+    }
 
     let mut event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
     #[cfg(target_os = "macos")]
