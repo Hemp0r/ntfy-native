@@ -245,7 +245,9 @@ mod tests {
         );
         let all = load_fonts(&c, |p| Ok(p.to_string_lossy().into_owned().into_bytes()));
         assert_eq!(all.len(), 4);
-        assert_eq!(all[0].1, b"/System/Library/Fonts/SFNS.ttf");
+        // Built with the host's separator, like the candidate itself.
+        let sfns = Path::new("/System/Library/Fonts").join("SFNS.ttf");
+        assert_eq!(all[0].1, sfns.to_string_lossy().as_bytes());
         assert!(load_fonts(&c, |_| Err(io::ErrorKind::NotFound.into())).is_empty());
     }
 
