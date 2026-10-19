@@ -268,6 +268,28 @@ Diese Schritte lassen sich nicht automatisieren und werden einmal pro Release au
 23. Schritte 7 bis 16 sinngemäß wiederholen (Stumm, Pause, Click-URL, „+ Topic“, Einstellungen, Fenster nach vorn, auch wenn das Einstellungsfenster minimiert ist). Erwartet: gleiches Verhalten wie unter Windows.
 24. Aktivitätsanzeige bei geschlossenen Fenstern. Erwartet: Genau ein Prozess `ntfy-native`, Speicher (Spalte „Speicher“ bzw. `phys_footprint`) unter 30 MB.
 
+**Autostart Windows** (Zustand zurücksetzen, `Run`-Wert vorher ggf. mit `reg delete HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v ntfy-native /f` entfernen)
+
+25. Assistent ohne Konfiguration durchlaufen und bis zum Schritt „Benachrichtigungen“ gehen. Erwartet: „Beim Anmelden automatisch starten“ ist angekreuzt. Mit „Fertig“ abschließen, dann ab- und wieder anmelden. Erwartet: ntfy-native startet von selbst (nur Tray-Icon, kein Fenster), das Menü zeigt „Verbunden“.
+26. Task-Manager › Autostart öffnen. Erwartet: Eintrag „ntfy-native“ mit Status „Aktiviert“; `reg query HKCU\Software\Microsoft\Windows\CurrentVersion\Run /v ntfy-native` zeigt den Pfad zur laufenden `.exe`.
+27. Den Eintrag im Task-Manager deaktivieren, Einstellungen › „Allgemein“ öffnen. Erwartet: Der Schalter „Beim Anmelden automatisch starten“ ist aus, mit dem Hinweis „Im Task-Manager deaktiviert – zum Aktivieren hier einschalten“. App beenden und neu starten. Erwartet: Der Schalter bleibt aus, der Eintrag im Task-Manager bleibt „Deaktiviert“.
+28. Den Schalter in den Einstellungen einschalten. Erwartet: Er bleibt an, der Hinweis verschwindet, der Task-Manager zeigt „Aktiviert“ (das Einschalten überstimmt die Deaktivierung dort).
+29. App beenden, die `.exe` in einen anderen Ordner verschieben und von dort starten. Erwartet: Der `Run`-Wert zeigt auf den neuen Pfad (`reg query` wie in Schritt 26), der Schalter bleibt an. Wiederholen mit zuvor ausgeschaltetem Schalter. Erwartet: Der Eintrag bleibt aus und wird nicht neu angelegt.
+30. Schalter ausschalten. Erwartet: Der `Run`-Wert `ntfy-native` ist verschwunden (`reg query` meldet einen Fehler).
+
+**Autostart macOS** (Bundle aus der DMG bzw. `scripts/macos-dev-bundle.sh`; Zustand zurücksetzen, vorhandene Einträge unter Anmeldeobjekte entfernen)
+
+31. Assistent durchlaufen, Autostart angekreuzt lassen, „Fertig“. Erwartet: Systemeinstellungen › Allgemein › Anmeldeobjekte zeigen „ntfy-native“ (als Anmeldeobjekt unter „Beim Anmelden öffnen“; nur wenn macOS bei einer ad-hoc signierten Build einen Signaturfehler meldet, stattdessen als LaunchAgent `~/Library/LaunchAgents/dev.hemp0r.ntfy-native.plist` unter „Im Hintergrund erlauben“). Abmelden und anmelden: ntfy-native startet von selbst.
+32. Den Eintrag in den Systemeinstellungen abschalten, Einstellungen › „Allgemein“ öffnen. Erwartet: Der Schalter ist aus, mit einem Hinweis, ihn dort wieder zu erlauben bzw. zu bestätigen. Den Schalter in ntfy-native einschalten. Erwartet: macOS fragt erneut nach, oder der Hinweis bleibt stehen; ntfy-native schaltet den Eintrag nie stillschweigend wieder ein. Nach dem Erlauben in den Systemeinstellungen zeigt der Schalter „an“.
+33. Assistenten erneut starten („Einrichten …“), solange der Eintrag in den Systemeinstellungen abgeschaltet ist. Erwartet: Die Option „Beim Anmelden automatisch starten“ ist zunächst nicht angekreuzt. Ankreuzen und „Fertig“. Erwartet: Verlangt macOS eine Bestätigung, bleibt die Abschlussseite mit dem Hinweis stehen und schließt sich erst mit „Schließen“; der Server ist gespeichert.
+34. Die App aus einem temporären Ort starten (direkt aus „Downloads“ oder aus der DMG, d. h. translociert) und den Autostart einschalten. Erwartet: Er wird abgelehnt mit der Meldung, die App zuerst nach „/Programme“ zu verschieben; es entsteht kein Eintrag.
+35. Schalter ausschalten. Erwartet: Eintrag unter Anmeldeobjekte bzw. LaunchAgent-Datei sind entfernt (nichts übrig lassen).
+
+**Release Notes**
+
+36. Branch mit einem Titel wie `feat(autostart): ...` als PR öffnen. Erwartet: Die Prüfung „PR title“ ist grün. Titel auf z. B. `Autostart hinzugefügt` ändern. Erwartet: „PR title“ schlägt fehl; Titel zurücksetzen.
+37. Nach dem Merge auf `main` den Lauf „Version“ und danach „Release“ abwarten. Erwartet: Der GitHub-Release `v0.2.0` existiert mit den Gruppen „Features“, „Fehlerbehebungen“ und „Sonstiges“ (leere entfallen), jeder Eintrag mit Scope fett und Kurz-SHA-Link, und am Ende „Alle Änderungen: …compare/v0.1.2...v0.2.0“. `Cargo.toml` auf `main` zeigt `0.2.0`.
+
 ## Release
 
 Releases entstehen vollautomatisch beim Merge auf `main`:
