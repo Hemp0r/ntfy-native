@@ -179,10 +179,21 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag }}
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
+      - name: Release notes
+        run: |
+          set -euo pipefail
+          prev=$(git tag --list 'v*.*.*' | scripts/prev-tag.sh "$TAG")
+          git log -z --no-merges --format='%H%x1f%B' "${prev:+$prev..}$TAG" |
+            scripts/release-notes.sh "$GITHUB_REPOSITORY" "$TAG" "$prev" > notes.md
+          cat notes.md
       - name: Checksums
         working-directory: artifacts
         run: |
@@ -194,7 +205,7 @@ jobs:
           draft: false
           prerelease: false
           make_latest: true
-          generate_release_notes: true
+          body_path: notes.md
           files: |
             artifacts/*.dmg
             artifacts/*.zip
