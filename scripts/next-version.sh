@@ -4,6 +4,9 @@
 # Usage: git tag --list 'v*.*.*' | scripts/next-version.sh <cargo-version> <kind>
 # <kind> is major|minor|patch (see scripts/bump-kind.sh).
 #
+# Also: git tag --list 'v*.*.*' | scripts/next-version.sh --latest
+# prints the latest plain vX.Y.Z tag as X.Y.Z (nothing without such a tag).
+#
 # Reads existing tags from stdin and prints "<version> <bump|keep>":
 #   keep  - release <version> (the Cargo.toml version) unchanged
 #   bump  - Cargo.toml must be rewritten to <version> (latest tag, jumped by <kind>)
@@ -17,6 +20,16 @@
 # vMAJOR.MINOR.PATCH (pre-releases, other names) are ignored.
 set -euo pipefail
 
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=scripts/commits-lib.sh
+source "$here/commits-lib.sh"
+
+# --latest: print the latest plain vX.Y.Z tag (as X.Y.Z) from stdin, or nothing.
+if [[ "${1-}" == "--latest" && $# -eq 1 ]]; then
+  latest_semver_tag
+  exit 0
+fi
+
 semver_re='^([0-9]+)\.([0-9]+)\.([0-9]+)$'
 
 if [[ $# -ne 2 || ! "$1" =~ $semver_re || ! "$2" =~ ^(major|minor|patch)$ ]]; then
@@ -26,30 +39,9 @@ fi
 cargo=$1
 kind=$2
 
-# Print 1 if version a > version b, else 0 (both MAJOR.MINOR.PATCH).
-greater() {
-  local -a a b
-  IFS=. read -r -a a <<<"$1"
-  IFS=. read -r -a b <<<"$2"
-  local i
-  for i in 0 1 2; do
-    if ((10#${a[i]} > 10#${b[i]})); then echo 1; return; fi
-    if ((10#${a[i]} < 10#${b[i]})); then echo 0; return; fi
-  done
-  echo 0
-}
+latest=$(latest_semver_tag)
 
-latest=""
-while IFS= read -r tag || [[ -n "$tag" ]]; do
-  tag=${tag%$'\r'}
-  [[ "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]] || continue
-  candidate=${BASH_REMATCH[1]}
-  if [[ -z "$latest" || $(greater "$candidate" "$latest") == 1 ]]; then
-    latest=$candidate
-  fi
-done
-
-if [[ -z "$latest" || $(greater "$cargo" "$latest") == 1 ]]; then
+if [[ -z "$latest" ]] || semver_greater "$cargo" "$latest"; then
   echo "$cargo keep"
   exit 0
 fi

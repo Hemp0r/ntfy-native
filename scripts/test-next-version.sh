@@ -50,4 +50,9 @@ else
   fail=1
 fi
 
+latest=$(printf 'v0.1.9\nv0.1.10\nv1.0.0-rc1\nfoo\n' | "$script" --latest)
+if [[ "$latest" == "0.1.10" ]]; then echo "ok   - --latest prints numeric maximum"; else echo "FAIL - --latest: got '$latest'"; fail=1; fi
+latest=$(printf 'v1.0.0-rc1\n' | "$script" --latest)
+if [[ -z "$latest" ]]; then echo "ok   - --latest prints nothing without plain tags"; else echo "FAIL - --latest: got '$latest'"; fail=1; fi
+
 exit "$fail"

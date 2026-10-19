@@ -1,7 +1,8 @@
 name: Version
 
 # On every merge to main: pick the next version, tag it and call the release
-# workflow. Decision logic lives in scripts/next-version.sh (tested in CI).
+# workflow. Decision logic lives in scripts/bump-kind.sh (bump size) and
+# scripts/next-version.sh (version, latest tag), both tested in CI.
 
 on:
   push:
@@ -44,7 +45,7 @@ jobs:
           current=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
           # Latest plain vX.Y.Z tag (numeric order); its version is the
           # baseline for the commit range and the breaking-change rule.
-          latest=$(git tag --list 'v*.*.*' | sed -n 's/^v\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' | sort -t. -k1,1n -k2,2n -k3,3n | tail -n 1)
+          latest=$(git tag --list 'v*.*.*' | scripts/next-version.sh --latest)
           if [[ -n "$latest" ]]; then
             range="v$latest..HEAD"
             baseline=$latest
@@ -52,7 +53,7 @@ jobs:
             range="HEAD"
             baseline=$current
           fi
-          kind=$(git log --no-merges --format='%H%x1f%B%x1e' "$range" | scripts/bump-kind.sh "$baseline")
+          kind=$(git log -z --no-merges --format='%H%x1f%B' "$range" | scripts/bump-kind.sh "$baseline")
           echo "Commits in $range -> $kind"
           read -r new action < <(git tag --list 'v*.*.*' | scripts/next-version.sh "$current" "$kind")
           tag="v$new"

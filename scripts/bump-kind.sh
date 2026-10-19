@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Decide how big the next version jump is.
 #
-# Usage: git log --no-merges --format='%H%x1f%B%x1e' <range> |
+# Usage: git log -z --no-merges --format='%H%x1f%B' <range> |
 #          scripts/bump-kind.sh <current-version>
 #
 # Prints major|minor|patch:
@@ -24,7 +24,7 @@ major=$((10#${BASH_REMATCH[1]}))
 
 has_feat=0
 has_breaking=0
-while IFS= read -r -d $'\x1e' record || [[ -n "$record" ]]; do
+while IFS= read -r -d '' record || [[ -n "$record" ]]; do
   message=${record#*$'\x1f'}
   message=${message//$'\r'/}
   subject=${message#"${message%%[![:space:]]*}"}
