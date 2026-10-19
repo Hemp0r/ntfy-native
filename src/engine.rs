@@ -852,10 +852,10 @@ fn home_dir() -> Option<std::path::PathBuf> {
     directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf())
 }
 
-/// The outermost error text for the UI; an error that mentions the user's
+/// The full error chain for the UI; an error that mentions the user's
 /// home directory becomes a generic message (details stay in the log).
 fn autostart_error_text(e: &anyhow::Error, home: Option<&std::path::Path>) -> String {
-    let text = e.to_string();
+    let text = format!("{e:#}");
     let leaks_home = home
         .and_then(|h| h.to_str())
         .is_some_and(|h| !h.is_empty() && text.contains(h));
@@ -1349,5 +1349,14 @@ mod autostart_tests {
         let text = autostart_error_text(&with_path, Some(home));
         assert!(!text.contains("jörg"), "{text}");
         assert!(!text.is_empty());
+
+        let chained = anyhow::anyhow!("permission denied").context("registering the login item");
+        assert_eq!(
+            autostart_error_text(&chained, Some(home)),
+            "registering the login item: permission denied"
+        );
+        let leaking_cause = anyhow::anyhow!("cannot write /Users/jörg/x.plist").context("failed");
+        let text = autostart_error_text(&leaking_cause, Some(home));
+        assert!(!text.contains("jörg"), "{text}");
     }
 }

@@ -194,6 +194,7 @@ ui_strings! {
     autostart_disabled_by_user: "Im Task-Manager deaktiviert – zum Aktivieren hier einschalten", "Disabled in Task Manager – switch on here to enable";
     autostart_disabled_by_user_macos: "In den Systemeinstellungen › Allgemein › Anmeldeobjekte deaktiviert – dort wieder erlauben", "Disabled in System Settings › General › Login Items – allow it there";
     autostart_unavailable: "Nur in der installierten App verfügbar", "Only available in the installed app";
+    autostart_not_applied: "Die Autostart-Einstellung wurde nicht übernommen", "The autostart setting was not applied";
     autostart_failed: "Autostart konnte nicht eingerichtet werden: {reason}", "Could not set up autostart: {reason}";
     close: "Schließen", "Close";
 }

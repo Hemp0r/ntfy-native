@@ -80,6 +80,8 @@ pub struct Wizard {
     autostart_touched: bool,
     /// Request id of the running `SetAutostart`.
     autostart_pending: Option<u64>,
+    /// What the running `SetAutostart` asked for.
+    autostart_requested: bool,
     /// Autostart answered with a state worth a hint on the Done page.
     autostart_notice: Option<AutostartState>,
     /// Left the Done page with "Close".
@@ -134,6 +136,7 @@ impl Wizard {
             autostart_state: None,
             autostart_touched: false,
             autostart_pending: None,
+            autostart_requested: false,
             autostart_notice: None,
             closed: false,
             login_required: false,
@@ -272,7 +275,8 @@ impl Wizard {
         }
     }
 
-    /// Switching on is always sent; switching off only when registered.
+    /// Switching on is always sent; switching off only when registered and
+    /// explicitly unchecked.
     /// Nothing before the OS state is known.
     fn autostart_request(&mut self, next_id: &mut u64) -> Option<UiRequest> {
         let enabled = self.autostart_choice;
@@ -281,13 +285,14 @@ impl Wizard {
             state,
             AutostartState::Enabled | AutostartState::NeedsApproval
         );
-        if !self.offer_autostart || state == AutostartState::Unavailable || !(enabled || registered)
-        {
+        let asked = enabled || (registered && self.autostart_touched);
+        if !self.offer_autostart || state == AutostartState::Unavailable || !asked {
             return None;
         }
         let request_id = *next_id;
         *next_id += 1;
         self.autostart_pending = Some(request_id);
+        self.autostart_requested = enabled;
         Some(UiRequest::SetAutostart {
             request_id,
             enabled,
@@ -304,10 +309,11 @@ impl Wizard {
             return false;
         }
         self.autostart_pending = None;
-        match result {
-            Ok(AutostartState::Enabled | AutostartState::Disabled) => {}
-            Ok(state) => self.autostart_notice = Some(*state),
-            Err(reason) => self.error = Some(Problem::AutostartFailed(reason.clone())),
+        match (result, self.autostart_requested) {
+            (Ok(AutostartState::Enabled), true) | (Ok(AutostartState::Disabled), false) => {}
+            (Ok(AutostartState::DisabledByUser | AutostartState::Unavailable), false) => {}
+            (Ok(state), _) => self.autostart_notice = Some(*state),
+            (Err(reason), _) => self.error = Some(Problem::AutostartFailed(reason.clone())),
         }
         self.finished()
     }
@@ -333,12 +339,15 @@ impl Wizard {
         self.autostart_touched = true;
     }
 
-    /// Mirrors the OS state. Turned off there, the option starts unchecked:
-    /// only an explicit choice switches it on again.
+    /// Mirrors the OS state. Turned off there or awaiting approval, the option
+    /// starts unchecked: only an explicit choice switches it on.
     pub fn set_autostart_state(&mut self, state: AutostartState) {
         self.autostart_state = Some(state);
         if self.offer_autostart && !self.autostart_touched {
-            self.autostart_choice = state != AutostartState::DisabledByUser;
+            self.autostart_choice = !matches!(
+                state,
+                AutostartState::DisabledByUser | AutostartState::NeedsApproval
+            );
         }
     }
 
@@ -540,7 +549,7 @@ fn done_page(ui: &mut egui::Ui, w: &mut Wizard, s: &UiStrings) {
         }
         let hint = w
             .autostart_notice
-            .and_then(|state| autostart_hint(state, s));
+            .map(|state| autostart_hint(state, s).unwrap_or(s.autostart_not_applied));
         if let Some(hint) = hint {
             ui.add(Label::new(hint).wrap());
         }
@@ -1709,6 +1718,18 @@ mod tests {
         let mut w = std::mem::take(&mut h.state_mut().w);
         assert_eq!(saved(&mut w, &mut id), []);
 
+        // Awaiting approval: starts unchecked too.
+        let mut w = first_run();
+        w.set_autostart_state(AutostartState::NeedsApproval);
+        assert!(!w.autostart_choice());
+        let mut w = at_notifications_from(w, &mut id);
+        assert_eq!(
+            saved(&mut w, &mut id),
+            [],
+            "untouched default leaves the pending item alone"
+        );
+        assert!(w.finished());
+
         // Turned off in the OS: not switched on again unless chosen here.
         let mut w = at_notifications_from(first_run(), &mut id);
         w.set_autostart_state(AutostartState::DisabledByUser);
@@ -1784,5 +1805,38 @@ mod tests {
         let mut h = harness(w);
         h.run_steps(4);
         h.get_by_label(autostart_hint(AutostartState::DisabledByUser, &UI_EN).unwrap());
+    }
+
+    #[test]
+    fn mismatched_result_keeps_done_page_with_hint() {
+        let mut id = 1;
+        for state in [
+            AutostartState::Disabled,
+            AutostartState::DisabledByUser,
+            AutostartState::Unavailable,
+        ] {
+            let mut w = at_notifications_from(first_run(), &mut id);
+            let (request_id, enabled) = autostart_request(&saved(&mut w, &mut id));
+            assert!(enabled);
+            assert!(!w.on_autostart_result(request_id, &Ok(state)), "{state:?}");
+            assert!(!w.finished(), "{state:?}");
+        }
+        let mut w = at_notifications_from(first_run(), &mut id);
+        let (request_id, _) = autostart_request(&saved(&mut w, &mut id));
+        assert!(!w.on_autostart_result(request_id, &Ok(AutostartState::Disabled)));
+        let mut h = harness(w);
+        h.run_steps(4);
+        h.get_by_label(UI_EN.autostart_not_applied);
+        click(&mut h, UI_EN.close);
+        assert!(h.state().w.finished());
+
+        // Asked to switch off, still on.
+        let mut w = at_notifications_from(first_run(), &mut id);
+        w.set_autostart_state(AutostartState::Enabled);
+        w.set_autostart(false);
+        let (request_id, enabled) = autostart_request(&saved(&mut w, &mut id));
+        assert!(!enabled);
+        assert!(!w.on_autostart_result(request_id, &Ok(AutostartState::Enabled)));
+        assert!(!w.finished());
     }
 }
