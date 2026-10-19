@@ -14,7 +14,11 @@ pub fn popover_position(
 ) -> (f32, f32) {
     const MARGIN: f64 = 8.0;
     const GAP: f64 = 4.0;
-    let scale = f64::from(scale);
+    let scale = if scale.is_finite() && scale > 0.0 {
+        f64::from(scale)
+    } else {
+        1.0
+    };
     let (w, h) = (f64::from(size_logical.0), f64::from(size_logical.1));
     let (mx, my) = (monitor_physical.0 / scale, monitor_physical.1 / scale);
     let (mw, mh) = (monitor_physical.2 / scale, monitor_physical.3 / scale);
@@ -86,6 +90,16 @@ mod tests {
         assert_eq!(y, 28.0);
         let (x, _) = popover_position(&anchor(-1910.0, 0.0, 20.0, 24.0), SIZE, 1.0, m2);
         assert_eq!(x, -1920.0 + 8.0);
+    }
+
+    #[test]
+    fn popover_position_invalid_scale_falls_back_to_one() {
+        let a = anchor(1800.0, 1040.0, 32.0, 40.0);
+        let m = (0.0, 0.0, 1920.0, 1080.0);
+        let expected = popover_position(&a, SIZE, 1.0, m);
+        for scale in [0.0, -2.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(popover_position(&a, SIZE, scale, m), expected, "{scale}");
+        }
     }
 
     #[test]

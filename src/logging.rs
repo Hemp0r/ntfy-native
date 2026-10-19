@@ -16,9 +16,15 @@ const KEEP_FILES: usize = 7;
 /// Installs the global subscriber. Keep the returned guard alive until the
 /// process ends; dropping it flushes buffered lines.
 pub fn init(paths: &AppPaths) -> anyhow::Result<WorkerGuard> {
+    init_with_prefix(paths, APP_NAME)
+}
+
+/// Like [`init`], with its own file prefix so a second process (the UI)
+/// never shares or prunes the core's log files.
+pub fn init_with_prefix(paths: &AppPaths, prefix: &str) -> anyhow::Result<WorkerGuard> {
     let appender = Builder::new()
         .rotation(Rotation::DAILY)
-        .filename_prefix(APP_NAME)
+        .filename_prefix(prefix)
         .filename_suffix("log")
         .max_log_files(KEEP_FILES)
         .build(&paths.log_dir)
