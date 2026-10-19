@@ -11,7 +11,9 @@ use crate::snapshot::UiSnapshot;
 use crate::ui::focus;
 use crate::ui::layout::popover_position;
 use crate::ui::popover::{PopoverState, popover_ui};
+use crate::ui::settings_view::{SettingsState, settings_ui};
 use crate::ui::text::UiStrings;
+use crate::ui::wizard::{Wizard, WizardStep, wizard_ui};
 
 pub const POPOVER_SIZE: (f32, f32) = (360.0, 480.0);
 pub const SETTINGS_SIZE: (f32, f32) = (560.0, 620.0);
@@ -65,6 +67,9 @@ pub struct UiApp {
     outbox: Sender<UiMsg>,
     snapshot: Option<UiSnapshot>,
     popover: PopoverState,
+    settings: SettingsState,
+    /// The wizard window's state (unused in other modes).
+    wizard: Wizard,
     next_id: u64,
     /// Frames drawn so far, saturating.
     frames: u8,
@@ -86,6 +91,8 @@ impl UiApp {
             outbox,
             snapshot: None,
             popover: PopoverState::default(),
+            settings: SettingsState::default(),
+            wizard: Wizard::new(),
             next_id: 1,
             frames: 0,
             had_focus: false,
@@ -96,15 +103,31 @@ impl UiApp {
     fn drain_inbox(&mut self) -> Flow {
         loop {
             match self.inbox.try_recv() {
-                Ok(CoreMsg::Snapshot(s)) => self.snapshot = Some(s),
+                Ok(CoreMsg::Snapshot(s)) => {
+                    self.popover.on_snapshot();
+                    self.settings.on_snapshot(&s);
+                    self.wizard.urgent_global = s.urgent_breaks_dnd;
+                    self.snapshot = Some(s);
+                }
+                // Request ids come from one counter, so every state only takes its own.
+                Ok(CoreMsg::TestResult {
+                    request_id,
+                    outcome,
+                }) => {
+                    self.wizard.on_test_result(request_id, &outcome);
+                    self.settings.on_test_result(request_id, &outcome);
+                }
                 Ok(CoreMsg::SaveResult { request_id, result }) => {
                     self.popover.on_save_result(request_id, &result);
+                    self.wizard.on_save_result(request_id, &result);
+                    self.settings.on_save_result(request_id, &result);
                 }
                 Ok(CoreMsg::Close) => {
                     tracing::info!("core asked the window to close");
                     return Flow::Close;
                 }
                 Ok(m) => tracing::debug!(kind = crate::ui::process::kind(&m), "ignored"),
+                Err(TryRecvError::Empty) if self.wizard_finished() => return Flow::Close,
                 Err(TryRecvError::Empty) => return Flow::Continue,
                 Err(TryRecvError::Disconnected) => {
                     tracing::info!("core connection ended, closing window");
@@ -112,6 +135,12 @@ impl UiApp {
                 }
             }
         }
+    }
+
+    /// The wizard window closes once saved or cancelled.
+    fn wizard_finished(&self) -> bool {
+        self.mode == UiMode::Wizard
+            && (self.wizard.step == WizardStep::Done || self.wizard.cancelled)
     }
 
     /// eframe shows the window only after the first frame, so activate on the second, once.
@@ -178,14 +207,36 @@ impl eframe::App for UiApp {
             ui.ctx().request_repaint_after(AGE_REFRESH);
             return;
         }
-        let title = match self.mode {
-            UiMode::Popover => self.strings.popover_title,
-            UiMode::Settings => self.strings.settings,
-            UiMode::Wizard | UiMode::Probe => self.strings.wizard_title,
-        };
-        egui::CentralPanel::default().show(ui, |ui| {
-            ui.heading(title);
-        });
+        let mut out = Vec::new();
+        match (self.mode, &self.snapshot) {
+            (UiMode::Wizard, _) => {
+                wizard_ui(
+                    ui,
+                    &mut self.wizard,
+                    self.strings,
+                    &mut out,
+                    &mut self.next_id,
+                );
+                if self.wizard_finished() {
+                    // `logic` closes the window on the next frame.
+                    ui.ctx().request_repaint();
+                }
+            }
+            (UiMode::Settings, Some(snap)) => settings_ui(
+                ui,
+                snap,
+                &mut self.settings,
+                self.strings,
+                &mut out,
+                &mut self.next_id,
+            ),
+            _ => {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.centered_and_justified(|ui| ui.spinner());
+                });
+            }
+        }
+        self.forward(out);
     }
 }
 
@@ -195,6 +246,7 @@ mod tests {
 
     use super::*;
     use crate::i18n::UI_EN;
+    use crate::ipc::TestOutcome;
     use crate::ui::layout::AnchorRect;
 
     fn app(mode: UiMode) -> (UiApp, Sender<CoreMsg>) {
@@ -250,6 +302,72 @@ mod tests {
         assert_eq!(a.drain_inbox(), Flow::Continue);
         assert_eq!(a.popover.pending, None);
         assert!(a.popover.add_topic.is_empty());
+    }
+
+    #[test]
+    fn results_reach_the_wizard_and_done_closes_it() {
+        let (mut a, tx) = app(UiMode::Wizard);
+        a.wizard.draft.url = "https://ntfy.example.org".into();
+        let mut id = 7;
+        a.wizard.next(&mut id).unwrap();
+        tx.send(CoreMsg::TestResult {
+            request_id: 7,
+            outcome: TestOutcome::Ok { topics: vec![] },
+        })
+        .unwrap();
+        assert_eq!(a.drain_inbox(), Flow::Continue);
+        assert_eq!(a.wizard.step, WizardStep::Auth);
+
+        a.wizard.step = WizardStep::Notifications;
+        a.wizard.busy = Some(8);
+        tx.send(CoreMsg::SaveResult {
+            request_id: 8,
+            result: Ok("a".into()),
+        })
+        .unwrap();
+        assert_eq!(a.drain_inbox(), Flow::Close);
+        assert_eq!(a.wizard.step, WizardStep::Done);
+    }
+
+    #[test]
+    fn cancelled_wizard_closes_settings_editor_does_not() {
+        let (mut a, _tx) = app(UiMode::Wizard);
+        assert_eq!(a.drain_inbox(), Flow::Continue);
+        a.wizard.cancelled = true;
+        assert_eq!(a.drain_inbox(), Flow::Close);
+        let (mut s, _tx) = app(UiMode::Settings);
+        s.wizard.cancelled = true;
+        assert_eq!(s.drain_inbox(), Flow::Continue);
+    }
+
+    #[test]
+    fn results_and_snapshots_reach_the_settings() {
+        let (mut a, tx) = app(UiMode::Settings);
+        a.settings.pending = Some((4, "a".into()));
+        tx.send(CoreMsg::SaveResult {
+            request_id: 4,
+            result: Ok("a".into()),
+        })
+        .unwrap();
+        assert_eq!(a.drain_inbox(), Flow::Continue);
+        assert!(a.settings.locked.contains("a"));
+        a.settings.editor = Some(Wizard::new());
+        let mut snap = snapshot();
+        snap.urgent_breaks_dnd = true;
+        tx.send(CoreMsg::Snapshot(snap)).unwrap();
+        assert_eq!(a.drain_inbox(), Flow::Continue);
+        assert!(a.settings.locked.is_empty());
+        assert!(a.settings.editor.as_ref().unwrap().urgent_global);
+        assert!(a.wizard.urgent_global);
+    }
+
+    #[test]
+    fn snapshot_reenables_the_popover_topic_row() {
+        let (mut a, tx) = app(UiMode::Popover);
+        a.popover.awaiting_snapshot = true;
+        tx.send(CoreMsg::Snapshot(snapshot())).unwrap();
+        assert_eq!(a.drain_inbox(), Flow::Continue);
+        assert!(!a.popover.awaiting_snapshot);
     }
 
     #[test]

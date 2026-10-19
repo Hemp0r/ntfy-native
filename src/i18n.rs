@@ -168,6 +168,13 @@ ui_strings! {
     version: "Version {v}", "Version {v}";
     not_configured: "Noch nicht eingerichtet", "Not set up yet";
     setup: "Einrichten …", "Set up …";
+    err_save_failed: "Speichern fehlgeschlagen: {reason}", "Saving failed: {reason}";
+    urgent_short: "Dringend", "Urgent";
+    cache_hours: "{n} Std.", "{n} h";
+    cache_days: "{n} Tage", "{n} days";
+    cache_custom: "Benutzerdefiniert ({v})", "Custom ({v})";
+    general_heading: "Allgemein", "General";
+    wizard_done: "Fertig eingerichtet", "All set";
 }
 
 pub fn ui_strings_for(locale: &str) -> &'static UiStrings {

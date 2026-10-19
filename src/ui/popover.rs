@@ -12,6 +12,7 @@ use crate::ipc::UiRequest;
 use crate::settings::Topic;
 use crate::snapshot::{InstanceStatus, InstanceView, RecentView, UiSnapshot, draft_from_view};
 use crate::state::RECENT_MAX;
+use crate::ui::problem::Problem;
 use crate::ui::time::{PauseChoice, format_age, format_paused, pause_until};
 use crate::validate::valid_topic_name;
 
@@ -25,11 +26,14 @@ pub struct PopoverState {
     pub add_topic: String,
     pub add_instance: Option<String>,
     pub pending: Option<u64>,
-    pub error: Option<String>,
+    /// Saved, but the snapshot with the new topic has not arrived yet.
+    pub awaiting_snapshot: bool,
+    pub error: Option<Problem>,
 }
 
 impl PopoverState {
-    /// The result arrives just before the snapshot with the new topic, so clear right away.
+    /// The result arrives just before the snapshot with the new topic: clear
+    /// the field now, keep the row disabled until `on_snapshot`.
     pub fn on_save_result(&mut self, request_id: u64, result: &Result<String, String>) {
         if self.pending != Some(request_id) {
             return;
@@ -39,9 +43,14 @@ impl PopoverState {
             Ok(_) => {
                 self.add_topic.clear();
                 self.error = None;
+                self.awaiting_snapshot = true;
             }
-            Err(e) => self.error = Some(e.clone()),
+            Err(e) => self.error = Some(Problem::SaveFailed(e.clone())),
         }
+    }
+
+    pub fn on_snapshot(&mut self) {
+        self.awaiting_snapshot = false;
     }
 }
 
@@ -361,7 +370,7 @@ fn footer(
         add_topic(ui, snap, state, s, out, next_id);
     }
     if let Some(e) = &state.error {
-        ui.add(Label::new(RichText::new(e).color(ui.visuals().error_fg_color)).wrap());
+        ui.add(Label::new(RichText::new(e.text(s)).color(ui.visuals().error_fg_color)).wrap());
     }
     ui.add_space(2.0);
     ui.horizontal(|ui| {
@@ -392,7 +401,7 @@ fn add_topic(
         .and_then(|id| snap.instances.iter().find(|i| i.id == id))
         .or(snap.instances.first());
     let Some(target) = target else { return };
-    ui.add_enabled_ui(state.pending.is_none(), |ui| {
+    ui.add_enabled_ui(state.pending.is_none() && !state.awaiting_snapshot, |ui| {
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let clicked = ui.button(s.add_topic).clicked();
@@ -428,7 +437,7 @@ fn add_topic(
                     if state.add_topic.trim().is_empty() {
                         edit.request_focus();
                     } else {
-                        submit_topic(target, state, s, out, next_id);
+                        submit_topic(target, state, out, next_id);
                     }
                 }
             })
@@ -439,17 +448,16 @@ fn add_topic(
 fn submit_topic(
     target: &InstanceView,
     state: &mut PopoverState,
-    s: &UiStrings,
     out: &mut Vec<UiRequest>,
     next_id: &mut u64,
 ) {
     let name = state.add_topic.trim();
     if !valid_topic_name(name) {
-        state.error = Some(s.err_topic_invalid.to_owned());
+        state.error = Some(Problem::TopicInvalid);
         return;
     }
     if target.topics.iter().any(|t| t.name == name) {
-        state.error = Some(s.err_topic_duplicate.to_owned());
+        state.error = Some(Problem::TopicDuplicate);
         return;
     }
     let mut draft = draft_from_view(target);
@@ -822,6 +830,16 @@ mod tests {
         assert_eq!(h.state().state.pending, None);
         assert_eq!(h.state().state.add_topic, "");
         assert_eq!(h.state().state.error, None);
+
+        // The snapshot with the new topic is still on its way: no draft from stale topics.
+        h.state_mut().state.add_topic = "second".into();
+        h.run();
+        click(&mut h, "+ Topic");
+        assert!(take(&mut h).is_empty());
+        h.state_mut().state.on_snapshot();
+        h.run();
+        click(&mut h, "+ Topic");
+        assert_eq!(take(&mut h).len(), 1);
     }
 
     #[test]
@@ -839,7 +857,7 @@ mod tests {
             .state
             .on_save_result(1, &Err("could not save settings".into()));
         h.run();
-        h.get_by_label("could not save settings");
+        h.get_by_label("Saving failed: could not save settings");
         assert_eq!(h.state().state.add_topic, "extra");
         assert_eq!(h.state().state.pending, None);
     }
