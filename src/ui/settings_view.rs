@@ -1,6 +1,6 @@
 //! Settings window: servers with their topics, global switches, folders, version.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eframe::egui::{self, Align, Color32, ComboBox, Frame, Label, Layout, RichText, ScrollArea};
 
@@ -9,7 +9,7 @@ use crate::ipc::{TestOutcome, UiRequest};
 use crate::settings::Topic;
 use crate::snapshot::{InstanceStatus, InstanceView, UiSnapshot, draft_from_view};
 use crate::ui::problem::Problem;
-use crate::ui::wizard::{Wizard, WizardStep, wizard_ui};
+use crate::ui::wizard::{Wizard, WizardStep, forget_secret_field, wizard_ui};
 
 /// 12 h, 24 h, 72 h, 7 days.
 pub const CACHE_CHOICES: [i64; 4] = [43_200, 86_400, 259_200, 604_800];
@@ -25,8 +25,8 @@ pub struct SettingsState {
     pub editor: Option<Wizard>,
     /// Instance whose removal awaits confirmation.
     pub confirm_remove: Option<String>,
-    /// Running save (request id, instance id) from this list.
-    pub pending: Option<(u64, String)>,
+    /// Running saves from this list: request id → instance id.
+    pub pending: BTreeMap<u64, String>,
     /// Instances changed by a confirmed request, disabled until the next snapshot shows the change.
     pub locked: BTreeSet<String>,
     pub error: Option<Problem>,
@@ -52,20 +52,12 @@ impl SettingsState {
                 return;
             }
         }
-        if self
-            .pending
-            .as_ref()
-            .is_none_or(|(id, _)| *id != request_id)
-        {
-            return;
-        }
-        let Some((_, instance_id)) = self.pending.take() else {
+        let Some(instance_id) = self.pending.remove(&request_id) else {
             return;
         };
         match result {
             Ok(_) => {
                 self.locked.insert(instance_id);
-                self.error = None;
             }
             Err(reason) => self.error = Some(Problem::SaveFailed(reason.clone())),
         }
@@ -79,11 +71,7 @@ impl SettingsState {
     }
 
     fn enabled(&self, instance_id: &str) -> bool {
-        !self.locked.contains(instance_id)
-            && self
-                .pending
-                .as_ref()
-                .is_none_or(|(_, id)| id != instance_id)
+        !self.locked.contains(instance_id) && !self.pending.values().any(|id| id == instance_id)
     }
 }
 
@@ -96,7 +84,7 @@ pub fn cache_label(secs: i64, s: &UiStrings) -> String {
             let v = if secs % 3600 == 0 {
                 hours(secs / 3600)
             } else {
-                format!("{secs} s")
+                fill(s.cache_seconds, &[("n", &secs.to_string())])
             };
             fill(s.cache_custom, &[("v", &v)])
         }
@@ -129,6 +117,7 @@ pub fn settings_ui(
         }
         return;
     }
+    forget_secret_field(ui.ctx());
     ui.style_mut().interaction.selectable_labels = false;
     egui::Panel::bottom("settings_footer").show(ui, |ui| footer(ui, snap, s, out));
     egui::CentralPanel::default().show(ui, |ui| {
@@ -264,7 +253,7 @@ fn cache_duration(
         draft.cache_duration_secs = chosen;
         let request_id = *next_id;
         *next_id += 1;
-        state.pending = Some((request_id, inst.id.clone()));
+        state.pending.insert(request_id, inst.id.clone());
         state.error = None;
         out.push(UiRequest::SaveInstance { request_id, draft });
     }
@@ -336,6 +325,7 @@ mod tests {
     use crate::i18n::UI_EN;
     use crate::instance_edit::AuthDraft;
     use crate::snapshot::AuthView;
+    use crate::ui::wizard::secret_field_id;
 
     struct T {
         snap: UiSnapshot,
@@ -530,7 +520,10 @@ mod tests {
         assert_eq!(draft.auth, AuthDraft::Token { token: None });
         assert_eq!(draft.topics, snapshot().instances[0].topics);
         let request_id = *request_id;
-        assert_eq!(h.state().state.pending, Some((request_id, "a".into())));
+        assert_eq!(
+            h.state().state.pending.get(&request_id).map(String::as_str),
+            Some("a")
+        );
 
         click(&mut h, "Remove");
         assert!(
@@ -543,7 +536,7 @@ mod tests {
             .on_save_result(request_id, &Err("could not save settings".into()));
         h.run_steps(4);
         h.get_by_label("Saving failed: could not save settings");
-        assert_eq!(h.state().state.pending, None);
+        assert!(h.state().state.pending.is_empty());
 
         open_cache_menu(&mut h);
         click(&mut h, "24 h");
@@ -626,6 +619,55 @@ mod tests {
                 .is_none(),
             "edited server locked until the snapshot"
         );
+    }
+
+    #[test]
+    fn cache_errors_survive_parallel_changes() {
+        let mut snap = snapshot();
+        let mut b = snap.instances[0].clone();
+        b.id = "b".into();
+        b.host = "push.example.net".into();
+        snap.instances.push(b);
+        let mut h = harness(snap);
+        let mut ids = Vec::new();
+        for (i, choice) in [(0, "7 days"), (1, "24 h")] {
+            h.get_all_by_role(egui::Role::ComboBox)
+                .nth(i)
+                .unwrap()
+                .click();
+            h.run_steps(4);
+            click(&mut h, choice);
+            let out = take(&mut h);
+            let [UiRequest::SaveInstance { request_id, .. }] = out.as_slice() else {
+                panic!("{out:?}");
+            };
+            ids.push(*request_id);
+        }
+        h.state_mut()
+            .state
+            .on_save_result(ids[0], &Err("could not save settings".into()));
+        h.state_mut().state.on_save_result(ids[1], &Ok("b".into()));
+        h.run_steps(4);
+        h.get_by_label("Saving failed: could not save settings");
+        assert!(h.state().state.pending.is_empty());
+        assert!(h.state().state.locked.contains("b"));
+        assert!(!h.state().state.locked.contains("a"));
+    }
+
+    #[test]
+    fn leaving_the_editor_forgets_the_secret_field() {
+        let mut h = harness(snapshot());
+        click(&mut h, "Edit");
+        h.state_mut().state.editor.as_mut().unwrap().step = WizardStep::Auth;
+        h.run_steps(4);
+        let field = h.get_by_role_and_label(egui::Role::PasswordInput, UI_EN.auth_token);
+        field.focus();
+        field.type_text("tk_1");
+        h.run_steps(4);
+        assert!(egui::text_edit::TextEditState::load(&h.ctx, secret_field_id()).is_some());
+        click(&mut h, "Cancel");
+        h.run_steps(4);
+        assert!(egui::text_edit::TextEditState::load(&h.ctx, secret_field_id()).is_none());
     }
 
     #[test]

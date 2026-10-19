@@ -1,6 +1,7 @@
 //! Setup wizard: server → login → topics → notifications, each step checked by the core.
 
 use eframe::egui::{self, Align, Key, Label, Layout, RichText, ScrollArea, TextEdit};
+use zeroize::Zeroize;
 
 use crate::i18n::UiStrings;
 use crate::instance_edit::{AuthDraft, InstanceDraft};
@@ -9,6 +10,16 @@ use crate::settings::{Instance, Topic};
 use crate::snapshot::{InstanceView, draft_from_view};
 use crate::ui::problem::Problem;
 use crate::validate::valid_topic_name;
+
+/// The token/password field; its egui state (with undo history) is dropped after the Auth step.
+pub fn secret_field_id() -> egui::Id {
+    egui::Id::unique("wizard_secret")
+}
+
+/// Drops egui's copy (text and undo history) of what was typed into the secret field.
+pub fn forget_secret_field(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(secret_field_id()));
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WizardStep {
@@ -52,6 +63,12 @@ pub struct Wizard {
     secret: String,
     new_topic: String,
     original_auth: AuthDraft,
+}
+
+impl Drop for Wizard {
+    fn drop(&mut self) {
+        self.secret.zeroize();
+    }
 }
 
 impl Default for Wizard {
@@ -117,8 +134,12 @@ impl Wizard {
         })
     }
 
-    /// Also abandons a running test or save: its answer will be ignored.
+    /// Also abandons a running test (its answer will be ignored), but not a
+    /// running save: its late success would make a second Finish a duplicate.
     pub fn back(&mut self) {
+        if self.saving() {
+            return;
+        }
         self.busy = None;
         self.error = None;
         self.step = match self.step {
@@ -169,6 +190,7 @@ impl Wizard {
             Ok(_) => {
                 self.error = None;
                 self.step = WizardStep::Done;
+                self.secret.zeroize();
             }
             Err(reason) => self.error = Some(Problem::SaveFailed(reason.clone())),
         }
@@ -184,7 +206,7 @@ impl Wizard {
                 AuthDraft::Token { .. } => !self.secret.trim().is_empty() || self.can_keep_secret(),
                 AuthDraft::Basic { username, .. } => {
                     !username.trim().is_empty()
-                        && (!self.secret.is_empty() || self.can_keep_secret())
+                        && (!self.secret.trim().is_empty() || self.can_keep_secret())
                 }
             },
             WizardStep::Topics => !self.has_unreadable(),
@@ -205,6 +227,11 @@ impl Wizard {
             }
     }
 
+    /// A `SaveInstance` is in flight.
+    pub fn saving(&self) -> bool {
+        self.step == WizardStep::Notifications && self.busy.is_some()
+    }
+
     fn has_unreadable(&self) -> bool {
         self.draft.topics.iter().any(|t| {
             self.topic_access
@@ -214,7 +241,7 @@ impl Wizard {
     }
 
     fn set_auth_choice(&mut self, choice: AuthChoice) {
-        self.secret.clear();
+        self.secret.zeroize();
         self.error = None;
         let original_user = match &self.original_auth {
             AuthDraft::Basic { username, .. } => username.clone(),
@@ -260,7 +287,8 @@ impl Wizard {
         } else {
             format!("https://{url}")
         };
-        let secret = (!self.secret.is_empty()).then(|| self.secret.clone());
+        // Blank keeps the stored secret; a password keeps its own spaces.
+        let secret = (!self.secret.trim().is_empty()).then(|| self.secret.clone());
         draft.auth = match &self.draft.auth {
             AuthDraft::None => AuthDraft::None,
             AuthDraft::Token { .. } => AuthDraft::Token {
@@ -287,6 +315,9 @@ pub fn wizard_ui(
     next_id: &mut u64,
 ) {
     ui.style_mut().interaction.selectable_labels = false;
+    if w.step != WizardStep::Auth {
+        forget_secret_field(ui.ctx());
+    }
     if w.step == WizardStep::Done {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.vertical_centered(|ui| {
@@ -349,7 +380,11 @@ fn buttons(
             if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
                 out.extend(w.next(next_id));
             }
-            if w.step != WizardStep::Server && ui.button(s.back).clicked() {
+            if w.step != WizardStep::Server
+                && ui
+                    .add_enabled(!w.saving(), egui::Button::new(s.back))
+                    .clicked()
+            {
                 w.back();
             }
         });
@@ -414,6 +449,7 @@ fn auth_step(ui: &mut egui::Ui, w: &mut Wizard, s: &UiStrings) -> bool {
                 ui,
                 s.auth_token,
                 TextEdit::singleline(&mut w.secret)
+                    .id(secret_field_id())
                     .password(true)
                     .hint_text(hint),
             );
@@ -425,6 +461,7 @@ fn auth_step(ui: &mut egui::Ui, w: &mut Wizard, s: &UiStrings) -> bool {
                 ui,
                 s.password,
                 TextEdit::singleline(&mut w.secret)
+                    .id(secret_field_id())
                     .password(true)
                     .hint_text(hint),
             );
@@ -966,6 +1003,107 @@ mod tests {
         h.get_by_label("Saving failed: disk full");
         click(&mut h, "Back");
         assert_eq!(h.state().w.step, WizardStep::Topics);
+    }
+
+    #[test]
+    fn back_is_blocked_while_saving() {
+        let mut id = 1;
+        let mut w = at_notifications(&mut id);
+        let Some(UiRequest::SaveInstance { request_id, .. }) = w.next(&mut id) else {
+            panic!("save");
+        };
+        w.back();
+        assert_eq!(w.step, WizardStep::Notifications);
+        assert_eq!(w.busy, Some(request_id));
+
+        let mut h = harness(w);
+        h.run_steps(4);
+        click(&mut h, "Back");
+        assert_eq!(h.state().w.step, WizardStep::Notifications);
+        h.state_mut()
+            .w
+            .on_save_result(request_id, &Ok("ntfy.example.org".into()));
+        assert_eq!(h.state().w.step, WizardStep::Done);
+    }
+
+    #[test]
+    fn blank_secret_keeps_the_stored_one() {
+        let mut id = 1;
+        let mut w = Wizard::edit(&view(AuthView::Token));
+        w.step = WizardStep::Auth;
+        w.secret = "  \t ".into();
+        let (_, draft) = test_draft(w.next(&mut id));
+        assert_eq!(draft.auth, AuthDraft::Token { token: None });
+
+        let mut w = Wizard::edit(&view(AuthView::Basic {
+            username: "alice".into(),
+        }));
+        w.step = WizardStep::Auth;
+        w.secret = "   ".into();
+        let (_, draft) = test_draft(w.next(&mut id));
+        assert_eq!(
+            draft.auth,
+            AuthDraft::Basic {
+                username: "alice".into(),
+                password: None
+            }
+        );
+        // A real password keeps its spaces.
+        w.on_test_result(w.busy.unwrap(), &TestOutcome::AuthFailed);
+        w.secret = " pw ".into();
+        let (_, draft) = test_draft(w.next(&mut id));
+        assert_eq!(
+            draft.auth,
+            AuthDraft::Basic {
+                username: "alice".into(),
+                password: Some(" pw ".into())
+            }
+        );
+
+        let mut w = Wizard::new();
+        w.step = WizardStep::Auth;
+        w.set_auth_choice(AuthChoice::Basic);
+        w.draft.auth = AuthDraft::Basic {
+            username: "bob".into(),
+            password: None,
+        };
+        w.secret = "  ".into();
+        assert!(!w.can_continue(), "a blank password is no password");
+    }
+
+    #[test]
+    fn secret_field_is_forgotten_after_the_auth_step() {
+        let mut w = Wizard::new();
+        w.step = WizardStep::Auth;
+        w.set_auth_choice(AuthChoice::Token);
+        let mut h = harness(w);
+        h.run_steps(4);
+        type_into(&mut h, egui::Role::PasswordInput, UI_EN.auth_token, "tk_1");
+        assert!(egui::text_edit::TextEditState::load(&h.ctx, secret_field_id()).is_some());
+        click(&mut h, "Next");
+        let id = h.state().w.busy.unwrap();
+        h.state_mut().w.on_test_result(id, &ok(&[]));
+        h.run_steps(4);
+        assert_eq!(h.state().w.step, WizardStep::Topics);
+        assert!(egui::text_edit::TextEditState::load(&h.ctx, secret_field_id()).is_none());
+        assert_eq!(
+            h.state().w.secret,
+            "tk_1",
+            "still needed for the next steps"
+        );
+    }
+
+    #[test]
+    fn secret_is_wiped_once_saved() {
+        let mut id = 1;
+        let mut w = at_notifications(&mut id);
+        w.secret = "tk_1".into();
+        let request = w.next(&mut id);
+        let Some(UiRequest::SaveInstance { request_id, .. }) = request else {
+            panic!("save");
+        };
+        w.on_save_result(request_id, &Ok("a".into()));
+        assert!(w.secret.is_empty());
     }
 
     #[test]

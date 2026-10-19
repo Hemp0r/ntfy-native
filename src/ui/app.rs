@@ -343,7 +343,7 @@ mod tests {
     #[test]
     fn results_and_snapshots_reach_the_settings() {
         let (mut a, tx) = app(UiMode::Settings);
-        a.settings.pending = Some((4, "a".into()));
+        a.settings.pending.insert(4, "a".into());
         tx.send(CoreMsg::SaveResult {
             request_id: 4,
             result: Ok("a".into()),

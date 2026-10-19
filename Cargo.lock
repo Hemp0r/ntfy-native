@@ -2702,6 +2702,7 @@ dependencies = [
  "windows-native-keyring-store",
  "winit",
  "winresource",
+ "zeroize",
 ]
 
 [[package]]

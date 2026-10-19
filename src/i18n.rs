@@ -172,6 +172,7 @@ ui_strings! {
     urgent_short: "Dringend", "Urgent";
     cache_hours: "{n} Std.", "{n} h";
     cache_days: "{n} Tage", "{n} days";
+    cache_seconds: "{n} s", "{n} s";
     cache_custom: "Benutzerdefiniert ({v})", "Custom ({v})";
     general_heading: "Allgemein", "General";
     wizard_done: "Fertig eingerichtet", "All set";
