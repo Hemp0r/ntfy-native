@@ -339,8 +339,8 @@ async fn stalled_server_times_out_after_ten_seconds() {
 #[tokio::test]
 async fn category_ignores_words_in_host_and_topic() {
     // The URL contains "dns", "tls" and "timeout", the cause is a refusal.
-    let port = unused_url().rsplit(':').next().unwrap().to_owned();
-    let url = format!("http://dns-tls-timeout.localhost:{port}");
+    // The words sit in the path: Windows does not resolve `*.localhost`.
+    let url = format!("{}/dns-tls-timeout", unused_url());
     let refused = TestOutcome::Unreachable {
         message: "connection refused".into(),
     };
