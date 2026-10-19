@@ -196,10 +196,8 @@ fn autostart(
     let available = current != AutostartState::Unavailable;
     let mut on = match state.autostart_pending {
         Some((_, requested)) => requested,
-        None => matches!(
-            current,
-            AutostartState::Enabled | AutostartState::NeedsApproval
-        ),
+        // Awaiting approval does not start the app yet.
+        None => current == AutostartState::Enabled,
     };
     let enabled = available && state.autostart_pending.is_none();
     if ui
@@ -869,10 +867,16 @@ mod tests {
             "{out:?}"
         );
 
-        // Waiting for approval counts as on, with a hint.
-        let h = harness(autostart_snapshot(AutostartState::NeedsApproval));
-        assert_eq!(autostart_toggled(&h), Some(Toggled::True));
+        // Waiting for approval does not start the app yet: off, with a hint.
+        let mut h = harness(autostart_snapshot(AutostartState::NeedsApproval));
+        assert_eq!(autostart_toggled(&h), Some(Toggled::False));
         h.get_by_label(UI_EN.autostart_needs_approval);
+        click(&mut h, UI_EN.autostart);
+        let out = take(&mut h);
+        assert!(
+            matches!(out[..], [UiRequest::SetAutostart { enabled: true, .. }]),
+            "{out:?}"
+        );
     }
 
     #[test]

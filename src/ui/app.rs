@@ -503,7 +503,7 @@ mod tests {
         let (tx, inbox) = channel();
         let (outbox, sent) = channel();
         let mut a = UiApp::new(UiMode::Wizard, &UI_EN, inbox, outbox);
-        assert!(a.wizard.offer_autostart && a.wizard.autostart_choice);
+        assert!(a.wizard.offer_autostart && a.wizard.autostart_choice());
         let (s, _tx) = app(UiMode::Settings);
         assert!(!s.wizard.offer_autostart);
 
@@ -511,7 +511,7 @@ mod tests {
         snap.autostart = AutostartState::Enabled;
         tx.send(CoreMsg::Snapshot(snap)).unwrap();
         assert_eq!(a.drain_inbox(), Flow::Continue);
-        assert_eq!(a.wizard.autostart_state, AutostartState::Enabled);
+        assert_eq!(a.wizard.autostart_state, Some(AutostartState::Enabled));
 
         a.wizard.step = WizardStep::Notifications;
         a.wizard.busy = Some(8);
@@ -541,6 +541,7 @@ mod tests {
         let (tx, inbox) = channel();
         let (outbox, _sent) = channel();
         let mut a = UiApp::new(UiMode::Wizard, &UI_EN, inbox, outbox);
+        tx.send(CoreMsg::Snapshot(snapshot())).unwrap();
         a.wizard.step = WizardStep::Notifications;
         a.wizard.busy = Some(1);
         a.next_id = 2;
@@ -586,6 +587,7 @@ mod tests {
             name: "alerts".into(),
             ..Default::default()
         }];
+        a.wizard.set_autostart_state(AutostartState::Disabled);
         a.wizard.step = WizardStep::Notifications;
         a.wizard.set_urgent(true);
         let mut id = 8;

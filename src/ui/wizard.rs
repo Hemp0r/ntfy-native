@@ -72,10 +72,10 @@ pub struct Wizard {
     urgent_set: Option<bool>,
     /// First setup only: offer to start at login, applied once saved.
     pub offer_autostart: bool,
-    /// The "start at login" option as shown.
-    pub autostart_choice: bool,
-    /// As the OS reports it, mirrored from the latest snapshot.
-    pub autostart_state: AutostartState,
+    /// The "start at login" option as shown; changed via `set_autostart`.
+    autostart_choice: bool,
+    /// As the OS reports it, mirrored from the latest snapshot; `None` before the first.
+    pub autostart_state: Option<AutostartState>,
     /// The user changed the option, so snapshots no longer adjust it.
     autostart_touched: bool,
     /// Request id of the running `SetAutostart`.
@@ -131,7 +131,7 @@ impl Wizard {
             urgent_set: None,
             offer_autostart: false,
             autostart_choice: false,
-            autostart_state: AutostartState::Disabled,
+            autostart_state: None,
             autostart_touched: false,
             autostart_pending: None,
             autostart_notice: None,
@@ -272,13 +272,16 @@ impl Wizard {
         }
     }
 
-    /// Switching on is always sent; switching off only when it is on.
+    /// Switching on is always sent; switching off only when registered.
+    /// Nothing before the OS state is known.
     fn autostart_request(&mut self, next_id: &mut u64) -> Option<UiRequest> {
         let enabled = self.autostart_choice;
-        let state = self.autostart_state;
-        if !self.offer_autostart
-            || state == AutostartState::Unavailable
-            || !(enabled || state == AutostartState::Enabled)
+        let state = self.autostart_state?;
+        let registered = matches!(
+            state,
+            AutostartState::Enabled | AutostartState::NeedsApproval
+        );
+        if !self.offer_autostart || state == AutostartState::Unavailable || !(enabled || registered)
         {
             return None;
         }
@@ -319,6 +322,11 @@ impl Wizard {
                 && self.error.is_none())
     }
 
+    /// The "start at login" option as shown.
+    pub fn autostart_choice(&self) -> bool {
+        self.autostart_choice
+    }
+
     /// The user's choice; sent only once saved.
     pub fn set_autostart(&mut self, enabled: bool) {
         self.autostart_choice = enabled;
@@ -328,7 +336,7 @@ impl Wizard {
     /// Mirrors the OS state. Turned off there, the option starts unchecked:
     /// only an explicit choice switches it on again.
     pub fn set_autostart_state(&mut self, state: AutostartState) {
-        self.autostart_state = state;
+        self.autostart_state = Some(state);
         if self.offer_autostart && !self.autostart_touched {
             self.autostart_choice = state != AutostartState::DisabledByUser;
         }
@@ -539,7 +547,7 @@ fn done_page(ui: &mut egui::Ui, w: &mut Wizard, s: &UiStrings) {
         if let Some(e) = &w.error {
             ui.add(Label::new(RichText::new(e.text(s)).color(ui.visuals().error_fg_color)).wrap());
         }
-        if (hint.is_some() || w.error.is_some()) && ui.button(s.close).clicked() {
+        if (w.autostart_notice.is_some() || w.error.is_some()) && ui.button(s.close).clicked() {
             w.closed = true;
         }
     });
@@ -738,7 +746,7 @@ fn notifications_step(ui: &mut egui::Ui, w: &mut Wizard, s: &UiStrings, out: &mu
     }
     if w.offer_autostart {
         ui.add_space(6.0);
-        let available = w.autostart_state != AutostartState::Unavailable;
+        let available = w.autostart_state != Some(AutostartState::Unavailable);
         let mut on = w.autostart_choice && available;
         if ui
             .add_enabled(available, egui::Checkbox::new(&mut on, s.autostart))
@@ -746,7 +754,7 @@ fn notifications_step(ui: &mut egui::Ui, w: &mut Wizard, s: &UiStrings, out: &mu
         {
             w.set_autostart(on);
         }
-        if let Some(hint) = autostart_hint(w.autostart_state, s) {
+        if let Some(hint) = w.autostart_state.and_then(|state| autostart_hint(state, s)) {
             ui.add(Label::new(RichText::new(hint).small().weak()).wrap());
         }
     }
@@ -1556,6 +1564,13 @@ mod tests {
         w.on_save_result(request_id, &Ok("a".into()), id)
     }
 
+    /// A first-run wizard that has seen a snapshot (autostart off).
+    fn first_run() -> Wizard {
+        let mut w = Wizard::first_run();
+        w.set_autostart_state(AutostartState::Disabled);
+        w
+    }
+
     fn autostart_request(out: &[UiRequest]) -> (u64, bool) {
         match out {
             [
@@ -1572,12 +1587,12 @@ mod tests {
     fn first_run_offers_autostart_default_on() {
         let w = Wizard::first_run();
         assert!(w.offer_autostart);
-        assert!(w.autostart_choice);
+        assert!(w.autostart_choice());
         assert_eq!(w.step, WizardStep::Server);
         assert!(!w.editing);
 
         let mut id = 1;
-        let mut h = harness(at_notifications_from(Wizard::first_run(), &mut id));
+        let mut h = harness(at_notifications_from(first_run(), &mut id));
         h.run_steps(4);
         assert_eq!(
             toggled(&h, UI_EN.autostart),
@@ -1585,7 +1600,7 @@ mod tests {
         );
         click(&mut h, UI_EN.autostart);
         assert!(take(&mut h).is_empty(), "the option waits for Finish");
-        assert!(!h.state().w.autostart_choice);
+        assert!(!h.state().w.autostart_choice());
         assert_eq!(
             toggled(&h, UI_EN.autostart),
             Some(egui::accesskit::Toggled::False)
@@ -1610,7 +1625,7 @@ mod tests {
     #[test]
     fn autostart_sent_only_after_successful_save() {
         let mut id = 1;
-        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        let mut w = at_notifications_from(first_run(), &mut id);
         let Some(UiRequest::SaveInstance { request_id, .. }) = w.next(&mut id) else {
             panic!("save");
         };
@@ -1634,7 +1649,7 @@ mod tests {
         assert!(w.finished());
 
         // Urgent switch and autostart together.
-        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        let mut w = at_notifications_from(first_run(), &mut id);
         w.set_urgent(true);
         let out = saved(&mut w, &mut id);
         assert!(
@@ -1649,7 +1664,7 @@ mod tests {
         );
 
         // Cancelled: nothing is sent.
-        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        let mut w = at_notifications_from(first_run(), &mut id);
         w.cancel();
         assert!(w.cancelled && w.finished());
     }
@@ -1662,24 +1677,26 @@ mod tests {
             AutostartState::DisabledByUser,
             AutostartState::Unavailable,
         ] {
-            let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+            let mut w = at_notifications_from(first_run(), &mut id);
             w.set_autostart_state(state);
             w.set_autostart(false);
             assert_eq!(saved(&mut w, &mut id), [], "{state:?}");
             assert!(w.finished(), "{state:?}");
         }
 
-        // Already on and unchecked: turned off.
-        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
-        w.set_autostart_state(AutostartState::Enabled);
-        w.set_autostart(false);
-        let (request_id, enabled) = autostart_request(&saved(&mut w, &mut id));
-        assert!(!enabled);
-        assert!(w.on_autostart_result(request_id, &Ok(AutostartState::Disabled)));
-        assert!(w.finished());
+        // Already on (or awaiting approval) and unchecked: turned off.
+        for state in [AutostartState::Enabled, AutostartState::NeedsApproval] {
+            let mut w = at_notifications_from(first_run(), &mut id);
+            w.set_autostart_state(state);
+            w.set_autostart(false);
+            let (request_id, enabled) = autostart_request(&saved(&mut w, &mut id));
+            assert!(!enabled, "{state:?}");
+            assert!(w.on_autostart_result(request_id, &Ok(AutostartState::Disabled)));
+            assert!(w.finished());
+        }
 
         // Unavailable: never sent, the option is shown disabled.
-        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        let mut w = at_notifications_from(first_run(), &mut id);
         w.set_autostart_state(AutostartState::Unavailable);
         let mut h = harness(w);
         h.run_steps(4);
@@ -1693,9 +1710,9 @@ mod tests {
         assert_eq!(saved(&mut w, &mut id), []);
 
         // Turned off in the OS: not switched on again unless chosen here.
-        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        let mut w = at_notifications_from(first_run(), &mut id);
         w.set_autostart_state(AutostartState::DisabledByUser);
-        assert!(!w.autostart_choice);
+        assert!(!w.autostart_choice());
         let mut h = harness(w);
         h.run_steps(4);
         assert_eq!(
@@ -1707,15 +1724,30 @@ mod tests {
             .w
             .set_autostart_state(AutostartState::DisabledByUser);
         let mut w = std::mem::take(&mut h.state_mut().w);
-        assert!(w.autostart_choice, "a snapshot keeps the choice");
+        assert!(w.autostart_choice(), "a snapshot keeps the choice");
         let (_, enabled) = autostart_request(&saved(&mut w, &mut id));
         assert!(enabled);
     }
 
     #[test]
-    fn needs_approval_keeps_done_page_with_hint() {
+    fn autostart_waits_for_the_os_state() {
         let mut id = 1;
         let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        assert_eq!(w.autostart_state, None);
+        assert!(w.autostart_choice());
+        w.set_urgent(true);
+        assert_eq!(
+            saved(&mut w, &mut id),
+            [UiRequest::SetUrgentGlobal { enabled: true }],
+            "no snapshot yet: autostart unknown, nothing sent"
+        );
+        assert!(w.finished());
+    }
+
+    #[test]
+    fn needs_approval_keeps_done_page_with_hint() {
+        let mut id = 1;
+        let mut w = at_notifications_from(first_run(), &mut id);
         let (request_id, _) = autostart_request(&saved(&mut w, &mut id));
         let mut h = harness(w);
         h.run_steps(4);
@@ -1735,7 +1767,7 @@ mod tests {
         assert!(take(&mut h).is_empty());
 
         // An error from the core is shown localized.
-        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        let mut w = at_notifications_from(first_run(), &mut id);
         let (request_id, _) = autostart_request(&saved(&mut w, &mut id));
         assert!(!w.on_autostart_result(request_id, &Err("permission denied".into())));
         let mut h = harness(w);
@@ -1746,7 +1778,7 @@ mod tests {
         assert!(h.state().w.finished());
 
         // Still off in the OS (macOS Login Items): pointed there.
-        let mut w = at_notifications_from(Wizard::first_run(), &mut id);
+        let mut w = at_notifications_from(first_run(), &mut id);
         let (request_id, _) = autostart_request(&saved(&mut w, &mut id));
         assert!(!w.on_autostart_result(request_id, &Ok(AutostartState::DisabledByUser)));
         let mut h = harness(w);
