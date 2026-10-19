@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ntfy_native::actions::RecordingOpener;
+use ntfy_native::autostart::{Autostart, AutostartState, MemoryAutostart};
 use ntfy_native::connection::ConnectionConfig;
 use ntfy_native::engine::{Command, EngineDeps, EngineHandle, spawn_engine_thread};
 use ntfy_native::i18n::EN;
@@ -86,6 +87,7 @@ fn load<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Option<T> {
 }
 
 type SaveResults = Arc<Mutex<Vec<(u64, Result<String, String>)>>>;
+type AutostartResults = Arc<Mutex<Vec<(u64, Result<AutostartState, String>)>>>;
 type TestResults = Arc<Mutex<Vec<(u64, TestOutcome)>>>;
 
 /// An engine on its own thread (as in production) with recording fakes.
@@ -98,6 +100,7 @@ struct TestEngine {
     snapshots: Arc<Mutex<Vec<UiSnapshot>>>,
     save_results: SaveResults,
     test_results: TestResults,
+    autostart_results: AutostartResults,
     exited: Arc<AtomicBool>,
     paths: AppPaths,
 }
@@ -113,12 +116,24 @@ impl TestEngine {
         state: State,
         secrets: Arc<dyn SecretStore>,
     ) -> Self {
+        let autostart = Arc::new(MemoryAutostart::new(AutostartState::Disabled));
+        Self::start_full(paths, settings, state, secrets, autostart)
+    }
+
+    fn start_full(
+        paths: &AppPaths,
+        settings: Settings,
+        state: State,
+        secrets: Arc<dyn SecretStore>,
+        autostart: Arc<MemoryAutostart>,
+    ) -> Self {
         let notifier = Arc::new(RecordingNotifier::default());
         let opener = Arc::new(RecordingOpener::default());
         let trays = Arc::new(Mutex::new(Vec::new()));
         let snapshots = Arc::new(Mutex::new(Vec::new()));
         let save_results = SaveResults::default();
         let test_results = TestResults::default();
+        let autostart_results = AutostartResults::default();
         let exited = Arc::new(AtomicBool::new(false));
         let deps = EngineDeps {
             paths: paths.clone(),
@@ -140,6 +155,7 @@ impl TestEngine {
                 let snapshots = snapshots.clone();
                 let save_results = save_results.clone();
                 let test_results = test_results.clone();
+                let autostart_results = autostart_results.clone();
                 Box::new(move |m| match m {
                     CoreMsg::TestResult {
                         request_id,
@@ -149,9 +165,13 @@ impl TestEngine {
                     CoreMsg::SaveResult { request_id, result } => {
                         save_results.lock().unwrap().push((request_id, result))
                     }
+                    CoreMsg::AutostartResult { request_id, result } => {
+                        autostart_results.lock().unwrap().push((request_id, result))
+                    }
                     _ => {}
                 })
             },
+            autostart: autostart.clone(),
             tune: fast,
             enable_triggers: false,
         };
@@ -165,6 +185,7 @@ impl TestEngine {
             snapshots,
             save_results,
             test_results,
+            autostart_results,
             exited,
             paths: paths.clone(),
         }
@@ -215,7 +236,12 @@ impl TestEngine {
 
     /// Waits up to 3 s for `cond`.
     async fn wait_for(&self, what: &str, cond: impl Fn(&Self) -> bool) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        self.wait_for_within(Duration::from_secs(3), what, cond)
+            .await;
+    }
+
+    async fn wait_for_within(&self, limit: Duration, what: &str, cond: impl Fn(&Self) -> bool) {
+        let deadline = tokio::time::Instant::now() + limit;
         while !cond(self) {
             assert!(
                 tokio::time::Instant::now() < deadline,
@@ -1305,4 +1331,111 @@ async fn edited_draft_for_another_host_is_tested_without_the_stored_secret() {
 
     let err = engine.save(2, moved).await.unwrap_err();
     assert_eq!(err, "credentials required for a new server address");
+}
+
+fn autostart_engine(
+    state: AutostartState,
+) -> (tempfile::TempDir, Arc<MemoryAutostart>, TestEngine) {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let autostart = Arc::new(MemoryAutostart::new(state));
+    let engine = TestEngine::start_full(
+        &paths,
+        Settings::default(),
+        State::default(),
+        Arc::new(MemoryStore::new()),
+        autostart.clone(),
+    );
+    (dir, autostart, engine)
+}
+
+impl TestEngine {
+    async fn set_autostart(
+        &self,
+        request_id: u64,
+        enabled: bool,
+    ) -> Result<AutostartState, String> {
+        self.send(ui(UiRequest::SetAutostart {
+            request_id,
+            enabled,
+        }));
+        let find = |e: &Self| {
+            e.autostart_results
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(id, _)| *id == request_id)
+                .map(|(_, r)| r.clone())
+        };
+        self.wait_for("autostart result", |e| find(e).is_some())
+            .await;
+        find(self).unwrap()
+    }
+
+    fn autostart_in_snapshot(&self) -> Option<AutostartState> {
+        self.last_snapshot().map(|s| s.autostart)
+    }
+}
+
+#[tokio::test]
+async fn snapshot_carries_autostart_state() {
+    let (_dir, _a, engine) = autostart_engine(AutostartState::Enabled);
+    engine
+        .wait_for("snapshot", |e| {
+            e.autostart_in_snapshot() == Some(AutostartState::Enabled)
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn set_autostart_reports_result_and_updates_snapshot() {
+    let (_dir, a, engine) = autostart_engine(AutostartState::Disabled);
+    engine
+        .wait_for("first snapshot", |e| e.last_snapshot().is_some())
+        .await;
+    assert_eq!(
+        engine.autostart_in_snapshot(),
+        Some(AutostartState::Disabled)
+    );
+    assert_eq!(
+        engine.set_autostart(1, true).await,
+        Ok(AutostartState::Enabled)
+    );
+    engine
+        .wait_for("enabled in snapshot", |e| {
+            e.autostart_in_snapshot() == Some(AutostartState::Enabled)
+        })
+        .await;
+    assert_eq!(a.state(), AutostartState::Enabled);
+}
+
+#[tokio::test]
+async fn set_autostart_failure_is_reported() {
+    let (_dir, a, engine) = autostart_engine(AutostartState::Disabled);
+    engine
+        .wait_for("first snapshot", |e| e.last_snapshot().is_some())
+        .await;
+    a.fail_next();
+    let result = engine.set_autostart(7, true).await;
+    assert_eq!(result, Err("simulated autostart failure".to_owned()));
+    assert_eq!(
+        engine.autostart_in_snapshot(),
+        Some(AutostartState::Disabled)
+    );
+}
+
+#[tokio::test]
+async fn snapshot_reports_disabled_by_user() {
+    let (_dir, a, engine) = autostart_engine(AutostartState::Enabled);
+    engine
+        .wait_for("enabled", |e| {
+            e.autostart_in_snapshot() == Some(AutostartState::Enabled)
+        })
+        .await;
+    a.set_state(AutostartState::DisabledByUser);
+    engine
+        .wait_for_within(Duration::from_secs(8), "disabled by user", |e| {
+            e.autostart_in_snapshot() == Some(AutostartState::DisabledByUser)
+        })
+        .await;
 }

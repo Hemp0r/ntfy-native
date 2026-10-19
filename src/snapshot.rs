@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
+use crate::autostart::AutostartState;
 use crate::connection::ConnStatus;
 use crate::instance_edit::{AuthDraft, InstanceDraft};
 use crate::settings::{AuthKind, Instance, Settings, Topic};
@@ -17,6 +18,7 @@ pub struct UiSnapshot {
     pub gaps: Vec<GapView>,
     pub paused_until: Option<i64>,
     pub urgent_breaks_dnd: bool,
+    pub autostart: AutostartState,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -79,6 +81,7 @@ pub fn build_snapshot(
     statuses: &BTreeMap<String, (ConnStatus, i64)>,
     recent: &VecDeque<RecentMessage>,
     gaps: &[GapFlag],
+    autostart: AutostartState,
     now: i64,
 ) -> UiSnapshot {
     UiSnapshot {
@@ -127,6 +130,7 @@ pub fn build_snapshot(
             .collect(),
         paused_until: settings.paused_until,
         urgent_breaks_dnd: settings.urgent_breaks_dnd,
+        autostart,
     }
 }
 
@@ -173,7 +177,14 @@ mod tests {
 
     fn snap(s: &Settings, st: Option<(ConnStatus, i64)>) -> UiSnapshot {
         let statuses = st.map(|v| ("a".to_string(), v)).into_iter().collect();
-        build_snapshot(s, &statuses, &VecDeque::new(), &[], NOW)
+        build_snapshot(
+            s,
+            &statuses,
+            &VecDeque::new(),
+            &[],
+            AutostartState::Disabled,
+            NOW,
+        )
     }
 
     #[test]
@@ -247,7 +258,14 @@ mod tests {
             topic: "t".into(),
             detected_at: 9,
         }];
-        let snapshot = build_snapshot(&s, &BTreeMap::new(), &recent, &gaps, NOW);
+        let snapshot = build_snapshot(
+            &s,
+            &BTreeMap::new(),
+            &recent,
+            &gaps,
+            AutostartState::Disabled,
+            NOW,
+        );
         assert!(snapshot.recent[0].has_click && !snapshot.recent[1].has_click);
         assert_eq!(snapshot.recent[0].host, "ntfy.example.org");
         assert_eq!(snapshot.recent[0].message_id, "m1");
@@ -292,6 +310,7 @@ mod tests {
                 &BTreeMap::new(),
                 &VecDeque::new(),
                 &[],
+                AutostartState::Disabled,
                 NOW
             )
             .configured

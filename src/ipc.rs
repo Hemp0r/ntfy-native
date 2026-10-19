@@ -3,6 +3,7 @@ use std::io::{self, BufRead, Read, Write};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+use crate::autostart::AutostartState;
 use crate::instance_edit::InstanceDraft;
 use crate::snapshot::UiSnapshot;
 
@@ -23,6 +24,10 @@ pub enum CoreMsg {
     SaveResult {
         request_id: u64,
         result: Result<String, String>,
+    },
+    AutostartResult {
+        request_id: u64,
+        result: Result<AutostartState, String>,
     },
     Close,
     /// Bring the open window to the front (it was requested again).
@@ -74,6 +79,10 @@ pub enum UiRequest {
     },
     RemoveInstance {
         instance_id: String,
+    },
+    SetAutostart {
+        request_id: u64,
+        enabled: bool,
     },
     OpenConfigDir,
     OpenLogs,
@@ -180,6 +189,7 @@ mod tests {
             gaps: vec![],
             paused_until: Some(i64::MAX),
             urgent_breaks_dnd: true,
+            autostart: crate::autostart::AutostartState::Disabled,
         };
         let core = vec![
             CoreMsg::Hello {
@@ -223,6 +233,14 @@ mod tests {
                 request_id: 7,
                 result: Err("bad".into()),
             },
+            CoreMsg::AutostartResult {
+                request_id: 8,
+                result: Ok(AutostartState::NeedsApproval),
+            },
+            CoreMsg::AutostartResult {
+                request_id: 9,
+                result: Err("no".into()),
+            },
             CoreMsg::Close,
             CoreMsg::Focus,
         ];
@@ -263,6 +281,10 @@ mod tests {
             },
             UiRequest::RemoveInstance {
                 instance_id: s("a"),
+            },
+            UiRequest::SetAutostart {
+                request_id: 3,
+                enabled: true,
             },
             UiRequest::OpenConfigDir,
             UiRequest::OpenLogs,

@@ -13,6 +13,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::actions::{self, UrlOpener};
+use crate::autostart::{Autostart, AutostartState};
 use crate::connection::{ConnControl, ConnEvent, ConnStatus, ConnectionConfig, spawn_connection};
 use crate::conntest::test_connection;
 use crate::dispatcher::Dispatcher;
@@ -72,6 +73,8 @@ pub struct EngineDeps {
     /// Snapshots and test/save results for the UI process. Called on the
     /// engine thread; must not block (enqueue onto a channel).
     pub on_ui: Box<dyn Fn(CoreMsg) + Send>,
+    /// Start at login; read at start and on every tick, changed on request.
+    pub autostart: Arc<dyn Autostart>,
     /// Adjusts each connection's config; production: `|_| {}`.
     pub tune: fn(&mut ConnectionConfig),
     /// Wake/network reconnect triggers and Ctrl-C/SIGTERM handling.
@@ -132,6 +135,7 @@ pub async fn run_engine(
         on_tray,
         on_exit,
         on_ui,
+        autostart,
         tune,
         enable_triggers,
     } = deps;
@@ -169,6 +173,8 @@ pub async fn run_engine(
         strings,
         on_tray,
         on_ui,
+        autostart_state: autostart.state(),
+        autostart,
         snapshot: None,
         secrets,
         tune,
@@ -335,6 +341,8 @@ struct Engine {
     strings: &'static Strings,
     on_tray: Box<dyn Fn(TrayState) + Send>,
     on_ui: Box<dyn Fn(CoreMsg) + Send>,
+    autostart: Arc<dyn Autostart>,
+    autostart_state: AutostartState,
     /// Last snapshot sent to the UI.
     snapshot: Option<UiSnapshot>,
     dispatcher: Dispatcher,
@@ -651,6 +659,23 @@ impl Engine {
                 (self.on_ui)(CoreMsg::SaveResult { request_id, result });
             }
             UiRequest::RemoveInstance { instance_id } => self.remove_instance(&instance_id),
+            UiRequest::SetAutostart {
+                request_id,
+                enabled,
+            } => {
+                let result = match self.autostart.set(enabled) {
+                    Ok(state) => {
+                        self.autostart_state = state;
+                        Ok(state)
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %format!("{e:#}"), "changing autostart failed");
+                        self.autostart_state = self.autostart.state();
+                        Err(autostart_error_text(&e, home_dir().as_deref()))
+                    }
+                };
+                (self.on_ui)(CoreMsg::AutostartResult { request_id, result });
+            }
             UiRequest::TestConnection { request_id, draft } => {
                 self.spawn_connection_test(request_id, draft);
             }
@@ -735,6 +760,7 @@ impl Engine {
             &self.statuses,
             &self.dispatcher.recent,
             &self.dispatcher.gaps,
+            self.autostart_state,
             now,
         )
     }
@@ -758,6 +784,7 @@ impl Engine {
     }
 
     fn on_tick(&mut self) {
+        self.autostart_state = self.autostart.state();
         reap_crashed_connections(&mut self.connections, &mut self.statuses, unix_now());
         if self.media_cleanup.due(Instant::now()) {
             match self.media.cleanup(MEDIA_MAX_AGE) {
@@ -818,6 +845,24 @@ impl Engine {
             tracing::error!(error = %format!("{e:#}"), "saving on exit failed");
         }
         settings.and(state)
+    }
+}
+
+fn home_dir() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf())
+}
+
+/// The full error chain for the UI; an error that mentions the user's
+/// home directory becomes a generic message (details stay in the log).
+fn autostart_error_text(e: &anyhow::Error, home: Option<&std::path::Path>) -> String {
+    let text = format!("{e:#}");
+    let leaks_home = home
+        .and_then(|h| h.to_str())
+        .is_some_and(|h| !h.is_empty() && text.contains(h));
+    if leaks_home {
+        "autostart could not be changed".to_owned()
+    } else {
+        text
     }
 }
 
@@ -1180,6 +1225,10 @@ mod tests {
             strings: &EN,
             on_tray: Box::new(|_| {}),
             on_ui: Box::new(|_| {}),
+            autostart: Arc::new(crate::autostart::MemoryAutostart::new(
+                AutostartState::Disabled,
+            )),
+            autostart_state: AutostartState::Disabled,
             snapshot: None,
             dispatcher: Dispatcher::new(settings.clone(), Default::default(), Vec::new(), &EN),
             saved_settings: settings,
@@ -1279,5 +1328,35 @@ mod tests {
             url: "not a url".into(),
         };
         assert_eq!(action_failed(&bad, "e", &EN).title, "Action failed: link");
+    }
+}
+
+#[cfg(test)]
+mod autostart_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn error_text_hides_home_path() {
+        let home = Path::new("/Users/jörg");
+        let plain = anyhow::anyhow!("autostart needs the app bundle");
+        assert_eq!(
+            autostart_error_text(&plain, Some(home)),
+            "autostart needs the app bundle"
+        );
+        let with_path =
+            anyhow::anyhow!("boom").context("writing /Users/jörg/Library/LaunchAgents/x.plist");
+        let text = autostart_error_text(&with_path, Some(home));
+        assert!(!text.contains("jörg"), "{text}");
+        assert!(!text.is_empty());
+
+        let chained = anyhow::anyhow!("permission denied").context("registering the login item");
+        assert_eq!(
+            autostart_error_text(&chained, Some(home)),
+            "registering the login item: permission denied"
+        );
+        let leaking_cause = anyhow::anyhow!("cannot write /Users/jörg/x.plist").context("failed");
+        let text = autostart_error_text(&leaking_cause, Some(home));
+        assert!(!text.contains("jörg"), "{text}");
     }
 }
