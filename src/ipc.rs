@@ -55,6 +55,9 @@ pub enum UiRequest {
     SetUrgentGlobal {
         enabled: bool,
     },
+    SetAutostart {
+        enabled: bool,
+    },
     DismissGap {
         instance_id: String,
         topic: String,
@@ -180,6 +183,7 @@ mod tests {
             gaps: vec![],
             paused_until: Some(i64::MAX),
             urgent_breaks_dnd: true,
+            autostart: false,
         };
         let core = vec![
             CoreMsg::Hello {
@@ -244,6 +248,7 @@ mod tests {
                 urgent: Some(true),
             },
             UiRequest::SetUrgentGlobal { enabled: true },
+            UiRequest::SetAutostart { enabled: false },
             UiRequest::DismissGap {
                 instance_id: s("a"),
                 topic: s("t"),

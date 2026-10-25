@@ -17,6 +17,7 @@ pub struct UiSnapshot {
     pub gaps: Vec<GapView>,
     pub paused_until: Option<i64>,
     pub urgent_breaks_dnd: bool,
+    pub autostart: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -127,6 +128,7 @@ pub fn build_snapshot(
             .collect(),
         paused_until: settings.paused_until,
         urgent_breaks_dnd: settings.urgent_breaks_dnd,
+        autostart: settings.autostart,
     }
 }
 
@@ -283,8 +285,9 @@ mod tests {
         let mut s = settings(AuthKind::None);
         s.paused_until = Some(42);
         s.urgent_breaks_dnd = true;
+        s.autostart = false;
         let snapshot = snap(&s, None);
-        assert!(snapshot.configured && snapshot.urgent_breaks_dnd);
+        assert!(snapshot.configured && snapshot.urgent_breaks_dnd && !snapshot.autostart);
         assert_eq!(snapshot.paused_until, Some(42));
         assert!(
             !build_snapshot(

@@ -144,7 +144,7 @@ jobs:
           - target: aarch64-pc-windows-msvc
             arch: arm64
     # TODO(Plan Part 3): replace the zip with a per-user MSI (Start-menu
-    # shortcut with AUMID/ToastActivatorCLSID, autostart).
+    # shortcut with AUMID/ToastActivatorCLSID). Autostart is set by the app.
     steps:
       - uses: actions/checkout@v4
         with:

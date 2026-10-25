@@ -17,6 +17,8 @@ pub use macos::MacNotifier;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
+pub(crate) use self::windows::set_string as set_registry_string;
+#[cfg(windows)]
 pub use self::windows::{TOAST_ACTIVATOR_CLSID, WinNotifier};
 
 /// The native notifier for this platform, or a [`LogNotifier`] if there is

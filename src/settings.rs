@@ -18,6 +18,8 @@ pub struct Settings {
     pub urgent_breaks_dnd: bool,
     /// `i64::MAX` means paused indefinitely.
     pub paused_until: Option<i64>,
+    /// Start at login; registered with the OS only once a server is set up.
+    pub autostart: bool,
 }
 
 impl Default for Settings {
@@ -27,6 +29,7 @@ impl Default for Settings {
             instances: Vec::new(),
             urgent_breaks_dnd: false,
             paused_until: None,
+            autostart: true,
         }
     }
 }
@@ -126,6 +129,7 @@ mod tests {
         assert_eq!(s.instances[0].cache_duration_secs, 43200);
         assert_eq!(s.instances[0].auth, AuthKind::None);
         assert!(!s.urgent_breaks_dnd);
+        assert!(s.autostart, "autostart is on by default");
     }
 
     #[test]

@@ -140,6 +140,7 @@ ui_strings! {
     notifications_hint_macos: "Falls nichts erscheint: Systemeinstellungen › Mitteilungen › ntfy-native erlauben.", "If nothing appears: allow ntfy-native in System Settings › Notifications.";
     notifications_hint_windows: "Falls nichts erscheint: Einstellungen › System › Benachrichtigungen › ntfy-native einschalten.", "If nothing appears: turn on ntfy-native in Settings › System › Notifications.";
     urgent_global: "Dringende Nachrichten (Priorität 5) dürfen „Nicht stören“ durchbrechen", "Urgent messages (priority 5) may break through Do Not Disturb";
+    autostart: "Beim Anmelden automatisch starten", "Start automatically at login";
     urgent_default: "Standard", "Default";
     urgent_on: "An", "On";
     urgent_off: "Aus", "Off";

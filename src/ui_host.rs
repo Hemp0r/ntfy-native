@@ -577,6 +577,7 @@ mod tests {
             gaps: vec![],
             paused_until: None,
             urgent_breaks_dnd: false,
+            autostart: true,
         }
     }
 

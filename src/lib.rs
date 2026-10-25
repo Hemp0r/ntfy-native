@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod activation;
 pub mod app;
+pub mod autostart;
 pub mod cli;
 pub mod connection;
 pub mod conntest;

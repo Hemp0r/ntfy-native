@@ -13,6 +13,7 @@ use crate::validate::{normalize_url, same_url, unique_id, valid_topic_name};
 #[derive(Clone, Debug, PartialEq)]
 pub struct ImportFile {
     pub urgent_breaks_dnd: Option<bool>,
+    pub autostart: Option<bool>,
     pub instances: Vec<ImportInstance>,
 }
 
@@ -81,6 +82,8 @@ struct RawInstance {
 struct RawFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     urgent_breaks_dnd: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    autostart: Option<bool>,
     #[serde(default)]
     instances: Vec<RawInstance>,
 }
@@ -231,6 +234,7 @@ pub fn parse_import(yaml: &str) -> Result<ImportFile> {
     }
     Ok(ImportFile {
         urgent_breaks_dnd: raw.urgent_breaks_dnd,
+        autostart: raw.autostart,
         instances,
     })
 }
@@ -282,6 +286,9 @@ pub fn apply_import(
     let mut settings = existing.unwrap_or_default();
     if let Some(v) = file.urgent_breaks_dnd {
         settings.urgent_breaks_dnd = v;
+    }
+    if let Some(v) = file.autostart {
+        settings.autostart = v;
     }
     let position = |settings: &Settings, url: &str| {
         settings
@@ -366,6 +373,7 @@ const SANITIZED_HEADER: &str = "\
 pub fn sanitized_yaml(file: &ImportFile) -> String {
     let raw = RawFile {
         urgent_breaks_dnd: file.urgent_breaks_dnd,
+        autostart: file.autostart,
         instances: file
             .instances
             .iter()
@@ -715,6 +723,20 @@ instances:
         let f = parse_import(&one("https://a.org", &["a"])).unwrap();
         let s = apply_import(Some(base), &f, &store).unwrap();
         assert!(s.urgent_breaks_dnd);
+    }
+
+    #[test]
+    fn autostart_only_changes_when_set() {
+        let store = MemoryStore::new();
+        let f = parse_import(&one("https://a.org", &["a"])).unwrap();
+        assert_eq!(f.autostart, None);
+        assert!(apply_import(None, &f, &store).unwrap().autostart);
+
+        let y = format!("autostart: false\n{}", one("https://a.org", &["a"]));
+        let f = parse_import(&y).unwrap();
+        assert_eq!(f.autostart, Some(false));
+        assert!(!apply_import(None, &f, &store).unwrap().autostart);
+        assert!(sanitized_yaml(&f).contains("autostart: false"));
     }
 
     #[test]

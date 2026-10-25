@@ -14,6 +14,7 @@ use tray_icon::menu::MenuEvent;
 use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
 use crate::actions::{SystemOpener, open_local_dir};
+use crate::autostart::platform_autostart;
 use crate::cli::{Cli, UiArgs, UiMode};
 use crate::engine::{Command, EngineDeps, EngineHandle, spawn_engine_thread};
 use crate::i18n::{Strings, fill, strings};
@@ -146,6 +147,7 @@ fn run_logged(paths: &AppPaths, cli: &Cli) -> anyhow::Result<()> {
         secrets,
         notifier,
         opener: Arc::new(SystemOpener),
+        autostart: platform_autostart(),
         strings,
         on_tray: Box::new({
             let proxy = proxy.clone();

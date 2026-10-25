@@ -29,6 +29,13 @@ Die Ausführlichkeit steuert die Umgebungsvariable `NTFY_NATIVE_LOG` (Standard `
 
 Speicherbedarf (macOS, Intel, Release-Build, zwei Instanzen mit zusammen 10 Topics, nach 1 Minute Ruhe): `phys_footprint` rund 13,5 MB (gemessen: 14 118 912 Byte nach fünfmaligem Öffnen und Schließen des Popovers, Ziel < 30 MB). Bei geschlossenem Popover, Assistent und Einstellungsfenster läuft nur dieser eine Prozess.
 
+## Autostart
+
+ntfy-native startet standardmäßig beim Anmelden. Gefragt wird bei der ersten Einrichtung im Assistenten; danach lässt es sich jederzeit unter „Einstellungen …“ → „Allgemein“ → „Beim Anmelden automatisch starten“ ändern, bei einer automatischen Installation mit `autostart: false` in der [`config.yaml`](#konfiguration). Eingetragen wird erst, sobald ein Server eingerichtet ist.
+
+- macOS: als Anmeldeobjekt (Systemeinstellungen › Allgemein › Anmeldeobjekte). Wurde es dort ausgeschaltet, schaltet die App es nicht wieder ein; dazu den Schalter dort wieder aktivieren. Nur die App im `.app`-Bundle trägt sich ein, nicht `cargo run`.
+- Windows: als Wert `ntfy-native` unter `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` mit dem Pfad der `ntfy-native.exe`; nach dem Verschieben der Datei trägt der nächste Start den neuen Pfad ein. Im Task-Manager unter „Autostart“ deaktiviert, bleibt es deaktiviert.
+
 ## Popover
 
 Das Popover erscheint direkt am Tray-Icon (macOS unter der Menüleiste, Windows über der Taskleiste, auch auf einem zweiten Monitor) und schließt sich bei Esc, bei einem Klick daneben oder einem erneuten Klick auf das Icon. Es zeigt:
@@ -48,13 +55,13 @@ Der Assistent (beim ersten Start automatisch, sonst über „Einrichten …“ i
 1. **Server-Adresse**, z. B. `https://ntfy.sh` oder ein eigener Server. Mit „Weiter“ prüft die App, ob dort ein ntfy-Server erreichbar ist. Verlangt der Server schon dafür eine Anmeldung (etwa hinter einem Proxy mit Basic-Auth), geht es mit dem Hinweis „Der Server verlangt eine Anmeldung.“ direkt zur Anmeldung.
 2. **Anmeldung**: ohne Anmeldung, Access-Token oder Benutzername und Passwort. Falsche Zugangsdaten meldet der Assistent sofort. Beim Bearbeiten behält ein leeres Feld das gespeicherte Token bzw. Passwort – aber nur, solange Schema, Host und Port der Adresse gleich bleiben; für eine neue Server-Adresse müssen die Zugangsdaten neu eingegeben werden, damit sie nie an einen anderen Server gehen.
 3. **Topics**: ein oder mehrere Topics; Topics ohne Leserecht werden markiert.
-4. **Benachrichtigungen**: ob dringende Nachrichten (Priorität 5) „Nicht stören“ durchbrechen dürfen, und „Test-Benachrichtigung senden“ zum Ausprobieren (die Test-Benachrichtigung wird sofort gesendet). Erscheint nichts, die Mitteilungen für ntfy-native in den Systemeinstellungen erlauben.
+4. **Benachrichtigungen**: ob dringende Nachrichten (Priorität 5) „Nicht stören“ durchbrechen dürfen, und „Test-Benachrichtigung senden“ zum Ausprobieren (die Test-Benachrichtigung wird sofort gesendet). Erscheint nichts, die Mitteilungen für ntfy-native in den Systemeinstellungen erlauben. Bei der ersten Einrichtung steht hier außerdem „Beim Anmelden automatisch starten“ (siehe [Autostart](#autostart)).
 
-Erst „Fertig“ speichert den Server und übernimmt die Einstellung für dringende Nachrichten; bei einem Fehler oder „Abbrechen“ bleiben Server und Einstellungen unverändert. Während des Speicherns sind „Zurück“ und „Abbrechen“ gesperrt. Zugangsdaten landen wie beim Import im Schlüsselbund bzw. in der Anmeldeinformationsverwaltung, nie in `settings.json` oder im Log.
+Erst „Fertig“ speichert den Server und übernimmt die Einstellungen für dringende Nachrichten und Autostart; bei einem Fehler oder „Abbrechen“ bleiben Server und Einstellungen unverändert. Während des Speicherns sind „Zurück“ und „Abbrechen“ gesperrt. Zugangsdaten landen wie beim Import im Schlüsselbund bzw. in der Anmeldeinformationsverwaltung, nie in `settings.json` oder im Log.
 
 ## Einstellungen
 
-Das Einstellungsfenster („Einstellungen …“ im Tray-Menü oder im Popover) verwaltet alle Server: „Server hinzufügen“, „Bearbeiten“ (Adresse, Anmeldung und Topics im Assistenten; ein leer gelassenes Token- bzw. Passwortfeld behält das gespeicherte, solange die Adresse auf denselben Server zeigt) und „Entfernen“. Die Server-Cache-Dauer wählt man je Server direkt in der Liste (12 Std., 24 Std., 72 Std., 7 Tage). Je Topic lassen sich „Stumm“ und „Dringend“ (Standard, An, Aus) einstellen. Unter „Allgemein“ stehen die globale Einstellung für dringende Nachrichten, die Ordner für Konfiguration und Logs sowie die Version. Änderungen gelten sofort, ohne Neustart.
+Das Einstellungsfenster („Einstellungen …“ im Tray-Menü oder im Popover) verwaltet alle Server: „Server hinzufügen“, „Bearbeiten“ (Adresse, Anmeldung und Topics im Assistenten; ein leer gelassenes Token- bzw. Passwortfeld behält das gespeicherte, solange die Adresse auf denselben Server zeigt) und „Entfernen“. Die Server-Cache-Dauer wählt man je Server direkt in der Liste (12 Std., 24 Std., 72 Std., 7 Tage). Je Topic lassen sich „Stumm“ und „Dringend“ (Standard, An, Aus) einstellen. Unter „Allgemein“ stehen die globale Einstellung für dringende Nachrichten, „Beim Anmelden automatisch starten“, die Ordner für Konfiguration und Logs sowie die Version. Änderungen gelten sofort, ohne Neustart.
 
 Ist das Einstellungsfenster oder der Assistent schon offen, holt jeder weitere Aufruf (Tray-Klick, „Einstellungen …“, „Einrichten …“) dieses Fenster nach vorn, statt es zu ersetzen; nicht gespeicherte Eingaben bleiben erhalten. Nur das Popover wird durch ein anderes Fenster ersetzt.
 
@@ -66,6 +73,7 @@ Die Datei `config.yaml` ist eine Alternative zum Einrichtungsassistenten, vor al
 
 ```yaml
 urgent_breaks_dnd: false          # optional, global
+autostart: true                   # optional, Standard: true
 instances:
   - url: https://ntfy.example.org
     token: tk_xxxxxxxx            # ODER username + password, ODER auth: none, ODER nichts
@@ -81,7 +89,7 @@ Regeln:
 - `url` muss mit `http://` oder `https://` beginnen. Die URL wird normalisiert (Hostname klein, Standard-Port wie `:443` entfernt, kein abschließender `/`), sodass `https://NTFY.example.org:443/` und `https://ntfy.example.org` dieselbe Instanz sind.
 - Topic-Namen: 1 bis 64 Zeichen aus `A-Z a-z 0-9 - _`.
 - `token`, `username`/`password` und `auth: none` schließen sich gegenseitig aus; `password` braucht `username`.
-- Ein erneuter Import ersetzt Topics der betroffenen Instanz (erkannt an der URL); andere Instanzen bleiben unverändert. `urgent_breaks_dnd` ändert sich nur, wenn es in der Datei steht.
+- Ein erneuter Import ersetzt Topics der betroffenen Instanz (erkannt an der URL); andere Instanzen bleiben unverändert. `urgent_breaks_dnd` und `autostart` ändern sich nur, wenn sie in der Datei stehen.
 - Zugangsdaten bei einem erneuten Import: `token` bzw. `username` + `password` ersetzen die gespeicherten. Ohne Zugangsdaten-Felder bleiben die gespeicherten erhalten; nur `username` (ohne `password`) behält das gespeicherte Passwort einer Basic-Auth-Instanz, solange der Benutzername unverändert ist; bei geändertem Benutzernamen ist ein `password` Pflicht. `auth: none` entfernt gespeicherte Zugangsdaten.
 
 Speicherort der Datei (`config.yaml`; „Konfigurationsordner öffnen“ im Tray-Menü öffnet den Ordner):

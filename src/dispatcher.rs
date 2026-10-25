@@ -207,6 +207,12 @@ impl Dispatcher {
         changed
     }
 
+    pub fn set_autostart(&mut self, enabled: bool) -> bool {
+        let changed = self.settings.autostart != enabled;
+        self.settings.autostart = enabled;
+        changed
+    }
+
     /// Returns whether a flag was removed.
     pub fn dismiss_gap(&mut self, instance_id: &str, topic: &str) -> bool {
         let before = self.gaps.len();
@@ -269,6 +275,8 @@ mod tests {
         assert!(d.set_topic_urgent("i", "t", None));
         assert!(d.set_urgent_global(true));
         assert!(!d.set_urgent_global(true));
+        assert!(d.set_autostart(false));
+        assert!(!d.set_autostart(false));
 
         d.on_gap("i", 5);
         assert!(d.dismiss_gap("i", "t"));

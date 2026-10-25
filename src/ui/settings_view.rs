@@ -46,25 +46,27 @@ impl SettingsState {
         &mut self,
         request_id: u64,
         result: &Result<String, String>,
-    ) -> Option<UiRequest> {
+    ) -> Vec<UiRequest> {
         if let Some(w) = &mut self.editor {
-            let follow_up = w.on_save_result(request_id, result);
+            let follow_ups = w.on_save_result(request_id, result);
             if w.step == WizardStep::Done {
                 if let Ok(id) = result {
                     self.locked.insert(id.clone());
                 }
                 self.editor = None;
-                return follow_up;
+                return follow_ups;
             }
         }
-        let instance_id = self.pending.remove(&request_id)?;
+        let Some(instance_id) = self.pending.remove(&request_id) else {
+            return Vec::new();
+        };
         match result {
             Ok(_) => {
                 self.locked.insert(instance_id);
             }
             Err(reason) => self.error = Some(Problem::SaveFailed(reason.clone())),
         }
-        None
+        Vec::new()
     }
 
     pub fn on_snapshot(&mut self, snap: &UiSnapshot) {
@@ -151,6 +153,10 @@ pub fn settings_ui(
             let mut urgent = snap.urgent_breaks_dnd;
             if ui.checkbox(&mut urgent, s.urgent_global).changed() {
                 out.push(UiRequest::SetUrgentGlobal { enabled: urgent });
+            }
+            let mut autostart = snap.autostart;
+            if ui.checkbox(&mut autostart, s.autostart).changed() {
+                out.push(UiRequest::SetAutostart { enabled: autostart });
             }
         });
     });
@@ -363,6 +369,7 @@ mod tests {
             gaps: vec![],
             paused_until: None,
             urgent_breaks_dnd: false,
+            autostart: true,
         }
     }
 
@@ -425,6 +432,7 @@ mod tests {
             "Version 1.2.3",
             UI_EN.cache_hint,
             UI_EN.urgent_global,
+            UI_EN.autostart,
         ] {
             h.get_by_label(label);
         }
@@ -432,12 +440,14 @@ mod tests {
         click(&mut h, UI_EN.open_config);
         click(&mut h, UI_EN.open_logs);
         click(&mut h, UI_EN.urgent_global);
+        click(&mut h, UI_EN.autostart);
         assert_eq!(
             take(&mut h),
             [
                 UiRequest::OpenConfigDir,
                 UiRequest::OpenLogs,
-                UiRequest::SetUrgentGlobal { enabled: true }
+                UiRequest::SetUrgentGlobal { enabled: true },
+                UiRequest::SetAutostart { enabled: false }
             ]
         );
     }
@@ -617,7 +627,7 @@ mod tests {
             h.state_mut()
                 .state
                 .on_save_result(*request_id, &Ok("a".into())),
-            Some(UiRequest::SetUrgentGlobal { enabled: true })
+            [UiRequest::SetUrgentGlobal { enabled: true }]
         );
         h.run_steps(4);
         assert!(h.state().state.editor.is_none());

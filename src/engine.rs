@@ -13,6 +13,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::actions::{self, UrlOpener};
+use crate::autostart::{self, Autostart};
 use crate::connection::{ConnControl, ConnEvent, ConnStatus, ConnectionConfig, spawn_connection};
 use crate::conntest::test_connection;
 use crate::dispatcher::Dispatcher;
@@ -65,6 +66,8 @@ pub struct EngineDeps {
     pub secrets: Arc<dyn SecretStore>,
     pub notifier: Arc<dyn Notifier>,
     pub opener: Arc<dyn UrlOpener>,
+    /// Kept in line with the settings' autostart switch.
+    pub autostart: Arc<dyn Autostart>,
     pub strings: &'static Strings,
     /// Called on the engine thread; must not block (enqueue onto a channel).
     pub on_tray: Box<dyn Fn(TrayState) + Send>,
@@ -128,6 +131,7 @@ pub async fn run_engine(
         secrets,
         notifier,
         opener,
+        autostart,
         strings,
         on_tray,
         on_exit,
@@ -166,6 +170,8 @@ pub async fn run_engine(
         deliveries: Some(delivery_tx),
         notifier,
         opener,
+        autostart,
+        autostart_applied: None,
         strings,
         on_tray,
         on_ui,
@@ -332,6 +338,9 @@ struct Engine {
     deliveries: Option<mpsc::UnboundedSender<Delivery>>,
     notifier: Arc<dyn Notifier>,
     opener: Arc<dyn UrlOpener>,
+    autostart: Arc<dyn Autostart>,
+    /// What was last passed to `autostart`; `None` until the first settle.
+    autostart_applied: Option<bool>,
     strings: &'static Strings,
     on_tray: Box<dyn Fn(TrayState) + Send>,
     on_ui: Box<dyn Fn(CoreMsg) + Send>,
@@ -623,6 +632,9 @@ impl Engine {
             UiRequest::SetUrgentGlobal { enabled } => {
                 self.dispatcher.set_urgent_global(enabled);
             }
+            UiRequest::SetAutostart { enabled } => {
+                self.dispatcher.set_autostart(enabled);
+            }
             UiRequest::DismissGap { instance_id, topic } => {
                 if self.dispatcher.dismiss_gap(&instance_id, &topic) {
                     self.state_dirty = true;
@@ -780,6 +792,7 @@ impl Engine {
         if self.dispatcher.settings != self.saved_settings {
             let _ = self.write_settings();
         }
+        self.apply_autostart();
         let tray = aggregate(&self.dispatcher.settings, &self.statuses, paused, now);
         if self.tray.as_ref() != Some(&tray) {
             (self.on_tray)(tray.clone());
@@ -789,6 +802,20 @@ impl Engine {
         if self.snapshot.as_ref() != Some(&snap) {
             (self.on_ui)(CoreMsg::Snapshot(snap.clone()));
             self.snapshot = Some(snap);
+        }
+    }
+
+    /// Registers or unregisters autostart when the wanted state changed (and
+    /// once at start, which also follows a moved app). A failure is logged
+    /// and not retried until the switch changes again.
+    fn apply_autostart(&mut self) {
+        let wanted = autostart::wanted(&self.dispatcher.settings);
+        if self.autostart_applied == Some(wanted) {
+            return;
+        }
+        self.autostart_applied = Some(wanted);
+        if let Err(e) = self.autostart.apply(wanted) {
+            tracing::warn!(error = %format!("{e:#}"), wanted, "changing autostart failed");
         }
     }
 
@@ -1177,6 +1204,8 @@ mod tests {
             deliveries: Some(delivery_tx),
             notifier: notifier.clone(),
             opener: Arc::new(crate::actions::RecordingOpener::default()),
+            autostart: Arc::new(crate::autostart::RecordingAutostart::default()),
+            autostart_applied: None,
             strings: &EN,
             on_tray: Box::new(|_| {}),
             on_ui: Box::new(|_| {}),

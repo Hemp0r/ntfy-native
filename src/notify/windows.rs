@@ -360,7 +360,7 @@ fn ensure_winrt() {
 
 /// Sets a string value below `HKEY_CURRENT_USER`, creating the key; `None`
 /// sets the default value.
-fn set_string(subkey: &str, name: Option<&str>, value: &str) -> Result<()> {
+pub(crate) fn set_string(subkey: &str, name: Option<&str>, value: &str) -> Result<()> {
     let subkey_w = HSTRING::from(subkey);
     let mut key = HKEY::default();
     // SAFETY: valid strings and out pointer.

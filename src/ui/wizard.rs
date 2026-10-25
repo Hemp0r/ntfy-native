@@ -57,6 +57,10 @@ pub struct Wizard {
     pub topic_access: Vec<TopicAccess>,
     /// Global "urgent breaks Do Not Disturb", mirrored from the latest snapshot.
     pub urgent_global: bool,
+    /// Start at login, mirrored from the latest snapshot.
+    pub autostart_global: bool,
+    /// Ask about starting at login (first setup only).
+    pub offer_autostart: bool,
     /// The user left without saving.
     pub cancelled: bool,
     /// The server answered the Server step with 401/403: show a hint at the login step.
@@ -69,6 +73,8 @@ pub struct Wizard {
     original_url: String,
     /// The urgent switch as set in this wizard; sent only once saved.
     urgent_set: Option<bool>,
+    /// Likewise for the autostart switch.
+    autostart_set: Option<bool>,
 }
 
 impl Drop for Wizard {
@@ -106,6 +112,7 @@ impl Wizard {
             original_auth: draft.auth.clone(),
             original_url: draft.url.clone(),
             urgent_set: None,
+            autostart_set: None,
             login_required: false,
             draft,
             editing,
@@ -113,6 +120,8 @@ impl Wizard {
             error: None,
             topic_access: Vec::new(),
             urgent_global: false,
+            autostart_global: true,
+            offer_autostart: false,
             cancelled: false,
             secret: String::new(),
             new_topic: String::new(),
@@ -208,14 +217,14 @@ impl Wizard {
         };
     }
 
-    /// Once saved, returns the changed urgent switch to send.
+    /// Once saved, returns the changed urgent and autostart switches to send.
     pub fn on_save_result(
         &mut self,
         request_id: u64,
         result: &Result<String, String>,
-    ) -> Option<UiRequest> {
+    ) -> Vec<UiRequest> {
         if self.busy != Some(request_id) || self.step != WizardStep::Notifications {
-            return None;
+            return Vec::new();
         }
         self.busy = None;
         match result {
@@ -223,14 +232,21 @@ impl Wizard {
                 self.error = None;
                 self.step = WizardStep::Done;
                 self.secret.zeroize();
-                self.urgent_set
+                let urgent = self
+                    .urgent_set
                     .take()
                     .filter(|enabled| *enabled != self.urgent_global)
-                    .map(|enabled| UiRequest::SetUrgentGlobal { enabled })
+                    .map(|enabled| UiRequest::SetUrgentGlobal { enabled });
+                let autostart = self
+                    .autostart_set
+                    .take()
+                    .filter(|enabled| *enabled != self.autostart_global)
+                    .map(|enabled| UiRequest::SetAutostart { enabled });
+                urgent.into_iter().chain(autostart).collect()
             }
             Err(reason) => {
                 self.error = Some(Problem::SaveFailed(reason.clone()));
-                None
+                Vec::new()
             }
         }
     }
@@ -252,6 +268,16 @@ impl Wizard {
     /// The urgent switch as shown: the choice made here, else the current setting.
     pub fn urgent_choice(&self) -> bool {
         self.urgent_set.unwrap_or(self.urgent_global)
+    }
+
+    /// Sets the autostart switch; like the urgent one, sent only once saved.
+    pub fn set_autostart(&mut self, enabled: bool) {
+        self.autostart_set = Some(enabled);
+    }
+
+    /// The autostart switch as shown: the choice made here, else the current setting.
+    pub fn autostart_choice(&self) -> bool {
+        self.autostart_set.unwrap_or(self.autostart_global)
     }
 
     /// Whether "Next" is enabled (ignoring a running request). Topics: an
@@ -618,6 +644,12 @@ fn notifications_step(ui: &mut egui::Ui, w: &mut Wizard, s: &UiStrings, out: &mu
     let mut urgent = w.urgent_choice();
     if ui.checkbox(&mut urgent, s.urgent_global).changed() {
         w.set_urgent(urgent);
+    }
+    if w.offer_autostart && !w.editing {
+        let mut autostart = w.autostart_choice();
+        if ui.checkbox(&mut autostart, s.autostart).changed() {
+            w.set_autostart(autostart);
+        }
     }
 }
 
@@ -1331,7 +1363,7 @@ mod tests {
             h.state_mut()
                 .w
                 .on_save_result(request_id, &Err("disk full".into())),
-            None
+            []
         );
         click(&mut h, "Finish");
         let out = take(&mut h);
@@ -1340,7 +1372,7 @@ mod tests {
         };
         assert_eq!(
             h.state_mut().w.on_save_result(*request_id, &Ok("a".into())),
-            Some(UiRequest::SetUrgentGlobal { enabled: true })
+            [UiRequest::SetUrgentGlobal { enabled: true }]
         );
 
         // Unchanged switch: nothing extra.
@@ -1348,7 +1380,7 @@ mod tests {
         let Some(UiRequest::SaveInstance { request_id, .. }) = w.next(&mut id) else {
             panic!("save");
         };
-        assert_eq!(w.on_save_result(request_id, &Ok("a".into())), None);
+        assert_eq!(w.on_save_result(request_id, &Ok("a".into())), []);
 
         // Cancelled: nothing is sent.
         let mut h = harness(at_notifications(&mut id));
@@ -1357,6 +1389,44 @@ mod tests {
         click(&mut h, "Cancel");
         assert!(h.state().w.cancelled);
         assert!(take(&mut h).is_empty());
+    }
+
+    #[test]
+    fn autostart_is_offered_on_first_setup_and_sent_after_saving() {
+        let mut id = 1;
+        // Not offered when adding a server to an existing setup.
+        let mut h = harness(at_notifications(&mut id));
+        h.run_steps(4);
+        assert!(h.query_by_label(UI_EN.autostart).is_none());
+
+        let mut w = at_notifications(&mut id);
+        w.offer_autostart = true;
+        let mut h = harness(w);
+        h.run_steps(4);
+        assert!(h.state().w.autostart_choice(), "on by default");
+        click(&mut h, UI_EN.autostart);
+        click(&mut h, UI_EN.urgent_global);
+        assert!(take(&mut h).is_empty(), "the switches wait for Finish");
+        click(&mut h, "Finish");
+        let out = take(&mut h);
+        let [UiRequest::SaveInstance { request_id, .. }] = out.as_slice() else {
+            panic!("{out:?}");
+        };
+        assert_eq!(
+            h.state_mut().w.on_save_result(*request_id, &Ok("a".into())),
+            [
+                UiRequest::SetUrgentGlobal { enabled: true },
+                UiRequest::SetAutostart { enabled: false }
+            ]
+        );
+
+        // Left on: nothing extra.
+        let mut w = at_notifications(&mut id);
+        w.offer_autostart = true;
+        let Some(UiRequest::SaveInstance { request_id, .. }) = w.next(&mut id) else {
+            panic!("save");
+        };
+        assert_eq!(w.on_save_result(request_id, &Ok("a".into())), []);
     }
 
     #[test]

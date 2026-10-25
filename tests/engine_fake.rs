@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ntfy_native::actions::RecordingOpener;
+use ntfy_native::autostart::RecordingAutostart;
 use ntfy_native::connection::ConnectionConfig;
 use ntfy_native::engine::{Command, EngineDeps, EngineHandle, spawn_engine_thread};
 use ntfy_native::i18n::EN;
@@ -94,6 +95,7 @@ struct TestEngine {
     thread: Option<std::thread::JoinHandle<()>>,
     notifier: Arc<RecordingNotifier>,
     opener: Arc<RecordingOpener>,
+    autostart: Arc<RecordingAutostart>,
     trays: Arc<Mutex<Vec<TrayState>>>,
     snapshots: Arc<Mutex<Vec<UiSnapshot>>>,
     save_results: SaveResults,
@@ -115,6 +117,7 @@ impl TestEngine {
     ) -> Self {
         let notifier = Arc::new(RecordingNotifier::default());
         let opener = Arc::new(RecordingOpener::default());
+        let autostart = Arc::new(RecordingAutostart::default());
         let trays = Arc::new(Mutex::new(Vec::new()));
         let snapshots = Arc::new(Mutex::new(Vec::new()));
         let save_results = SaveResults::default();
@@ -127,6 +130,7 @@ impl TestEngine {
             secrets,
             notifier: notifier.clone(),
             opener: opener.clone(),
+            autostart: autostart.clone(),
             strings: &EN,
             on_tray: {
                 let trays = trays.clone();
@@ -161,6 +165,7 @@ impl TestEngine {
             thread: Some(thread),
             notifier,
             opener,
+            autostart,
             trays,
             snapshots,
             save_results,
@@ -180,6 +185,10 @@ impl TestEngine {
 
     fn shown_ids(&self) -> Vec<String> {
         self.shown().into_iter().map(|n| n.id).collect()
+    }
+
+    fn autostart_applied(&self) -> Vec<bool> {
+        self.autostart.applied.lock().unwrap().clone()
     }
 
     fn trays(&self) -> Vec<TrayState> {
@@ -667,6 +676,58 @@ async fn ui_mute_and_urgent_are_persisted() {
                 let topics = &s.instances[0].topics;
                 topics[0].muted && topics[1].urgent_breaks_dnd == Some(true) && s.urgent_breaks_dnd
             })
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn autostart_follows_the_switch() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let engine = TestEngine::start(&paths, settings_for(&unused_url()), State::default());
+    engine
+        .wait_for("registered on start", |e| e.autostart_applied() == [true])
+        .await;
+    assert!(engine.last_snapshot().unwrap().autostart);
+
+    engine.send(ui(UiRequest::SetAutostart { enabled: false }));
+    engine
+        .wait_for("unregistered", |e| e.autostart_applied() == [true, false])
+        .await;
+    engine
+        .wait_for("settings.json", |e| {
+            e.saved_settings().is_some_and(|s| !s.autostart)
+        })
+        .await;
+    engine
+        .wait_for("snapshot", |e| {
+            e.last_snapshot().is_some_and(|s| !s.autostart)
+        })
+        .await;
+    // Unchanged switch: nothing is applied again.
+    engine.send(ui(UiRequest::SetAutostart { enabled: false }));
+    engine.send(ui(UiRequest::PauseAll { until: None }));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(engine.autostart_applied(), [true, false]);
+}
+
+#[tokio::test]
+async fn autostart_waits_until_set_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let paths = AppPaths::under(dir.path());
+    let engine = TestEngine::start(&paths, Settings::default(), State::default());
+    engine
+        .wait_for("not registered while unconfigured", |e| {
+            e.autostart_applied() == [false]
+        })
+        .await;
+    let saved = engine
+        .save(1, draft(None, &unused_url(), &["alerts"]))
+        .await;
+    assert!(saved.is_ok(), "{saved:?}");
+    engine
+        .wait_for("registered once set up", |e| {
+            e.autostart_applied() == [false, true]
         })
         .await;
 }

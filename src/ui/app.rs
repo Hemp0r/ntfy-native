@@ -167,6 +167,8 @@ impl UiApp {
                     self.popover.on_snapshot();
                     self.settings.on_snapshot(&s);
                     self.wizard.urgent_global = s.urgent_breaks_dnd;
+                    self.wizard.autostart_global = s.autostart;
+                    self.wizard.offer_autostart = !s.configured;
                     self.snapshot = Some(s);
                 }
                 // Request ids come from one counter, so every state only takes its own.
@@ -183,7 +185,7 @@ impl UiApp {
                         self.wizard.on_save_result(request_id, &result),
                         self.settings.on_save_result(request_id, &result),
                     ];
-                    self.forward(follow_ups.into_iter().flatten().collect());
+                    self.forward(follow_ups.concat());
                 }
                 Ok(CoreMsg::Focus) => self.focus_requested = true,
                 Ok(CoreMsg::Close) => {
@@ -388,6 +390,7 @@ mod tests {
             gaps: vec![],
             paused_until: None,
             urgent_breaks_dnd: false,
+            autostart: true,
         }
     }
 
@@ -539,6 +542,8 @@ mod tests {
         assert!(a.settings.locked.is_empty());
         assert!(a.settings.editor.as_ref().unwrap().urgent_global);
         assert!(a.wizard.urgent_global);
+        assert!(a.wizard.autostart_global);
+        assert!(!a.wizard.offer_autostart, "only offered on first setup");
     }
 
     #[test]
