@@ -71,6 +71,7 @@ fn snapshot() -> UiSnapshot {
         gaps: vec![],
         paused_until: None,
         urgent_breaks_dnd: false,
+        autostart: ntfy_native::autostart::AutostartState::Disabled,
     }
 }
 

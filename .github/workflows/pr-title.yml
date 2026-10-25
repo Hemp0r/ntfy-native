@@ -1,0 +1,19 @@
+name: PR title
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+
+jobs:
+  conventional-title:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Title follows Conventional Commits
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: scripts/check-commit-subject.sh "$TITLE"

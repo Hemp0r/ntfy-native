@@ -54,6 +54,7 @@ block2 = "0.6.2"
 objc2 = "0.6.5"
 objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "libc", "NSApplication", "NSResponder", "NSRunningApplication"] }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSDictionary", "NSError", "NSObject", "NSSet", "NSString", "NSURL"] }
+objc2-service-management = { version = "0.3.2", default-features = false, features = ["std", "objc2", "objc2-foundation", "SMAppService"] }
 objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNError", "UNNotification", "UNNotificationAction", "UNNotificationAttachment", "UNNotificationCategory", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationSound", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 winit = { version = "0.30.13", default-features = false }
 

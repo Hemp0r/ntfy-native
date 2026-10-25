@@ -7,8 +7,8 @@ script="$here/next-version.sh"
 fail=0
 
 check() {
-  local name=$1 cargo=$2 tags=$3 expected=$4 actual
-  actual=$(printf '%s' "$tags" | "$script" "$cargo") || actual="<exit $?>"
+  local name=$1 cargo=$2 tags=$3 expected=$4 kind=${5:-patch} actual
+  actual=$(printf '%s' "$tags" | "$script" "$cargo" "$kind") || actual="<exit $?>"
   if [[ "$actual" == "$expected" ]]; then
     echo "ok   - $name"
   else
@@ -28,11 +28,31 @@ check "major comparison is numeric" 1.0.0 $'v0.9.9\n' "1.0.0 keep"
 check "minor comparison is numeric" 0.10.0 $'v0.9.0\n' "0.10.0 keep"
 check "tag order in input does not matter" 0.1.0 $'v0.1.10\nv0.1.2\n' "0.1.11 bump"
 
-if ! printf '' | "$script" "not-a-version" >/dev/null 2>&1; then
+check "minor kind bumps minor and resets patch" 0.1.2 $'v0.1.2\n' "0.2.0 bump" minor
+check "patch kind bumps patch" 0.1.2 $'v0.1.2\n' "0.1.3 bump" patch
+check "major kind bumps major" 1.2.3 $'v1.2.3\n' "2.0.0 bump" major
+check "cargo higher than tag is kept for minor" 0.2.0 $'v0.1.5\n' "0.2.0 keep" minor
+check "cargo higher than tag is kept for major" 0.2.0 $'v0.1.5\n' "0.2.0 keep" major
+check "no tags keeps cargo for minor" 0.1.0 "" "0.1.0 keep" minor
+
+if printf '' | "$script" 0.1.0 bogus >/dev/null 2>&1; then
+  echo "FAIL - invalid kind was accepted"
+  fail=1
+else
+  rc=$?
+  if [[ $rc -eq 2 ]]; then echo "ok   - invalid kind exits 2"; else echo "FAIL - invalid kind exit $rc"; fail=1; fi
+fi
+
+if ! printf '' | "$script" "not-a-version" patch >/dev/null 2>&1; then
   echo "ok   - invalid cargo version is rejected"
 else
   echo "FAIL - invalid cargo version was accepted"
   fail=1
 fi
+
+latest=$(printf 'v0.1.9\nv0.1.10\nv1.0.0-rc1\nfoo\n' | "$script" --latest)
+if [[ "$latest" == "0.1.10" ]]; then echo "ok   - --latest prints numeric maximum"; else echo "FAIL - --latest: got '$latest'"; fail=1; fi
+latest=$(printf 'v1.0.0-rc1\n' | "$script" --latest)
+if [[ -z "$latest" ]]; then echo "ok   - --latest prints nothing without plain tags"; else echo "FAIL - --latest: got '$latest'"; fail=1; fi
 
 exit "$fail"
